@@ -17,6 +17,7 @@ import { findAmountLike } from '../src/mcp/tools.ts';
 const TPL = 'test/fixtures/月度保送表.xlsx';
 const LONG = 'test/fixtures/集团导出长表.xlsx';
 const OUT = 'test/output/月度保送表-已填.xlsx';
+const VARIANT = 'test/output/变体长表.xlsx';
 
 const log = (...a: unknown[]) => console.log(...a);
 let pass = 0;
@@ -529,6 +530,65 @@ check('HTTP 上传并校验 960 行', staged2.rowCount === 960 && staged2.status
 check('重复导入的坐标冲突被识别', staged2.issues.some((i: any) => i.level === 'error' && i.message.includes('重复坐标')) === false,
   '与库内已有数据不冲突（按坐标 upsert）');
 
+// ★ 两个只有浏览器能撞出来的 bug（都是 e2e 全绿之后在界面上发现的）
+//
+// 先生成一个"下个月改了公司写法"的变体表：把「华东子公司」写成「华东本部」。
+// 这是真实场景的常态，也是 Tier 2 待确认卡的唯一来源。
+// 特意选一个第 15 阶段没用到的写法，避免污染那一段的断言。
+{
+  const XLSXPopulate = (await import('xlsx-populate')).default;
+  const vwb = await XLSXPopulate.fromFileAsync(LONG);
+  const vws = vwb.sheet(0);
+  const used = vws.usedRange();
+  let renamed = 0;
+  for (let r = 1; r <= used.endCell().rowNumber(); r++) {
+    if (vws.cell(r, 2).value() === '华东子公司') { vws.cell(r, 2).value('华东本部'); renamed++; }
+  }
+  fs.mkdirSync('test/output', { recursive: true });
+  await vwb.toFileAsync(VARIANT);
+  check('变体表生成（240 行改名为「华东本部」）', renamed === 240, `${renamed} 行`);
+}
+
+// (1) 并发 / 连点上传时 batchId 撞车。原来只有 `Date.now()`，同毫秒的两个请求
+//     会生成同一个 id，后到的直接 Duplicate key 失败。
+const parallel = await Promise.all([1, 2, 3, 4, 5].map(() =>
+  fetch(base + '/api/import/stage', {
+    method: 'POST',
+    headers: { 'x-filename': encodeURIComponent('并发.xlsx'), 'content-type': 'application/octet-stream' },
+    body: fs.readFileSync(LONG),
+  }).then((r) => r.json() as any),
+));
+const dupErr = parallel.filter((p) => /Duplicate key|Constraint Error/.test(p.error ?? ''));
+check('★ 并发上传不会撞 batchId（连点两次也不该挂）', dupErr.length === 0 && parallel.every((p) => p.batchId),
+  `${parallel.length} 个并发请求，冲突 ${dupErr.length} 个`);
+check('★ 并发批次的 id 两两不同', new Set(parallel.map((p) => p.batchId)).size === parallel.length);
+
+// (2) 未识别名称必须自带 `kind`。候选清单由「公司」和「指标」两个 Resolver 分别产出，
+//     汇总给前端后就分不出谁是谁了；缺了它前端只能把公司标成「指标」，
+//     而且人拍板回传的决定 `kind=undefined`，服务端永远匹配不上 ——
+//     点「并入」等于没点，提交被无限次拦下。
+const stagedVariant = await fetch(base + '/api/import/stage', {
+  method: 'POST',
+  headers: { 'x-filename': encodeURIComponent('变体.xlsx'), 'content-type': 'application/octet-stream' },
+  body: fs.readFileSync(VARIANT),
+}).then((r) => r.json() as any);
+const un = stagedVariant.unresolved.companies[0];
+check('★ 未识别名称自带 kind（前端靠它区分公司/指标）', un?.kind === 'company', JSON.stringify(un?.kind));
+check('★ 待确认名称带候选与出现行数', un?.rows === 240 && un?.candidates?.[0]?.name === '华东子公司',
+  `${un?.rows} 行 / ${un?.candidates?.[0]?.name}`);
+
+// 端到端复现浏览器路径：把 stagedVariant 的 unresolved 直接转成 decisions 提交。
+// 这一条若失败，就说明「人确认」这个动作在真实链路上是无效的。
+const browserDecisions = [
+  ...stagedVariant.unresolved.companies.map((d: any) => ({ kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id })),
+  ...stagedVariant.unresolved.metrics.map((d: any) => ({ kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id })),
+];
+const confirmed = await postJson('/api/import/commit', {
+  batchId: stagedVariant.batchId, file: stagedVariant.sourceFile, autoCreateDims: true, decisions: browserDecisions,
+});
+check('★ 前端回传的 decisions 被服务端认账（kind 对得上）', !confirmed.pendingConfirm && confirmed.inserted === 960,
+  `pendingConfirm=${confirmed.pendingConfirm} inserted=${confirmed.inserted}`);
+
 const committed = await postJson('/api/import/commit', { batchId: staged2.batchId, file: staged2.sourceFile, autoCreateDims: true });
 check('HTTP 提交写入 960 行', committed.inserted === 960, `${committed.inserted}`);
 
@@ -548,11 +608,14 @@ check('归档文件确实落盘', archived.length >= 1, `${archived.length} 个�
 if (archived.length) {
   // 注意：不能走主连接读回 —— 主实例的 enable_external_access=false 会连 read_parquet 一起拒
   // （这正是硬化的预期效果：主库进程不碰任意文件）。用独立实例验证归档文件本身有效。
+  //
+  // 只读**本批次**的归档目录，不要用 `*/` 汇总 —— 那样断言会随别的测试批次一起变化，
+  // 断言就不再指向"这一次提交归档成功了"这个事实。
   const { DuckDBInstance } = await import('@duckdb/node-api');
   const verify = await DuckDBInstance.create();
   const vc = await verify.connect();
   const vr = await vc.runAndReadAll(
-    `SELECT count(*) AS n FROM read_parquet('data/parquet/fact_finance/*/part.parquet')`,
+    `SELECT count(*) AS n FROM read_parquet('data/parquet/fact_finance/batch=${staged2.batchId}/part.parquet')`,
   );
   const n = Number((vr.getRowObjectsJson() as any[])[0].n);
   vc.closeSync();

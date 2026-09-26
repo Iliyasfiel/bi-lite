@@ -101,6 +101,16 @@ export interface Candidate {
 }
 
 export interface UnresolvedName {
+  /**
+   * 这是公司名还是指标名。
+   *
+   * ★ 必须带上：候选清单是「公司」和「指标」两个 Resolver 分别产出的，
+   *   汇总给前端后就再也分不出谁是谁了。缺了它前端只能瞎猜标签，
+   *   而人拍板时回传的 `DimDecision.kind` 也会变成 `undefined` ——
+   *   服务端按 `kind|normalized` 查决定表，永远匹配不上，
+   *   于是「确认」按钮点了等于没点，提交被无限次拦下。
+   */
+  kind: DimKind;
   raw: string;
   normalized: string;
   /** 这个名字出现在多少行数据里（越多的越该先处理） */
@@ -231,6 +241,7 @@ export function describeUnresolved(r: Resolver, values: string[]): UnresolvedNam
   return [...counts.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([value, rows]) => ({
+      kind: r.kind,
       raw: value,
       normalized: normalizeName(value),
       rows,

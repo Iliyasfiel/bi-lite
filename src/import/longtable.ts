@@ -114,9 +114,19 @@ function normalizeMonth(v: unknown): string {
   return s;
 }
 
-/** STAGED 阶段：解析 + 校验，不写库 */
+/**
+ * STAGED 阶段：解析 + 校验，不写库
+ *
+ * `batchId` 必须**唯一**（`import_batch` 的主键）。只用 `Date.now()` 不够：
+ * 毫秒级的两个请求会撞出同一个 id，后到的那个直接
+ * `Constraint Error: Duplicate key "batch_id: ..."` 失败。
+ * 这在浏览器里很容易复现 —— 用户手快连点两次，或拖放时误触发了两次 upload。
+ * 所以时间戳之外再加一个进程内自增序号，彻底消灭同毫秒碰撞。
+ */
+let batchSeq = 0;
+
 export async function stage(filePath: string, sheetName?: string): Promise<StageResult> {
-  const batchId = `b${Date.now().toString(36)}`;
+  const batchId = `b${Date.now().toString(36)}${(batchSeq++).toString(36)}`;
   const rows = await readLongTable(filePath, sheetName);
   const issues: StageResult['issues'] = [];
 

@@ -104,10 +104,23 @@ function renderStage(s) {
 
   $('stageIssues').innerHTML = html;
   renderUnresolved(s.unresolved);
-  $('doCommit').disabled = failed || pendingCount() > 0;
-  $('doCommit').textContent = pendingCount() > 0
-    ? `还有 ${pendingCount()} 个名称待确认`
-    : `确认无误，提交入库（${s.rowCount.toLocaleString()} 行）`;
+  syncCommitButton();
+}
+
+/**
+ * 把「还有几个名字待确认」同步到提交按钮上。
+ *
+ * ★ 必须同时被 `renderStage()` 和确认卡片的 `refresh()` 调用。
+ *   只在 renderStage 里更新的话，人点完「并入」按钮文案不会变、
+ *   按钮仍然是 disabled —— 人会觉得"点了没反应"，而其实决定已经记下了。
+ */
+function syncCommitButton() {
+  const btn = $('doCommit');
+  const n = pendingCount();
+  btn.disabled = (staged?.status === 'error') || n > 0;
+  btn.textContent = n > 0
+    ? `还有 ${n} 个名称待确认`
+    : `确认无误，提交入库（${(staged?.rowCount ?? 0).toLocaleString()} 行）`;
 }
 
 // ── 主数据对齐：把「疑似同一家」的名字交给人拍板（§10 R1）──
@@ -158,6 +171,7 @@ function renderUnresolved(u) {
 
   const refresh = () => {
     renderUnresolved(staged.unresolved);
+    syncCommitButton();   // 决定了就要立刻放行提交按钮，否则人以为「点了没反应」
   };
   $('stageDecisions').querySelectorAll('.decide').forEach((el) => {
     const key = el.dataset.key;
@@ -211,8 +225,8 @@ $('doCommit').addEventListener('click', async () => {
         <span>${res.needsDecision.length} 个名称需要你确认后才能提交。为避免把两家公司的钱静默加在一起，
         系统不会替你决定。</span></div>`;
       renderUnresolved(staged.unresolved);
-      btn.textContent = '提交中…';
-      return;   // 不要重新 enable，renderUnresolved 里按 pendingCount 处理
+      syncCommitButton();   // 仍有待确认项时保持 disabled，人做完决定才放行
+      return;
     }
 
     const merged = res.merged?.length
