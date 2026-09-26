@@ -144,6 +144,32 @@ td.num { font-variant-numeric: tabular-nums; }
 .kv .k { font-size: 12px; color: var(--muted); }
 .kv .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
+/* ── 主数据对齐：待确认名称（§10 R1）──
+   合并两家公司比不合并危险得多，所以这块 UI 的职责是**让人看清依据再决定**，
+   不是让操作变快。候选必须带 why（判断依据），否则推荐等于猜。 */
+.decide-wrap { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.decide-wrap h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.decide {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 10px;
+  background: #fffdf5;
+}
+.decide-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.decide-head strong { font-size: 15px; }
+.decide-head .tag {
+  font-size: 11px; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 7px;
+}
+.decide-body { display: flex; align-items: flex-end; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.decide-body label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); flex: 1 1 340px; }
+.decide-body select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; max-width: 100%; }
+.decide-merge { background: var(--accent); color: #fff; border-color: var(--accent); }
+.decide-merge:disabled { opacity: .5; cursor: not-allowed; }
+
 .spec-item {
   display: flex;
   align-items: center;

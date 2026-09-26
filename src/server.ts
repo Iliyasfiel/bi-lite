@@ -15,7 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import * as db from './db/index.ts';
-import { stage, commit, readLongTable } from './import/longtable.ts';
+import { stage, commit, readLongTable, type DimDecision } from './import/longtable.ts';
+import { normalizeName, type DimKind } from './import/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
@@ -147,8 +148,9 @@ const routes: Record<string, Handler> = {
 
   /** 导入第二步：提交（写维度 + 事实表 + Parquet 归档） */
   'POST /api/import/commit': async (req, res) => {
-    const { batchId, file, sheet, autoCreateDims } = await readJson<{
+    const { batchId, file, sheet, autoCreateDims, decisions } = await readJson<{
       batchId: string; file: string; sheet?: string; autoCreateDims?: boolean;
+      decisions?: DimDecision[];
     }>(req);
 
     // 文件路径必须落在上传目录内，避免被伪造成任意路径
@@ -158,7 +160,18 @@ const routes: Record<string, Handler> = {
     }
 
     const rows = await readLongTable(resolved, sheet);
-    const result = await commit(batchId, rows, { autoCreateDims: autoCreateDims !== false });
+    const result = await commit(batchId, rows, {
+      autoCreateDims: autoCreateDims !== false,
+      decisions,
+    });
+
+    // ★ 有歧义的名字 → 一行都没写，把待确认清单回给前端。
+    //   这不是错误（HTTP 200），是"需要人拍板"的正常中间状态：
+    //   报 4xx 会让前端把它当成失败，而它其实是一条待办。
+    if (result.needsDecision.length) {
+      return json(res, 200, { ...result, archived: false, pendingConfirm: true });
+    }
+
     let archived = true;
     try {
       const { archiveParquet } = await import('./import/longtable.ts');
@@ -169,6 +182,55 @@ const routes: Record<string, Handler> = {
       console.error(`[归档] 批次 ${batchId} 的 Parquet 归档失败:`, (e as Error).message);
     }
     json(res, 200, { ...result, archived });
+  },
+
+  /** 别名映射清单（§10 R1）—— 人确认过一次的写法，下月自动命中 */
+  'GET /api/aliases': async (_req, res) => {
+    const { listAliases } = await import('./import/resolve.ts');
+    json(res, 200, await listAliases());
+  },
+
+  /**
+   * 手工登记/纠正一条别名映射。
+   *
+   * 这是"人拍板"的落点：`registerAlias` 会把 `raw` 的规范化键指向 `targetId`，
+   * 从此这个写法（以及所有和它只有格式差异的写法）自动归并，**不再出现在未识别清单里**。
+   */
+  'POST /api/aliases': async (req, res) => {
+    const { kind, raw, targetId, note } = await readJson<{
+      kind: DimKind; raw: string; targetId: string; note?: string;
+    }>(req);
+    if (kind !== 'company' && kind !== 'metric') return json(res, 400, { error: 'kind 必须是 company 或 metric' });
+    if (!raw || !targetId) return json(res, 400, { error: '缺少 raw 或 targetId' });
+
+    const { registerAlias, loadEntities } = await import('./import/resolve.ts');
+    // 目标必须真实存在 —— 否则会造出一条指向虚空的别名，将来更难查
+    const target = (await loadEntities(kind)).find((e) => e.id === targetId);
+    if (!target) return json(res, 400, { error: `目标主数据不存在: ${targetId}` });
+
+    const r = await registerAlias(kind, raw, targetId, note);
+    json(res, 200, { ...r, kind, raw, normalized: normalizeName(raw), targetId, targetName: target.name });
+  },
+
+  /**
+   * 未识别名称的候选建议（不写库）。
+   *
+   * 页面在提交被 `pendingConfirm` 拦下后调用它拿候选，也可以独立用来
+   * 上传前先看看"这批名字里有多少是见过的"。
+   */
+  'POST /api/import/suggest': async (req, res) => {
+    const { names } = await readJson<{ names: Array<{ kind: DimKind; raw: string }> }>(req);
+    if (!Array.isArray(names)) return json(res, 400, { error: '缺少 names 数组' });
+    const { buildResolver } = await import('./import/resolve.ts');
+    const resolvers = { company: await buildResolver('company'), metric: await buildResolver('metric') };
+    json(res, 200, {
+      suggestions: names.map((n) => ({
+        kind: n.kind,
+        raw: n.raw,
+        resolved: resolvers[n.kind].resolve(n.raw) ?? null,
+        candidates: resolvers[n.kind].candidates(n.raw),
+      })),
+    });
   },
 
   /** 已注册报表列表（specs/*.yaml） */

@@ -61,6 +61,20 @@ CREATE TABLE IF NOT EXISTS fact_contract (
   PRIMARY KEY (fin_month, company_id, metric_id)
 );
 
+-- ---------- 主数据别名映射（§10 R1）----------
+-- 人确认过一次的写法记在这里，下个月自动命中，不再问第二遍。
+-- normalized 是 normalizeName() 的结果（只去格式噪音，不改语义）——
+-- 见 src/import/resolve.ts 的注释：合并比不合并危险得多，所以只有规范化相等才自动归并。
+CREATE TABLE IF NOT EXISTS dim_alias (
+  kind       VARCHAR NOT NULL,   -- company / metric
+  normalized VARCHAR NOT NULL,   -- 规范化后的写法（命中键）
+  alias      VARCHAR NOT NULL,   -- 原始写法（给人看）
+  target_id  VARCHAR NOT NULL,   -- 归并到哪条主数据
+  note       VARCHAR,
+  created_at TIMESTAMP,
+  PRIMARY KEY (kind, normalized)
+);
+
 -- ---------- 导入批次（可追溯）----------
 
 CREATE TABLE IF NOT EXISTS import_batch (

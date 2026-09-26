@@ -31,7 +31,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 155 项断言全流程验收
+npm run e2e             # ★ 186 项断言全流程验收
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -70,6 +70,37 @@ curl -X POST http://127.0.0.1:4319/api/import/stage \
 ```
 
 > 上传不用 multipart（省依赖）：原始二进制 body + `X-Filename` 头。
+
+### 主数据对齐：同一个公司，每月写法不同
+
+集团导出的长表里，「华东子公司」这个月可能写成 `（华东子公司）`，下个月写成 `华东分公司`。
+如果每个写法都新建一条主数据，**同一家公司的钱就被拆到了两条主数据上** ——
+报表出来少了一半，但格式完全正常。
+
+匹配分两档，分界线是**"这个差异是不是只是格式噪音"**：
+
+| 档 | 判据 | 处理 |
+|---|---|---|
+| **Tier 1** 自动 | `normalizeName()` 后完全相同（全角/空格/括号/大小写） | 直接归并，并在校验提示里**留痕**（"已自动归并 2 个写法"） |
+| **Tier 2** 需确认 | 去壳后字号相同 / 名称互相包含 / 写法相近 | 只给**候选 + 判断依据**，由人拍板 |
+
+```bash
+# 看看这批名字里哪些需要人决定（不写库）
+curl -s -X POST http://127.0.0.1:4319/api/import/suggest \
+  -H 'content-type: application/json' \
+  -d '{"names":[{"kind":"company","raw":"华东分公司"}]}'
+# → 候选：华东子公司（字号相同（剥掉「有限公司」「集团」等形式后缀后一致））
+
+# 人确认一次，永久记住
+curl -s -X POST http://127.0.0.1:4319/api/aliases \
+  -H 'content-type: application/json' \
+  -d '{"kind":"company","raw":"华东分公司","targetId":"c_xxx","note":"2026-06 起改名"}'
+```
+
+**为什么不是"按相似度自动合并"**：不合并时数字明显不对（少了一半），人会来查；
+**错合并时两家的钱被静默加在一起，报表看起来完全正常，没人会来查**。
+所以宁可停下问人。有歧义时接口返 **HTTP 200 + `pendingConfirm: true`**，一行都不落库 ——
+那是待办，不是失败；Web 导入页会把待确认的名字渲染成卡片，选「并入已有」或「确认是新建」。
 
 ### 写一条报送规格
 
@@ -181,6 +212,10 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 另有一道**机械兜底**：任何工具返回值里若出现 ≥ 10000 的数字，本次调用直接失败。
 它不替代上面的结构设计，只是让"将来某次改动不小心泄漏"变成一个响亮的错误。
 
+**主数据归并（`/api/aliases`）刻意不做成 MCP 工具**：它是一次**不可逆的写操作**，
+登记后永久生效。合并两家公司会把它们的钱静默加在一起，而报表看起来完全正常 ——
+这种事必须由人在界面上看着依据点确认，不该成为 agent 顺手就能做的事。
+
 ### 把 MCP 接到客户端
 
 ```jsonc
@@ -212,7 +247,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 155 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 186 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -226,6 +261,8 @@ src/
   db/schema.ts       DDL（四维表 + 事实表 + 批次表）+ 口径注册表
   db/index.ts        open / query / execute / exportParquet（单进程双连接）
   import/longtable.ts 长表解析 + STAGED 三态校验 + 提交 + Parquet 归档
+                      commit() 两阶段：有歧义整体不落库
+  import/resolve.ts  ★ 主数据两档归并（Tier 1 自动 / Tier 2 人拍板）+ 别名表
   spec/types.ts      spec 类型与校验（YAML → Spec）
   spec/compile.ts    ★ 维度白名单 DIMENSIONS + spec → 参数化 SQL + planOf
   spec/template.ts   模板结构读取（表头/行标签/合并区/定义名称/公式行）
@@ -249,7 +286,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，155 项断言，14 个阶段
+npm run e2e        # ★ 唯一门禁，186 项断言，15 个阶段
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -267,12 +304,17 @@ npm run bench      # ⚠️ 未实现
 | 3. 规格引擎 | ✅ Excel + ECharts 两个渲染器 + Web 报表预览导出 |
 | 4. agent 入口 | ✅ MCP 六工具（真实 MCP 客户端验收通过） |
 | 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
+| R1. 主数据对齐 | ✅ 两档归并（Tier 1 自动 / Tier 2 人拍板）+ `dim_alias` 表 + Web 待确认卡片 |
 
 ### 已知限制
 
 - **只有假数据在跑**。生产环境的导入格式会有差异，导入层对列名/公司名/指标名
   有别名表，但**真实导出很可能超出这份表** —— 未识别的主数据会列进 `stage()` 的
   待确认清单，需要人工确认，不会静默建维。
+- **别名只增不减**：`dim_alias` 里的映射一旦登记就永久生效（人确认过一次，下月自动命中）。
+  目前没有 Web 上的撤销入口，改错了要去 `GET /api/aliases` 看清单。
+  这也是 `commit()` 分两阶段的原因 —— 宁可整体不落库，也不留下半成品别名。
+- **`fact_business_line` 尚未建表**：运营指标（合同、业务线）目前只有 `fact_contract`。
 - **公式缓存值不写回**：xlsx-populate 不重算公式。下游若直接读公式列数值，
   Excel 打开时会自动重算，但程序化读取需要另做处理。
 - **重打包后有 10/18 个部件字节不等**（属性顺序、转义、空白等良性差异）。
@@ -284,7 +326,7 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（15 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（16 条铁律）
 
 ## License
 

@@ -8,8 +8,9 @@
  */
 import XLSXPopulate from 'xlsx-populate';
 import fs from 'node:fs';
-import { execute, exportParquet, query, writer } from '../db/index.ts';
+import { execute, exportParquet } from '../db/index.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
+import { buildResolver, registerAlias, normalizeName, describeUnresolved, type UnresolvedName, type DimKind } from './resolve.ts';
 
 export interface LongRow {
   fin_month: string;    // YYYY-MM-DD
@@ -28,6 +29,13 @@ export interface StageResult {
   unknownCompanies: string[];
   unknownMetrics: string[];
   unknownPeriodTypes: string[];
+  /**
+   * 带候选建议的未识别清单（§10 R1）。
+   * `unknownCompanies` 是纯名字列表（向后兼容），这里是给人**做决定用**的版本：
+   * 每个名字带上"建议并入哪条已有主数据 + 为什么"和它出现多少行。
+   * 按出现行数降序 —— 人最该先核对的是覆盖最多数据的那个写法。
+   */
+  unresolved: { companies: UnresolvedName[]; metrics: UnresolvedName[] };
   /** 校验问题清单 */
   issues: Array<{ level: 'error' | 'warn'; row?: number; message: string }>;
   /** 类型推断样例（§4.6.2 max-inferred-lines = 10） */
@@ -114,28 +122,51 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
 
   if (rows.length === 0) issues.push({ level: 'error', message: '文件中没有数据行' });
 
-  // 已知主数据
-  const knownCompanies = new Set(
-    (await query<{ name: string; alias: string[] | null }>('SELECT name, alias FROM dim_company')).flatMap((r) => [
-      r.name,
-      ...(r.alias ?? []),
-    ]),
-  );
-  const knownMetrics = new Set(
-    (await query<{ name: string; alias: string[] | null }>('SELECT name, alias FROM dim_metric')).flatMap((r) => [
-      r.name,
-      ...(r.alias ?? []),
-    ]),
-  );
+  // 已知主数据（§10 R1）。走 Resolver 而不是 Set 精确匹配：
+  //   Tier 1 自动归并 —— 规范化后相同（全角/空格/括号等纯格式噪音）直接算已识别；
+  //   Tier 2 需确认 —— 去壳/互相包含/写法相近只给候选，**绝不自动合并**。
+  // 理由见 resolve.ts 头部：合并两家公司比不合并危险得多。
+  const companyResolver = await buildResolver('company');
+  const metricResolver = await buildResolver('metric');
+
   // 口径：以 PERIOD_TYPES 注册表为准（铁律 5），而不是"库里已有什么"。
   // 用库里的既有值当白名单会导致首次导入无法识别任何口径，且新增口径永远进不来。
   const knownPeriods = new Set<string>(PERIOD_TYPES.map((p) => p.id));
 
-  const unknownCompanies = [...new Set(rows.map((r) => r.company))].filter((c) => !knownCompanies.has(c));
-  const unknownMetrics = [...new Set(rows.map((r) => r.metric))].filter((m) => !knownMetrics.has(m));
+  const companyValues = rows.map((r) => r.company);
+  const metricValues = rows.map((r) => r.metric);
+  const unknownCompanyValues = [...new Set(companyValues)].filter((c) => !companyResolver.resolve(c));
+  const unknownMetricValues = [...new Set(metricValues)].filter((m) => !metricResolver.resolve(m));
+
+  const unknownCompanies = unknownCompanyValues;
+  const unknownMetrics = unknownMetricValues;
   const unknownPeriodTypes = [...new Set(rows.map((r) => r.period_type))].filter(
     (p) => knownPeriods.size > 0 && !knownPeriods.has(p),
   );
+
+  const unresolved = {
+    companies: describeUnresolved(companyResolver, companyValues.filter((c) => !companyResolver.resolve(c))),
+    metrics: describeUnresolved(metricResolver, metricValues.filter((m) => !metricResolver.resolve(m))),
+  };
+
+  // Tier 1 自动归并的痕迹 —— 让人看见"有 3 个写法被自动合并了"，
+  // 而不是悄悄发生。合并是有后果的操作，即使安全也要留痕。
+  // （Tier 1 只做 normalizeName，去的是全角/空格/括号这类纯格式噪音，
+  //   所以这里列出来的每条都应该"肉眼一看就是同一个名字的两种写法"。）
+  const merged: Array<{ kind: DimKind; raw: string; target: string; rows: number }> = [];
+  for (const [kind, resolver, values] of [
+    ['company', companyResolver, companyValues],
+    ['metric', metricResolver, metricValues],
+  ] as const) {
+    const counts = new Map<string, number>();
+    for (const v of values) counts.set(v, (counts.get(v) ?? 0) + 1);
+    for (const [raw, n] of counts) {
+      const ent = resolver.entityOf(raw);
+      if (ent && normalizeName(raw) !== normalizeName(ent.name)) {
+        merged.push({ kind, raw, target: ent.name, rows: n });
+      }
+    }
+  }
 
   if (unknownCompanies.length) {
     issues.push({
@@ -147,6 +178,30 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
     issues.push({
       level: 'warn',
       message: `未识别的指标名 ${unknownMetrics.length} 个: ${unknownMetrics.slice(0, 5).join(', ')}${unknownMetrics.length > 5 ? ' …' : ''}`,
+    });
+  }
+
+  // 有候选的名字单独提示 —— 这些是"很可能该合并，但需要人拍板"的
+  const withCandidates = [...unresolved.companies, ...unresolved.metrics].filter((u) => u.candidates.length);
+  if (withCandidates.length) {
+    issues.push({
+      level: 'warn',
+      message: `${withCandidates.length} 个未识别名称看起来与已有主数据相近，请确认是「并入已有」还是「新建」: ${withCandidates
+        .slice(0, 3)
+        .map((u) => `${u.raw}（${u.rows} 行）→ 疑似 ${u.candidates.map((c) => c.name).join(' / ')}`)
+        .join('；')}${withCandidates.length > 3 ? ' …' : ''}`,
+    });
+  }
+
+  // Tier 1 自动归并留痕：这些写法已被并进已有主数据，**不再出现在未识别清单里**，
+  // 但必须让人看见，否则"我的公司名怎么不见了"会变成一个无从排查的疑问。
+  if (merged.length) {
+    issues.push({
+      level: 'warn',
+      message: `已自动归并 ${merged.length} 个写法（仅去格式差异，未改语义）: ${merged
+        .slice(0, 5)
+        .map((m) => `${m.raw} → ${m.target}（${m.rows} 行）`)
+        .join('；')}${merged.length > 5 ? ' …' : ''}`,
     });
   }
 
@@ -192,48 +247,216 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
     unknownCompanies,
     unknownMetrics,
     unknownPeriodTypes,
+    unresolved,
     issues,
     sample: rows.slice(0, MAX_INFERRED_LINES),
   };
+}
+
+/** 人工对一个未识别名称的处置决定（来自 Web 确认界面或 CLI） */
+export interface DimDecision {
+  kind: DimKind;
+  /** 导入文件里的原始写法 */
+  raw: string;
+  /** merge = 并入已有主数据（会写进 dim_alias）；create = 确实是个新实体 */
+  action: 'merge' | 'create';
+  /** action='merge' 时必填：并入哪条 */
+  targetId?: string;
+  note?: string;
+}
+
+export interface CommitOptions {
+  /**
+   * 是否允许为新实体建维。默认 `true`（首次导入必须能建，否则链路跑不起来）。
+   *
+   * ⚠️ 但**"看起来像已有实体"的名字不受此开关保护** —— 它们走 `needsDecision` 拦下来，
+   * 必须由人明确 `merge` 或 `create`。理由见 resolve.ts 头部：合并有风险，不合并也有风险，
+   * 但**静默地替人做这个决定**是两害之中最坏的 —— 钱被拆到两条主数据上，报表看着正常。
+   */
+  autoCreateDims?: boolean;
+  /** 人的处置决定（覆盖自动判定），每条都会记进 dim_alias（merge 时） */
+  decisions?: DimDecision[];
+  /** 遇到"疑似已有实体"时是否直接抛错（Web 先预览再确认的流程用得到）；默认 false（返回结论） */
+  strict?: boolean;
+}
+
+export interface CommitResult {
+  inserted: number;
+  createdCompanies: string[];
+  createdMetrics: string[];
+  /**
+   * Tier 1 自动归并（纯格式差异）—— 已合并，列出来是为了**留痕**。
+   * 合并是"有后果"的操作，即使安全也要让人看得见。
+   */
+  merged: Array<{ kind: DimKind; raw: string; target: string; rows: number }>;
+  /**
+   * ★ Tier 2：疑似已有实体但**没有**人工决定的名字 —— **这些名字的行不会写库**。
+   * 空数组 = 本次提交没有任何歧义。非空 = 必须让人拍板后重提。
+   */
+  needsDecision: Array<{ kind: DimKind; raw: string; rows: number; candidates: UnresolvedName['candidates'] }>;
+  /** 因 needsDecision 而被跳过的行数 */
+  skippedRows: number;
 }
 
 /** 提交：写维度 + 写事实表 + 写 Parquet 归档 */
 export async function commit(
   batchId: string,
   rows: LongRow[],
-  opts: { autoCreateDims?: boolean } = {},
-): Promise<{ inserted: number; createdCompanies: string[]; createdMetrics: string[] }> {
+  opts: CommitOptions = {},
+): Promise<CommitResult> {
+  const autoCreateDims = opts.autoCreateDims !== false;
+  const strict = opts.strict === true;
+
+  const resolvers = {
+    company: await buildResolver('company'),
+    metric: await buildResolver('metric'),
+  };
+
+  // 人的决定优先于一切自动判定 —— 人拍过板的事不该被算法再推翻
+  const decided = new Map<string, DimDecision>();
+  for (const d of opts.decisions ?? []) decided.set(`${d.kind}|${normalizeName(d.raw)}`, d);
+
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    counts.set(`company|${r.company}`, (counts.get(`company|${r.company}`) ?? 0) + 1);
+    counts.set(`metric|${r.metric}`, (counts.get(`metric|${r.metric}`) ?? 0) + 1);
+  }
+
+  // ---------- 阶段 1：只做判断，一次库都不写 ----------
+  //
+  // ★ 为什么必须分两阶段：`settle()` 里的 `registerAlias()` 一旦执行就写进了 dim_alias，
+  //   而别名是**永久生效**的，没有干净的撤销办法。若边判断边写，
+  //   后面发现某个名字要人确认时，前面的别名已经落库了 ——
+  //   库进入半成品状态，且"提交失败"这件事反而留下了副作用。
+  //
+  //   新建维度的 id 是 `hash(raw)` 决定的**纯函数**，所以阶段 1 完全可以在不写库的前提下
+  //   算出 id。这是分两阶段可行的关键。
+
+  /** `kind|raw` → 目标 id（已确定）；新建的目标 id 也在阶段 1 就算好 */
+  const assigned = new Map<string, string>();
+  /** 阶段 1 判定要新建的实体（阶段 2 才写） */
+  const toCreate = new Map<string, { kind: DimKind; raw: string }>();
+  /** 阶段 1 判定要登记的别名（阶段 2 才写） */
+  const toAlias: Array<{ kind: DimKind; raw: string; targetId: string; note?: string }> = [];
+  const needsDecision: CommitResult['needsDecision'] = [];
+  const merged: CommitResult['merged'] = [];
+  const pending = new Set<string>();
+
+  function plan(kind: DimKind, raw: string): string | null {
+    const key = `${kind}|${raw}`;
+    const known = assigned.get(key);
+    if (known) return known;
+    if (pending.has(key)) return null;
+
+    const resolver = resolvers[kind];
+    const n = normalizeName(raw);
+    const nrows = counts.get(key) ?? 0;
+
+    // ① 人的决定最高优先
+    const dec = decided.get(`${kind}|${n}`);
+    if (dec) {
+      if (dec.action === 'merge') {
+        if (!dec.targetId) throw new Error(`决定「并入已有」但没给 targetId: ${kind} ${raw}`);
+        // 目标是否真实存在留到阶段 2 校验 —— 那里才知道本批新建了哪些实体，
+        // 而"把变体并进本批同时新建的实体"是合法且常见的操作。
+        toAlias.push({ kind, raw, targetId: dec.targetId, note: dec.note ?? '导入时人工确认' });
+        assigned.set(key, dec.targetId);
+        return dec.targetId;
+      }
+      // action === 'create'：人明确说了"这是个新实体"
+      const id = entityId(kind, raw);
+      toCreate.set(key, { kind, raw });
+      assigned.set(key, id);
+      return id;
+    }
+
+    // ② Tier 1：规范化后命中（含 dim_alias 里人确认过的映射）—— 纯格式差异，自动归并
+    const hit = resolver.resolve(raw);
+    if (hit) {
+      assigned.set(key, hit);
+      const ent = resolver.entityOf(raw);
+      // 写法与主名不同才值得提；同一个字面值不算"归并"
+      if (ent && raw !== ent.name) merged.push({ kind, raw, target: ent.name, rows: nrows });
+      return hit;
+    }
+
+    // ③ Tier 2：像已有实体但不确定 → 交给人
+    const cands = resolver.candidates(raw);
+    if (cands.length) {
+      pending.add(key);
+      needsDecision.push({ kind, raw, rows: nrows, candidates: cands });
+      return null;
+    }
+
+    // ④ 完全不像任何已有实体
+    if (!autoCreateDims) {
+      pending.add(key);
+      needsDecision.push({ kind, raw, rows: nrows, candidates: [] });
+      return null;
+    }
+    const id = entityId(kind, raw);
+    toCreate.set(key, { kind, raw });
+    assigned.set(key, id);
+    return id;
+  }
+
+  for (const r of rows) {
+    plan('company', r.company);
+    plan('metric', r.metric);
+  }
+
+  // ★ 有歧义 → 一行都不写，连维度都不建。
+  //   "写一半"会让库进入既不是旧状态也不是新状态的中间态，比拒绝提交难排查得多。
+  if (needsDecision.length) {
+    const detail = needsDecision
+      .map((d) => `${d.raw}（${d.rows} 行${d.candidates.length ? `，疑似 ${d.candidates.map((c) => c.name).join(' / ')}` : '，无相近主数据'}）`)
+      .join('；');
+    const msg =
+      `有 ${needsDecision.length} 个名称需要人工确认后才能提交: ${detail}。` +
+      `合并两家不同的公司会把它们的钱静默加在一起（报表看起来完全正常，没人会来查），所以这一步不自动做。` +
+      `请对每个名称二选一：并入已有（action='merge' + targetId）或确认是新建（action='create'）。`;
+    if (strict) throw new Error(msg);
+    return { inserted: 0, createdCompanies: [], createdMetrics: [], merged: [], needsDecision, skippedRows: rows.length };
+  }
+
+  // ---------- 阶段 2：判断已全部通过，这才开始写 ----------
+
+  // 先建维度，再登记别名 —— 别名可以指向**本批同时新建**的实体
+  // （真实场景：「集团公司」新建为正式主数据，同时把「集团有限公司」「集团公司(本部)」
+  //   这些变体并进它 —— 这是同一批导入里最自然的操作，顺序反了就会失败）。
   const createdCompanies: string[] = [];
   const createdMetrics: string[] = [];
-
-  const companyMap = new Map((await query<{ id: string; name: string; alias: string[] | null }>('SELECT id, name, alias FROM dim_company')).flatMap((r) => [[r.name, r.id], ...(r.alias ?? []).map((a) => [a, r.id] as [string, string])]));
-  const metricMap = new Map((await query<{ id: string; name: string; alias: string[] | null }>('SELECT id, name, alias FROM dim_metric')).flatMap((r) => [[r.name, r.id], ...(r.alias ?? []).map((a) => [a, r.id] as [string, string])]));
-
-  if (opts.autoCreateDims !== false) {
-    for (const r of rows) {
-      if (!companyMap.has(r.company)) {
-        const id = `c_${hash(r.company)}`;
-        await execute(
-          `INSERT INTO dim_company (id, name, parent_id, level, group_name, alias) VALUES (${lit(id)}, ${lit(r.company)}, NULL, 2, NULL, ARRAY[]::VARCHAR[])`,
-        );
-        companyMap.set(r.company, id);
-        createdCompanies.push(r.company);
-      }
-      if (!metricMap.has(r.metric)) {
-        const id = `m_${hash(r.metric)}`;
-        await execute(
-          `INSERT INTO dim_metric (id, name, category, unit, direction, alias) VALUES (${lit(id)}, ${lit(r.metric)}, NULL, NULL, 'positive', ARRAY[]::VARCHAR[])`,
-        );
-        metricMap.set(r.metric, id);
-        createdMetrics.push(r.metric);
-      }
-      // 期间
+  for (const { kind, raw } of toCreate.values()) {
+    const id = entityId(kind, raw);
+    if (kind === 'company') {
       await execute(
-        `INSERT INTO dim_period (fin_month, year, month, is_audited)
-         SELECT ${lit(r.fin_month)}::DATE, ${Number(r.fin_month.slice(0, 4))}, ${Number(r.fin_month.slice(5, 7))}, FALSE
-         WHERE NOT EXISTS (SELECT 1 FROM dim_period WHERE fin_month = ${lit(r.fin_month)}::DATE)`,
+        `INSERT INTO dim_company (id, name, parent_id, level, group_name, alias) VALUES (${lit(id)}, ${lit(raw)}, NULL, 2, NULL, ARRAY[]::VARCHAR[])`,
       );
+      createdCompanies.push(raw);
+    } else {
+      await execute(
+        `INSERT INTO dim_metric (id, name, category, unit, direction, alias) VALUES (${lit(id)}, ${lit(raw)}, NULL, NULL, 'positive', ARRAY[]::VARCHAR[])`,
+      );
+      createdMetrics.push(raw);
     }
+  }
+
+  // 登记人的决定（写 dim_alias）。此时校验目标存在 —— 错过这一步会造出一条指向虚空、
+  // 却从此自动命中的别名：所有带这个写法的行都被静默归并到不存在的公司上。
+  const createdIds = new Set([...toCreate.keys()].map((k) => assigned.get(k)!));
+  for (const a of toAlias) {
+    const exists = resolvers[a.kind].ents.some((e) => e.id === a.targetId) || createdIds.has(a.targetId);
+    if (!exists) throw new Error(`决定「并入已有」但目标主数据不存在: ${a.kind} ${a.raw} → ${a.targetId}`);
+    await registerAlias(a.kind, a.raw, a.targetId, a.note);
+  }
+
+  // 期间维度（与公司/指标无关，逐行幂等）
+  for (const r of rows) {
+    await execute(
+      `INSERT INTO dim_period (fin_month, year, month, is_audited)
+       SELECT ${lit(r.fin_month)}::DATE, ${Number(r.fin_month.slice(0, 4))}, ${Number(r.fin_month.slice(5, 7))}, FALSE
+       WHERE NOT EXISTS (SELECT 1 FROM dim_period WHERE fin_month = ${lit(r.fin_month)}::DATE)`,
+    );
   }
 
   await execute(`UPDATE import_batch SET status = 'committed' WHERE batch_id = ${lit(batchId)}`);
@@ -245,8 +468,9 @@ export async function commit(
     const chunk = rows.slice(i, i + CHUNK);
     const values = chunk
       .map((r) => {
-        const cid = companyMap.get(r.company) ?? '';
-        const mid = metricMap.get(r.metric) ?? '';
+        // assigned 里一定有：需要人决定的名字此时已因 needsDecision 提前返回
+        const cid = assigned.get(`company|${r.company}`)!;
+        const mid = assigned.get(`metric|${r.metric}`)!;
         const amt = r.amount === null ? 'NULL' : r.amount;
         return `(${lit(r.fin_month)}::DATE, ${lit(cid)}, ${lit(mid)}, ${lit(r.period_type)}, ${amt}, ${lit(batchId)})`;
       })
@@ -259,7 +483,12 @@ export async function commit(
     inserted += chunk.length;
   }
 
-  return { inserted, createdCompanies, createdMetrics };
+  return { inserted, createdCompanies, createdMetrics, merged, needsDecision: [], skippedRows: 0 };
+}
+
+/** 新建实体的 id：`hash(名字)` 决定的纯函数（阶段 1 无需写库即可算出） */
+function entityId(kind: DimKind, raw: string): string {
+  return `${kind === 'company' ? 'c' : 'm'}_${hash(raw)}`;
 }
 
 /**

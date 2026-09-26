@@ -40,6 +40,7 @@ window.addEventListener('hashchange', hashTab);
 
 // ═══════════════ 1. 数据导入 ═══════════════
 let staged = null;   // 待提交的批次
+let decisions = {};  // key = `${kind}|${raw}` → {action, targetId}
 
 $('pick').addEventListener('click', () => $('file').click());
 $('file').addEventListener('change', (e) => { if (e.target.files[0]) upload(e.target.files[0]); });
@@ -56,6 +57,7 @@ dz.addEventListener('drop', (e) => { if (e.dataTransfer.files[0]) upload(e.dataT
 async function upload(file) {
   $('filename').textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）· 校验中…`;
   $('stageCard').classList.add('hidden');
+  decisions = {};   // 换文件就丢弃上一批的决定
   try {
     const buf = await file.arrayBuffer();
     const res = await fetch('/api/import/stage', {
@@ -91,9 +93,7 @@ function renderStage(s) {
 
   let html = '';
   if (unknown.length) {
-    html += `<p class="hint">以下名称是第一次出现，提交时会自动建档。
-      若只是别名（如「集团有限公司」vs「集团公司」），请先改数据源或建别名映射 —— 
-      否则同一家公司会被拆成两条主数据。</p>
+    html += `<p class="hint">以下名称是第一次出现，提交时会自动建档。若只是别名，请在下方「待确认名称」里并入已有主数据 —— 否则同一家公司会被拆成两条主数据，它的钱也会被拆成两半。</p>
       <div class="issue warn"><span class="lv">新</span><span>${unknown.join('、')}</span></div>`;
   }
   html += s.issues.length
@@ -103,13 +103,83 @@ function renderStage(s) {
     : '<p class="hint">没有任何问题。</p>';
 
   $('stageIssues').innerHTML = html;
-  $('doCommit').disabled = failed;
-  $('doCommit').textContent = `确认无误，提交入库（${s.rowCount.toLocaleString()} 行）`;
+  renderUnresolved(s.unresolved);
+  $('doCommit').disabled = failed || pendingCount() > 0;
+  $('doCommit').textContent = pendingCount() > 0
+    ? `还有 ${pendingCount()} 个名称待确认`
+    : `确认无误，提交入库（${s.rowCount.toLocaleString()} 行）`;
+}
+
+// ── 主数据对齐：把「疑似同一家」的名字交给人拍板（§10 R1）──
+// 安全立场：**合并两家公司比不合并危险得多**。不合并时数字明显不对、人会来查；
+// 错合并则报表看起来完全正常，没人会来查。所以只有纯格式差异（Tier 1）自动归并，
+// 其余一律停下来问人。人确认一次写进 dim_alias，下月自动命中。
+const dkey = (kind, raw) => `${kind}|${raw}`;
+
+const pendingCount = () => {
+  const u = (staged && staged.unresolved) || { companies: [], metrics: [] };
+  return [...u.companies, ...u.metrics].filter((d) => !decisions[dkey(d.kind, d.raw)]).length;
+};
+
+function renderUnresolved(u) {
+  const all = [...(u?.companies ?? []), ...(u?.metrics ?? [])];
+  if (!all.length) { $('stageDecisions').innerHTML = ''; return; }
+
+  const card = (d) => {
+    const cur = decisions[dkey(d.kind, d.raw)];
+    const opts = d.candidates.map((c) => `<option value="${esc(c.id)}"${cur?.targetId === c.id ? ' selected' : ''}>
+        ${esc(c.name)}（${c.why}）</option>`).join('');
+    return `<div class="decide" data-key="${esc(dkey(d.kind, d.raw))}">
+      <div class="decide-head">
+        <strong>${esc(d.raw)}</strong>
+        <span class="tag">${d.kind === 'company' ? '公司' : '指标'}</span>
+        <span class="tag">${d.rows} 行</span>
+        ${cur ? `<span class="pill ok">${cur.action === 'merge' ? '并入已有' : '确认新建'}</span>` : ''}
+      </div>
+      <div class="decide-body">
+        <label>并入已有主数据
+          <select class="decide-target">${opts}</select>
+        </label>
+        <button class="decide-merge"${d.candidates.length ? '' : ' disabled'}>并入</button>
+        <button class="decide-new">确认是新建</button>
+      </div>
+      <p class="hint">若上面没有正确的目标，说明它确实是新公司 —— 选「确认是新建」。
+        选「并入」后这个写法会被记住，下个月自动归并，不再问。</p>
+    </div>`;
+  };
+
+  $('stageDecisions').innerHTML = `
+    <div class="decide-wrap">
+      <h3>待确认名称 <span class="pill warn">${all.length}</span></h3>
+      <p class="hint">这些名字第一次出现，但看起来与已有主数据相近。请逐个确认：
+        是同一家的不同写法（并入），还是确实是一家新公司（新建）。</p>
+      ${all.map(card).join('')}
+    </div>`;
+
+  const refresh = () => {
+    renderUnresolved(staged.unresolved);
+  };
+  $('stageDecisions').querySelectorAll('.decide').forEach((el) => {
+    const key = el.dataset.key;
+    const [kind, raw] = [key.slice(0, key.indexOf('|')), key.slice(key.indexOf('|') + 1)];
+    el.querySelector('.decide-merge').addEventListener('click', () => {
+      const targetId = el.querySelector('.decide-target').value;
+      if (!targetId) return;
+      decisions[key] = { kind, raw, action: 'merge', targetId };
+      refresh();
+    });
+    el.querySelector('.decide-new').addEventListener('click', () => {
+      decisions[key] = { kind, raw, action: 'create' };
+      refresh();
+    });
+  });
 }
 
 $('cancelImport').addEventListener('click', () => {
   staged = null;
+  decisions = {};
   $('stageCard').classList.add('hidden');
+  $('stageDecisions').innerHTML = '';
   $('filename').textContent = '或把 .xlsx 拖到这里';
 });
 
@@ -122,11 +192,38 @@ $('doCommit').addEventListener('click', async () => {
     const res = await api('/api/import/commit', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ batchId: staged.batchId, file: staged.file, autoCreateDims: true }),
+      body: JSON.stringify({
+        batchId: staged.batchId,
+        file: staged.file,
+        autoCreateDims: true,
+        decisions: Object.values(decisions),
+      }),
     });
+
+    // 服务端可能回一个「需要人拍板」的中间状态（HTTP 200，不是错误）——
+    // 那种情况下它一行都没写，把待确认项渲染出来让人决定，而不是当成失败。
+    if (res.pendingConfirm) {
+      staged.unresolved = {
+        companies: res.needsDecision.filter((d) => d.kind === 'company'),
+        metrics: res.needsDecision.filter((d) => d.kind === 'metric'),
+      };
+      $('stageIssues').innerHTML = `<div class="issue warn"><span class="lv">待确认</span>
+        <span>${res.needsDecision.length} 个名称需要你确认后才能提交。为避免把两家公司的钱静默加在一起，
+        系统不会替你决定。</span></div>`;
+      renderUnresolved(staged.unresolved);
+      btn.textContent = '提交中…';
+      return;   // 不要重新 enable，renderUnresolved 里按 pendingCount 处理
+    }
+
+    const merged = res.merged?.length
+      ? `；自动归并 ${res.merged.length} 个写法（${res.merged.map((m) => `${m.raw}→${m.target}`).join('、')}）`
+      : '';
     $('stageIssues').innerHTML = `<div class="issue"><span class="lv">成功</span>
-      <span>写入 ${res.inserted.toLocaleString()} 行；新建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个。</span></div>`;
+      <span>写入 ${res.inserted.toLocaleString()} 行；新建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个${merged}。
+      ${res.archived === false ? '<strong>⚠️ Parquet 归档失败，请查看服务端日志</strong>' : ''}</span></div>`;
+    $('stageDecisions').innerHTML = '';
     $('doCommit').textContent = '已提交';
+    decisions = {};
     await Promise.all([loadBatches(), loadCatalog()]);
   } catch (e) {
     $('stageIssues').innerHTML = `<div class="issue error"><span class="lv">失败</span><span>${e.message}</span></div>`;

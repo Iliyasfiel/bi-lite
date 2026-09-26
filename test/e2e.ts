@@ -560,6 +560,21 @@ if (archived.length) {
   check('归档内容可被 DuckDB 读回（960 行）', n === 960, `${n} 行`);
 }
 
+// 主数据对齐的两个路由（§10 R1）
+const sug = await postJson('/api/import/suggest', { names: [{ kind: 'company', raw: '华东分公司' }] });
+check('HTTP 别名建议接口给出候选', sug.suggestions?.[0]?.candidates?.[0]?.name === '华东子公司',
+  JSON.stringify(sug.suggestions?.[0]?.candidates?.[0] ?? {}));
+check('建议接口不写库（纯查询）', (await getJson('/api/aliases')).filter((a: any) => a.alias === '华东分公司').length === 0);
+
+const hzId = (await db.query<{ id: string }>(`SELECT id FROM dim_company WHERE name = '华东子公司'`))[0].id;
+const aliasAdded = await postJson('/api/aliases', { kind: 'company', raw: '别名测试公司', targetId: hzId, note: 'e2e' });
+check('HTTP 登记别名', aliasAdded.targetId === hzId && aliasAdded.normalized === '别名测试公司');
+
+const badAlias = await postJson('/api/aliases', { kind: 'company', raw: 'x', targetId: 'c_不存在' });
+check('别名指向不存在的目标 → 拒绝', /目标主数据不存在/.test(badAlias.error ?? ''), badAlias.error ?? '');
+const badKind = await postJson('/api/aliases', { kind: 'nope', raw: 'x', targetId: hzId });
+check('别名 kind 只接受 company/metric', /kind/.test(badKind.error ?? ''), badKind.error ?? '');
+
 stop();
 
 // ============ 13. MCP 工具集（第 4 步：agent 入口）============
@@ -788,6 +803,128 @@ sheets:
   // 发布出去的示例 spec 必须是好的
   const shipped = parseSpec(fs.readFileSync('specs/月度保送表.yaml', 'utf8'));
   check('★ 仓库里的 specs/月度保送表.yaml 已修正（含 scope.time）', findUnusedParams(shipped).length === 0);
+}
+
+// ============ 15. 主数据对齐（§10 R1）============
+log('\n════════ 15. 主数据对齐（R1）════════');
+{
+  const R = await import('../src/import/resolve.ts');
+
+  // --- 规范化只去格式噪音，不改语义 ---
+  check('全角转半角 + 去空白', R.normalizeName('　集团公司　') === '集团公司');
+  check('括号/标点算格式噪音', R.normalizeName('（集团）公司') === '集团公司');
+  check('大小写不敏感', R.normalizeName('ABC') === R.normalizeName('abc'));
+  check('规范化不改变语义（「华东」≠「华南」）', R.normalizeName('华东子公司') !== R.normalizeName('华南子公司'));
+
+  // 去壳只用于生成候选，不用于自动合并
+  check('去壳剥掉公司形式后缀', R.stemCompany('华东子公司') === '华东' && R.stemCompany('华东分公司') === '华东');
+  check('★ 去壳不剥空（纯壳名不会塌成空串）', R.stemCompany('公司') === '公司' && R.stemCompany('有限公司') === '有限公司');
+
+  const beforeCompanies = Number(
+    (await db.query<{ n: number | string }>('SELECT count(*) AS n FROM dim_company'))[0].n,
+  );
+  const HZ = await db.query<{ id: string }>(`SELECT id FROM dim_company WHERE name = '华东子公司'`);
+  check('已有 4 家公司主数据', beforeCompanies === 4, `${beforeCompanies}`);
+
+  /** 造一行：同一家公司、同一个指标、同一个口径，只是月份不同 —— 用于试提交 */
+  const row = (company: string, month: string, amount: number): LongRow => ({
+    fin_month: `${month}-01`,
+    company,
+    metric: '营业收入',
+    period_type: '本年累计',
+    amount,
+  });
+
+  // --- Tier 1：纯格式差异 → 自动归并，不打扰人 ---
+  const t1 = await commit('b_tier1', [row('（集团公司）', '2026-01', 100), row('（集团公司）', '2026-02', 200)]);
+  check('★ Tier 1 纯格式差异自动归并（不再问人）', t1.needsDecision.length === 0 && t1.inserted === 2, `inserted=${t1.inserted}`);
+  check('自动归并留痕（看得见并进了谁）', t1.merged.length === 1 && t1.merged[0].target === '集团公司', JSON.stringify(t1.merged[0] ?? {}));
+  check('归并未新建公司主数据', t1.createdCompanies.length === 0);
+
+  const afterT1 = Number(
+    (await db.query<{ n: number | string }>('SELECT count(*) AS n FROM dim_company'))[0].n,
+  );
+  check('★ 归并后公司数不变（钱没被拆到两条主数据上）', afterT1 === beforeCompanies, `${afterT1}`);
+
+  // --- Tier 2：像已有实体但不确定 → 拒绝写库，交给人拍板 ---
+  const t2 = await commit('b_tier2', [row('华东分公司', '2026-03', 300), row('西北子公司', '2026-03', 400)]);
+  check('★ Tier 2 疑似已有主数据 → 拦下要人确认', t2.needsDecision.length === 1, `${t2.needsDecision.length} 条待确认`);
+  check('待确认项带候选与出现行数', t2.needsDecision[0]?.raw === '华东分公司' && t2.needsDecision[0].rows === 1
+    && t2.needsDecision[0].candidates.some((c) => c.name === '华东子公司'), JSON.stringify(t2.needsDecision[0]?.candidates ?? []));
+  check('★ 有歧义时一行都不写（不做半成品提交）', t2.inserted === 0 && t2.skippedRows === 2, `inserted=${t2.inserted}`);
+  check('★ 有歧义时不新建任何维度（无副作用）', t2.createdCompanies.length === 0);
+
+  const afterT2 = Number(
+    (await db.query<{ n: number | string }>('SELECT count(*) AS n FROM dim_company'))[0].n,
+  );
+  check('★ 拦下后公司数没变（拒绝提交不留半成品）', afterT2 === beforeCompanies, `${afterT2}`);
+
+  // 「西北子公司」不该被误判成与「华东子公司」相近 ——
+  // 首版编辑距离把共享的「子公司」后缀算成了相似度，两者仅差 2 字、相似度 0.6。
+  check('★ 不同字号的同名后缀不误报（西北 ≠ 华东）',
+    !t2.needsDecision.some((d) => d.raw === '西北子公司'),
+    `待确认: ${t2.needsDecision.map((d) => d.raw).join(', ')}`);
+
+  // --- 人拍板：把「华东分公司」并入「华东子公司」---
+  const t3 = await commit('b_tier3', [row('华东分公司', '2026-03', 300), row('西北子公司', '2026-03', 400)], {
+    decisions: [{ kind: 'company', raw: '华东分公司', action: 'merge', targetId: HZ[0].id, note: 'e2e 人工确认' }],
+  });
+  check('人确认后可提交', t3.needsDecision.length === 0 && t3.inserted === 2, `inserted=${t3.inserted}`);
+  check('并入已有的公司，不新建', t3.createdCompanies.length === 1 && t3.createdCompanies[0] === '西北子公司',
+    `${t3.createdCompanies.join(', ')}`);
+
+  // 2026-03 本来就有一批「华东子公司 × 营业收入」的真实数据（fixture 覆盖 12 个月），
+  // 所以这里按**坐标**断言而不是按行数 —— 行数会因为 upsert 命中已有坐标而看不出来。
+  const hzRows = await db.query<{ amount: string | number; batch_id: string }>(
+    `SELECT amount, batch_id FROM fact_finance
+     WHERE company_id = '${HZ[0].id}' AND fin_month = DATE '2026-03-01'
+       AND metric_id = (SELECT id FROM dim_metric WHERE name = '营业收入')
+       AND period_type = '本年累计'`,
+  );
+  check('★ 「华东分公司」的钱确实记在「华东子公司」名下',
+    hzRows.length === 1 && Number(hzRows[0].amount) === 300 && hzRows[0].batch_id === 'b_tier3',
+    `${JSON.stringify(hzRows[0] ?? {})}`);
+
+  const aliasRows = await db.query<{ normalized: string; target_id: string; alias: string }>(
+    `SELECT normalized, target_id, alias FROM dim_alias WHERE kind = 'company' AND normalized = '华东分公司'`,
+  );
+  check('人确认的映射写进了 dim_alias（下月自动命中）',
+    aliasRows.length === 1 && aliasRows[0].target_id === HZ[0].id && aliasRows[0].alias === '华东分公司',
+    JSON.stringify(aliasRows));
+
+  // --- 关键：下个月同样的写法，不再问第二遍 ---
+  const t4 = await commit('b_tier4', [row('华东分公司', '2026-04', 500)]);
+  check('★ 人确认过一次后，下月自动命中 Tier 1（一次人工投入换永久自动）',
+    t4.needsDecision.length === 0 && t4.inserted === 1 && t4.createdCompanies.length === 0,
+    `inserted=${t4.inserted} 待确认=${t4.needsDecision.length}`);
+
+  // --- 别名指向诚实性：不存在的目标必须报错，不能造出指向虚空的别名 ---
+  let badTarget = '';
+  try {
+    await commit('b_bad', [row('华南分公司', '2026-05', 1)], {
+      decisions: [{ kind: 'company', raw: '华南分公司', action: 'merge', targetId: 'c_不存在' }],
+    });
+  } catch (e) {
+    badTarget = (e as Error).message;
+  }
+  check('★ 并入不存在的目标 → 报错（否则会造出指向虚空的自动别名）', /目标主数据不存在/.test(badTarget), badTarget);
+
+  // --- strict 模式：抛错而不是回结论 ---
+  const strictRows = [row('华北分公司', '2026-06', 1)];
+  let strictMsg = '';
+  try {
+    await commit('b_strict', strictRows, { strict: true });
+  } catch (e) {
+    strictMsg = (e as Error).message;
+  }
+  check('strict 模式遇歧义直接抛错', /需要人工确认后才能提交/.test(strictMsg), strictMsg.slice(0, 60));
+
+  // --- 未识别清单要按出现行数排序（人先看覆盖数据最多的那个）---
+  const staged3 = await stage(LONG, '财务快报');
+  check('stage 输出 unresolved 候选清单', Array.isArray(staged3.unresolved.companies) && Array.isArray(staged3.unresolved.metrics));
+  check('★ 重复导入相同名字不再报未识别（已全部建维 + 别名命中）',
+    staged3.unknownCompanies.length === 0 && staged3.unknownMetrics.length === 0,
+    `公司 ${staged3.unknownCompanies.length} / 指标 ${staged3.unknownMetrics.length}`);
 }
 
 // ============ 汇总 ============
