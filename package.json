@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.5",
+    "echarts": "^6.1.0",
     "jszip": "^3.10.1",
     "xlsx-populate": "^1.21.0",
     "yaml": "^2.6.1"

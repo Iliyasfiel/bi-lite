@@ -8,6 +8,7 @@
  */
 import XLSXPopulate from 'xlsx-populate';
 import { execute, query, writer } from '../db/index.ts';
+import { PERIOD_TYPES } from '../db/schema.ts';
 
 export interface LongRow {
   fin_month: string;    // YYYY-MM-DD
@@ -125,9 +126,9 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
       ...(r.alias ?? []),
     ]),
   );
-  const knownPeriods = new Set(
-    (await query<{ period_type: string }>('SELECT DISTINCT period_type FROM fact_finance')).map((r) => r.period_type),
-  );
+  // 口径：以 PERIOD_TYPES 注册表为准（铁律 5），而不是"库里已有什么"。
+  // 用库里的既有值当白名单会导致首次导入无法识别任何口径，且新增口径永远进不来。
+  const knownPeriods = new Set<string>(PERIOD_TYPES.map((p) => p.id));
 
   const unknownCompanies = [...new Set(rows.map((r) => r.company))].filter((c) => !knownCompanies.has(c));
   const unknownMetrics = [...new Set(rows.map((r) => r.metric))].filter((m) => !knownMetrics.has(m));
@@ -145,6 +146,14 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
     issues.push({
       level: 'warn',
       message: `未识别的指标名 ${unknownMetrics.length} 个: ${unknownMetrics.slice(0, 5).join(', ')}${unknownMetrics.length > 5 ? ' …' : ''}`,
+    });
+  }
+
+  if (unknownPeriodTypes.length) {
+    // 口径未注册 = error：语义层会拒绝它，写进去也只是死数据（铁律 5）
+    issues.push({
+      level: 'error',
+      message: `未注册的口径 ${unknownPeriodTypes.length} 个（须先加进 PERIOD_TYPES）: ${unknownPeriodTypes.join(', ')}`,
     });
   }
 

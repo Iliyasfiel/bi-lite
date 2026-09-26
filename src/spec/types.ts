@@ -30,6 +30,17 @@ export interface Block {
     time?: { year?: string | number; month?: string | number };
     company?: { dim?: string; filter?: Record<string, string> };
   };
+  /**
+   * 可选图表声明 —— 同一份 spec 的第二个 renderer（§5.3、F5）。
+   * 没写就只能出 Excel；写了就能出图，且换口径时图表与表格一起跟随。
+   */
+  chart?: {
+    type: 'bar' | 'line' | 'pie' | 'area';
+    category?: 'rows' | 'cols';
+    title?: string;
+    stacked?: boolean;
+    include?: { rows?: string[]; cols?: string[] };
+  };
 }
 
 export interface AxisSpec {

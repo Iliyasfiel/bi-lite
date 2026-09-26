@@ -288,6 +288,148 @@ const planStr = JSON.stringify(plan);
 const leaked = /\d{4,}/.test(planStr.replace(/"totalCells":\d+/, ''));
 check('给 agent 的预览不含金额', !leaked, planStr.slice(0, 120));
 
+// ============ 10. 语义层自由查询（F6）============
+log('\n════════ 10. 语义层 query_metrics ════════');
+const { queryMetrics, compileMetrics, band, catalog, QueryRefused } = await import('../src/semantic/query.ts');
+
+const cat = await catalog();
+log(`  目录: ${cat.dimensions.length} 维度 / ${cat.periodTypes.length} 口径 / ${cat.metrics.length} 指标 / ${cat.companies.length} 公司`);
+check('目录含 5 个维度', cat.dimensions.length === 5, cat.dimensions.map((d) => d.name).join(','));
+check('目录含 5 个口径', cat.periodTypes.length === 5);
+check('目录含 5 指标 / 4 公司', cat.metrics.length === 5 && cat.companies.length === 4);
+// 目录本身不含金额
+const catStr = JSON.stringify(cat);
+check('目录不含金额', !/\d{4,}/.test(catStr), `${catStr.length} 字节`);
+
+// human 视角：精确值
+const qHuman = await queryMetrics({
+  measures: [{ metric: '营业收入', periodType: '本年累计' }, { metric: '营业收入', periodType: '单月' }],
+  groupBy: ['company'],
+  filter: { month: '2026-06' },
+  audience: 'human',
+});
+log(`  人视角: ${qHuman.groups.length} 组 × ${qHuman.columns.length} 指标，脱敏=${qHuman.meta.redaction}`);
+const sampleHuman = qHuman.groups[0];
+log(`    ${sampleHuman.values.join('/')}: [${sampleHuman.cells.map((c) => (typeof c === 'number' ? c.toLocaleString() : c)).join(', ')}]`);
+check('human 返回精确数值', qHuman.groups.every((g) => g.cells.every((c) => typeof c === 'number' || c === null)));
+check('human 不脱敏', qHuman.meta.redaction === 'none');
+check('按公司分组返回 4 组', qHuman.groups.length === 4, `${qHuman.groups.length}`);
+
+// agent 视角：同一查询 → 分档值 + 阈值
+// 注意：这里**不加 month 过滤** —— 一整年 12 个月的数据支撑每格，才过得了反推阈值。
+const qAgent = await queryMetrics({
+  measures: [{ metric: '营业收入', periodType: '本年累计' }, { metric: '营业收入', periodType: '单月' }, { metric: '利润总额', periodType: '本年累计' }],
+  groupBy: ['company'],
+  audience: 'agent',
+});
+log(`  agent 视角: 脱敏=${qAgent.meta.redaction}，每格最少 ${qAgent.meta.minSupport} 行支撑，示例 [${qAgent.groups[0].cells.join(', ')}]`);
+check('agent 返回分档值而非精确数', qAgent.groups.every((g) => g.cells.every((c) => c === null || typeof c === 'string')));
+check('agent 脱敏标记为 banded', qAgent.meta.redaction === 'banded');
+check('分档值含单位（亿/万/千）', qAgent.groups.some((g) => g.cells.some((c) => typeof c === 'string' && /[亿万千]/.test(c))));
+check('分档不可还原为精确数', !/\d{5,}/.test(qAgent.groups.flatMap((g) => g.cells).join(',')));
+
+// 分档不可还原：同一条查询，agent 拿不到精确数
+const humanVals = JSON.stringify(qHuman.groups.map((g) => g.cells));
+const agentVals = JSON.stringify(qAgent.groups.map((g) => g.cells));
+check('人/agent 同一查询返回不同形态', humanVals !== agentVals);
+
+// 聚合阈值：单月单指标 = 每格仅 1 行明细支撑 → 必须拒绝（防反推，R5）
+let tooFine = false;
+try {
+  await queryMetrics({
+    measures: [{ metric: '营业收入', periodType: '单月' }],
+    groupBy: ['company', 'metric'],
+    filter: { month: '2026-06' },
+    audience: 'agent',
+  });
+} catch (e) {
+  tooFine = e instanceof QueryRefused && (e as InstanceType<typeof QueryRefused>).reason === 'TOO_FINE_GRAINED';
+  if (tooFine) log('  过细粒度被拒:', (e as Error).message);
+}
+check('agent 探测式细粒度查询被拒（每格 1 行明细）', tooFine);
+
+// 同一过细查询，human 允许（人本来就该能看明细）
+const fineHuman = await queryMetrics({
+  measures: [{ metric: '营业收入', periodType: '单月' }],
+  groupBy: ['company', 'metric'],
+  filter: { month: '2026-06' },
+  audience: 'human',
+});
+check('同一查询 human 放行（阈值只约束 agent）', fineHuman.groups.length > 0, `${fineHuman.groups.length} 行`);
+check('human 结果含精确数值', fineHuman.groups.some((g) => g.cells.some((c) => typeof c === 'number')));
+
+// 未注册维度被拒
+let badDim = false;
+try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['secret'], audience: 'human' }); } catch { badDim = true; }
+check('自由查询拒绝未注册维度', badDim);
+
+// 未注册口径被拒
+let badPeriod = false;
+try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '我编的口径' }], audience: 'human' }); } catch { badPeriod = true; }
+check('自由查询拒绝未注册口径', badPeriod);
+
+// SQL 注入：指标名里的单引号必须被双写转义
+const INJ = "营业收入'); DROP TABLE fact_finance;--";
+const inj = compileMetrics({ measures: [{ metric: INJ, periodType: '本年累计' }], audience: 'human' });
+log('  注入输入的转义结果: ' + inj.sql.split('\n').find((l) => l.includes('营业收入'))?.trim().slice(0, 110));
+// 期望：每个单引号都被双写；不存在未转义的 `'); DROP`
+const unescaped = INJ.replace(/'/g, "''");
+check('指标名中的引号被双写转义', inj.sql.includes(unescaped) && !inj.sql.includes("= '营业收入'); DROP"));
+const stillThere = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
+check('注入尝试后事实表仍在', Number(stillThere[0].n) === 960, `${stillThere[0].n} 行`);
+
+// 分档函数
+check('band() 分档正确', band(123456789) === '1.2亿' && band(45678) === '4.6万' && band(null) === null, `${band(123456789)} / ${band(45678)}`);
+
+// ============ 11. 图表渲染器（同一 spec 的第二个 renderer，F5）============
+log('\n════════ 11. 图表渲染器（同一 spec → ECharts）════════');
+const { toEChartsOption, chartShape } = await import('../src/render/chart.ts');
+const chartSpec = { type: 'bar' as const, title: '各公司营业收入', stacked: false };
+const opt = toEChartsOption(chartSpec, result);
+log(`  类目轴: ${opt.xAxis!.data.join(', ')}`);
+log(`  系列: ${opt.series.map((s) => s.name).join(', ')}`);
+check('option 含 xAxis/yAxis/series', !!opt.xAxis && !!opt.yAxis && opt.series.length > 0);
+check('系列名 = 4 个口径', opt.series.length === 4, `${opt.series.length}`);
+check('每个系列 5 个数据点', opt.series.every((s) => s.data.length === 5));
+check('option 含真实数值（只能给浏览器）', opt.series.some((s) => s.data.some((v) => typeof v === 'number')));
+
+// 同一 spec 的另一个投影方向
+const optByCols = toEChartsOption({ ...chartSpec, category: 'cols' }, result);
+check('category=cols 时类目轴变成口径', optByCols.xAxis!.data.join(',') === result.colLabels.join(','));
+check('category=cols 时系列变成 5 个指标', optByCols.series.length === 5, `${optByCols.series.length}`);
+
+// 换图表类型不改数据
+const optLine = toEChartsOption({ ...chartSpec, type: 'line' }, result);
+check('line 类型生效', optLine.series.every((s) => s.type === 'line'));
+const optPie = toEChartsOption({ ...chartSpec, type: 'pie' }, result);
+check('pie 类型生成单系列', optPie.series.length === 1 && optPie.series[0].type === 'pie');
+
+// 堆叠
+const optStack = toEChartsOption({ ...chartSpec, stacked: true }, result);
+check('stacked=true 时系列带 stack', optStack.series.every((s) => s.stack === 'total'));
+
+// ★ 安全：给 agent 的图表描述不含数值
+const shape = chartShape(chartSpec, result);
+const shapeStr = JSON.stringify(shape);
+log(`  图表形状（给 agent）: ${shapeStr}`);
+check('图表形状描述不含数值', !/"value":\d|\d{4,}/.test(shapeStr.replace(/"pointCount":\d+/, '')));
+check('图表形状含结构与标签', shape.chartType === 'bar' && shape.seriesLabels.length === 4);
+
+// spec 可选 chart 声明已被解析
+const specWithChart = parseSpec(`
+id: 带图表
+template: ${TPL}
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: B4
+        rows: { dim: metric, order: [营业收入] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+        chart: { type: bar, title: 测试 }
+`);
+check('spec 支持可选 chart 声明', specWithChart.sheets[0].blocks[0].chart?.type === 'bar');
+
 // ============ 汇总 ============
 log('\n════════════════════════════════');
 log(`  通过 ${pass} / 失败 ${fail}`);

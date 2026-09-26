@@ -7,7 +7,12 @@
 import type { Block, Spec, SheetSpec } from './types.ts';
 import { substitute } from './types.ts';
 
-/** 已注册的维度 —— group_by / rows / cols 只接受这里的名字（防注入 + 防越界） */
+/**
+ * 已注册的维度 —— group_by / rows / cols 只接受这里的名字（防注入 + 防越界）
+ *
+ * table === null 表示该维度的取值**直接来自事实表**（或是个 SQL 表达式），不需要 join。
+ * labelCol 在 table 为 null 时可以是完整表达式（如 `strftime(f.fin_month, '%Y-%m')`）。
+ */
 export const DIMENSIONS = {
   metric: {
     table: 'dim_metric',
@@ -21,8 +26,11 @@ export const DIMENSIONS = {
     idCol: 'id',
     joinOn: 'f.company_id = dim_company.id',
   },
-  // period_type 直接来自事实表，不 join
-  period_type: { table: null, labelCol: 'period_type', idCol: 'period_type', joinOn: null },
+  // 以下直接来自事实表，不 join
+  period_type: { table: null, labelCol: 'f.period_type', idCol: 'period_type', joinOn: null },
+  // 时间维度：Web 看板要"按月份筛选/分组"（F6）
+  month: { table: null, labelCol: "strftime(f.fin_month, '%Y-%m')", idCol: 'fin_month', joinOn: null },
+  year: { table: null, labelCol: 'CAST(year(f.fin_month) AS VARCHAR)', idCol: 'fin_month', joinOn: null },
 } as const;
 
 export type DimName = keyof typeof DIMENSIONS;

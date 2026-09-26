@@ -55,18 +55,25 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
    量纲、频率、口径体系都不同（Kimball 星型）。
    现有 `fact_contract`（已建表）；后续的 `fact_business_line` **尚未建**，加运营指标时新建表，别扩 `fact_finance`。
 9. **数据文件不入库。** `data/` 下是真实财务数据，**永不提交、永不进 prompt、永不贴进 issue**。
+10. **阈值与脱敏挂在"受众"上，不挂在查询上。** 见 §4 环境备忘第 7 条。
+    `audience='human'`（Web 看板，已授权的人）返**精确值、无阈值**；
+    `audience='agent'`（LLM/MCP）返**分档值 + 每格至少 3 行明细支撑**。
+    反推保护的判据是**每格背后的明细行数**（`minSupport`），**不是单元格个数** ——
+    按单元格个数计会让「公司 × 指标」单月网格（20 格、每格仅 1 行明细）蒙混过关。
+    禁止把 `audience` 默认成 `'agent'` 之外的值绕过限制，也禁止给 agent 开精确值出口。
 
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，39 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，71 项断言，唯一的门禁
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 断言覆盖：导入 → spec 编译 → 查询 → 渲染 → 版式保真 →
-  读回 → 换口径出第二张表 → 安全边界。
+- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 11 个阶段：模板指纹 → 开库 → STAGED 校验 →
+  提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
+  语义层 → 图表渲染。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
 - 验收脚本会 **`rm -rf data/bi.duckdb`**（每次从空库跑）。别拿它对着真实数据库跑。
 
@@ -97,6 +104,17 @@ npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
 6. **`exceljs` 只能用于生成测试 fixture**（`devDependencies`）。
    **生产路径禁用**：对含批注/图表/图片的真实模板 `readFile` 即崩，写出还会静默删 8/9 类部件（§5.3.1）。
    另外它 `addConditionalFormatting` 用 `type: 'dataBar'` 会崩，测试里用 `cellIs`。
+7. **聚合阈值与脱敏按 `audience` 分级**（`src/semantic/query.ts` 的 `THRESHOLDS`）：
+   `human { minSupport: 0, maxRows: 5000 }` / `agent { minSupport: 3, maxRows: 200 }`。
+   **`minSupport` 是"每格背后的明细行数"，实现上由 SQL 并出 `count(CASE WHEN <cond> THEN 1 END) AS n{i}` 得来。**
+   取 3 的依据：累计类口径每格 ≥ 6 行，而「单月 × 单指标 × 单公司」恰好 = 1 行 —— 阈值 3 挡住后者、不误伤看板。
+   实测 agent 查全年按公司分组 `minSupport = 12` 放行；单月探测式查询报
+   `结果过于精细（每格仅 1 行明细支撑 < 阈值 3）`。
+   **不要把判据改回"单元格个数"** —— 那会让 20 格 × 每格 1 行明细的查询蒙混过关。
+8. **Node 原生 TS 是 strip-only 模式，不支持构造函数参数属性。**
+   `constructor(msg: string, readonly reason: string)` 报
+   `SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript parameter property is not supported in strip-only mode`。
+   必须写成显式字段赋值（见 `QueryRefused`）。**这是固有约束，会反复遇到。**
 
 ## 5. 架构地图
 
@@ -113,19 +131,29 @@ src/
     types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
     compile.ts     ★ DIMENSIONS 白名单 + compileBlock() → 参数化 SQL
                    + runCompiled() + planOf()（给 agent 的坐标预览，不含金额）
+  semantic/
+    query.ts       ★ queryMetrics()：唯一的自由查询出口
+                   + staticCatalog()（元数据，零金额）+ band() 分档脱敏
+                   + QueryRefused + THRESHOLDS（按 audience 分级，见 §4 备忘 7）
   render/
     excel.ts       ★ renderTemplate()：xlsx-populate 模板填充
                    + readNumberFormat()（纯只读，勿改成 cell.style()）
                    + 兜底：setNumericCellXml / setTextCellXml（JSZip + 定向 XML）
                    + quoteFormulas()（公式注入防护）
+    chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
+                   + chartShape()（只含结构与标签、不含数据点，可给 agent）
 specs/             口径规格 YAML（如 月度保送表.yaml）
 templates/         原始报送模板（人工制作，不修改）
 data/              ⚠️ 真实财务数据，永不提交
 ```
 
 **数据流**：Excel 长表 →（`import/`，不经 LLM）→ DuckDB →（`spec/` 编译成 SQL，本地执行）
-→ 结果矩阵 →（`render/`）→ 报送 Excel。
+→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
 **agent 只参与产出 spec，从不接触数值。**
+
+**两条"给 agent 看不给数值"的对称设计**（新增返回数据的接口时照这个套路）：
+- `planOf(spec, results)` → 坐标网格（§5，第②层）
+- `chartShape(chart, input)` → 图表形状描述（§5.3，同一思路）
 
 ## 6. 落地顺序与当前进度
 
@@ -134,12 +162,12 @@ data/              ⚠️ 真实财务数据，永不提交
 
 | 阶段 | 状态 |
 |---|---|
-| 1. 导入闭环 | ✅ 已完成（验收：960 行/350ms，12 月 × 4 公司 × 5 指标 × 4 口径） |
-| 2. 语义层 + 查询 | ⬜ 未开始 —— `query_metrics` 自由查询 + Web 看板 |
-| 3. 规格引擎 | 🟡 Excel 渲染器 ✅；ECharts 渲染器（同一 spec 的第二个 renderer）⬜ |
+| 1. 导入闭环 | ✅ 服务端完成（960 行/320–380ms） |
+| 2. 语义层 + 查询 | ✅ 服务端完成（`query_metrics`，71 断言含受众分级/反推/注入）；⬜ Web 看板前端 |
+| 3. 规格引擎 | ✅ 两个 renderer 都完成（Excel 模板填充 + ECharts）；⬜ Web 预览界面 |
 | 4. agent 入口 | ⬜ 未开始 —— MCP 五个工具 + 模板/自然语言 → spec |
 
-**下一步**：第 2 步（它是第 4 步的前提 —— 没有注册维度就没有可下推的查询）。
+**下一步**：第 4 步（MCP 工具集），或先补 Web 前端让前两步的能力真正被人用到。
 
 ## 7. 测试纪律
 

@@ -73,9 +73,14 @@ CREATE TABLE IF NOT EXISTS import_batch (
 );
 `;
 
-/** 口径的类型：哪些可由单月派生，哪些必须实存 */
+/** 口径的类型：哪些可由单月派生，哪些必须实存
+ *
+ * ⚠️ id 必须与集团导出 Excel 里「口径」列的**字面值**完全一致 ——
+ * 它是 fact_finance.period_type 的实际取值，也是语义层校验的依据。
+ * （曾误写为 '累计'，与数据里的 '本年累计' 不符，会导致合法数据被拒。）
+ */
 export const PERIOD_TYPES = [
-  { id: '累计', label: '本年累计', derivable: false, note: '账面累计含调整，必须实存' },
+  { id: '本年累计', label: '本年累计', derivable: false, note: '含审计调整，必须实存' },
   { id: '去年同期累计', label: '去年同期累计', derivable: false, note: '来自去年账，无法从本月派生' },
   { id: '单月', label: '单月', derivable: false, note: '最基础的事实值，实际值' },
   { id: '单月同比', label: '单月同比', derivable: true, note: '可由 (本月 - 去年同月)/去年同月 派生' },
