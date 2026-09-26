@@ -75,19 +75,28 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 12. **禁止裸 `catch {}`。** 有意容错的地方必须留下可观测痕迹（打日志 + 回传状态字段）。
     判例：Parquet 归档曾因裸 `catch {}` **静默失效多轮**而无人察觉（R13）。
     现在 `POST /api/import/commit` 回传 `archived: boolean`，e2e 有 3 项断言守着。
+13. **MCP 工具返回值必须过金额兜底；审计日志只记字段名，不记值。**
+    `src/mcp/tools.ts` 的 `callTool()` 对每个返回值递归扫描，出现 **≥ `AMOUNT_TRIPWIRE`（10000）的数字**
+    即判定泄漏：记审计 + 打 stderr + 返回 `内部错误：… 已拦截（安全不变量）`。
+    **新增任何 MCP 工具都必须走 `callTool()`**，不得绕过。
+    审计写 `data/audit/mcp.jsonl`，只记 `argKeys` / `resultKeys` / `ms` / 成败 ——
+    **记值就等于把金额写进另一个明文文件**，那会让整套安全设计自我否定。
+    这道兜底**不替代铁律 1 的结构性设计**（如 `preview_spec` 根本不查库）：
+    它防的是"将来某次改动不小心把数值带进返回值"，作用是把**安静的泄漏**变成**响亮的报错**。
+    已知局限：分档串（`12.3亿`）与真正的低额金额都过不了它 —— 所以它只是第四道防线，不是第一道。
 
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，97 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，138 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 12 个阶段：模板指纹 → 开库 → STAGED 校验 →
+- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 13 个阶段：模板指纹 → 开库 → STAGED 校验 →
   提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
-  语义层 → 图表渲染 → **Web 服务 HTTP 全链路**。
+  语义层 → 图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -177,9 +186,19 @@ src/
                    + quoteFormulas()（公式注入防护）
     chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
                    + chartShape()（只含结构与标签、不含数据点，可给 agent）
+  mcp/
+    tools.ts       ★ 五个工具（list_metrics / get_template_schema / preview_spec /
+                   render_report / diff_report）
+                   + callTool()：★ 金额兜底（铁律 13）+ 审计（只记字段名）
+                   + findAmountLike()（递归找 ≥ AMOUNT_TRIPWIRE 的数字，给 e2e 复用）
+                   + previewSpec() ★ 不查库 —— 坐标纯从 spec 的 order 长度 + 锚点推出
+    server.ts      零依赖 MCP stdio 服务端（JSON-RPC 2.0，按 \n 分帧）
+                   ⚠️ stdout 是协议通道，日志一律走 stderr
+                   server/discover 必须回 -32601 才会让客户端回落 legacy（§3.2）
 specs/             口径规格 YAML（如 月度保送表.yaml）
 templates/         原始报送模板（人工制作，不修改）
 data/              ⚠️ 真实财务数据，永不提交
+  audit/           MCP 审计日志（JSONL，只记字段名不记值）
 ```
 
 **数据流**：Excel 长表 →（`import/`，不经 LLM）→ DuckDB →（`spec/` 编译成 SQL，本地执行）
@@ -200,12 +219,18 @@ data/              ⚠️ 真实财务数据，永不提交
 | 1. 导入闭环 | ✅ **完成**（服务端 960 行/320–380ms + Web 导入向导 + Parquet 归档） |
 | 2. 语义层 + 查询 | ✅ **完成**（`queryMetrics` 受众分级 / 反推防护 / 注入防护 + Web 看板查询页） |
 | 3. 规格引擎 | ✅ **完成**（Excel 模板填充 + ECharts 两个 renderer + Web 报表预览/导出） |
-| 4. agent 入口 | ⬜ 未开始 —— MCP 五个工具 + 模板/自然语言 → spec |
+| 4. agent 入口 | ✅ **完成**（MCP 五工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
 
-前 3 步已由 `src/server.ts` + `src/web/` 打通到人可操作的界面，
-97 项 e2e 断言（含第 12 阶段 HTTP 全链路）守着。
+四步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
+**138 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端）守着。
 
-**下一步**：第 4 步（MCP 五工具：`list_metrics` / `get_template_schema` / `preview_spec` / `render_report` / `diff_report`）。
+**下一步（尚未开始）**：第 5 步「模板 → spec 的自动生成」——
+现在 agent 只能**校验人写好的 spec**（`preview_spec` / `diff_report` / `render_report`），
+还不能自己读一个新模板并产出 spec 草稿（`get_template_schema` 已提供所需的结构信息，
+缺的是把结构转成 spec 的那一步）。以及真实数据接入时的 R1 主数据对齐。
+
+**新增 MCP 工具时**：必须走 `callTool()`（铁律 13），并在 `test/e2e.ts` 第 13 阶段补断言
+（工具数、返回值零金额、错误路径）。
 
 ## 7. 测试纪律
 

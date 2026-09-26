@@ -12,6 +12,7 @@ import { stage, commit, readLongTable, type LongRow } from '../src/import/longta
 import { compileBlock, runCompiled } from '../src/spec/compile.ts';
 import { parseSpec } from '../src/spec/types.ts';
 import { renderTemplate, type RenderBlock } from '../src/render/excel.ts';
+import { findAmountLike } from '../src/mcp/tools.ts';
 
 const TPL = 'test/fixtures/月度保送表.xlsx';
 const LONG = 'test/fixtures/集团导出长表.xlsx';
@@ -560,6 +561,154 @@ if (archived.length) {
 }
 
 stop();
+
+// ============ 13. MCP 工具集（第 4 步：agent 入口）============
+//
+// ★ 本阶段**用 DSH 自带的真实 MCP 客户端 SDK** 连我们的手写 stdio 服务端 ——
+//   不是自打一个 mock 客户端自己对自己。这样协议漂移（分帧、版本协商、
+//   server/discover 回落）会被真实客户端实测出来，而不是靠我们的假设。
+log('\n════════ 13. MCP 工具集（真实客户端 · 零依赖 stdio）════════');
+
+const SDK_DIR = '/Applications/DSH Desktop.app/Contents/Resources/app/node_modules/@modelcontextprotocol/client/dist/';
+let mcpOk = false;
+let mcpSkipReason = '';
+try {
+  const { Client } = await import(SDK_DIR + 'index.mjs');
+  const { StdioClientTransport } = await import(SDK_DIR + 'stdio.mjs');
+
+  // 用 DSH 同款配置（含 versionNegotiation: auto —— 它会先探 server/discover 再回落 legacy）
+  const client = new Client(
+    { name: 'bi-lite-e2e', version: '0.0.1' },
+    { capabilities: {}, versionNegotiation: { mode: 'auto' } },
+  );
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: ['src/mcp/server.ts'],
+      cwd: process.cwd(),
+      stderr: 'ignore', // 服务端日志走 stderr，别污染测试输出
+    }),
+  );
+  mcpOk = true;
+
+  const raw = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = await client.callTool({ name, arguments: args });
+    const text = (r.content as Array<{ type: string; text: string }>)[0].text;
+    return { isError: r.isError === true, text, json: (() => { try { return JSON.parse(text); } catch { return null; } })() };
+  };
+
+  // --- 握手与工具清单 ---
+  const list = await client.listTools();
+  const names = list.tools.map((t) => t.name).sort();
+  check('MCP 握手成功（auto 协商 → legacy 回落）', true, '真实客户端已连接');
+  check('恰好暴露 5 个工具', names.length === 5, names.join(', '));
+  check(
+    '工具集与 §7.1 一致',
+    JSON.stringify(names) ===
+      JSON.stringify(['diff_report', 'get_template_schema', 'list_metrics', 'preview_spec', 'render_report']),
+  );
+  check(
+    '每个工具都有 description 与 inputSchema',
+    list.tools.every((t) => t.description && t.description.length > 20 && t.inputSchema),
+  );
+
+  // --- 1. list_metrics：纯元数据 ---
+  const lm = await raw('list_metrics');
+  check('list_metrics 成功', !lm.isError);
+  check('list_metrics 有维度/口径/指标/公司', lm.json.dimensions.length === 5 && lm.json.periodTypes.length === 5 && lm.json.metrics.length === 5 && lm.json.companies.length === 4);
+  check('list_metrics 不含金额', findAmountLike(lm.json).length === 0);
+
+  // --- 2. get_template_schema：模板结构，且不回传数字 ---
+  const ts = await raw('get_template_schema', { template: TPL });
+  check('get_template_schema 成功', !ts.isError);
+  const anchor = ts.json.anchors.find((a: any) => a.name === 'DATA_START');
+  check('解析出定义名称锚点 DATA_START → B4', anchor?.cell === 'B4' && anchor?.sheet === '主要指标');
+  check('锚点上方表头即列口径', JSON.stringify(anchor?.headerAbove) === JSON.stringify(['本年累计', '去年同期累计', '单月', '账面累计']));
+  check('锚点左方行标签', anchor?.labelsLeft[0] === '营业收入' && anchor?.labelsLeft.length === 6);
+  check('识别出合并单元格 3 处', ts.json.sheets[0].mergedCells.length === 3);
+  check('模板结构不含金额', findAmountLike(ts.json).length === 0);
+
+  // --- 3. preview_spec：★ 不查库，结构上不可能泄漏 ---
+  const pv = await raw('preview_spec', { specFile: 'specs/月度保送表.yaml', params: { year: 2026, month: 6 } });
+  check('preview_spec 成功', !pv.isError);
+  check('预览给出写入区域 B4:E8', pv.json.blocks[0].dataRange === 'B4:E8', pv.json.blocks[0].dataRange);
+  check('预览 5 行 × 4 列 = 20 格', pv.json.blocks[0].cells === 20);
+  check('预览含行标签与列口径标签', pv.json.blocks[0].rows.labels[0] === '营业收入' && pv.json.blocks[0].cols.labels[0] === '本年累计');
+  check('预览标注锚点类型为定义名称', pv.json.blocks[0].anchor.kind === 'name');
+  check('★ 预览不含任何金额', findAmountLike(pv.json).length === 0);
+  check('预览的 plan 也不含金额', findAmountLike(pv.json.plan).length === 0);
+
+  // --- 4. render_report：真的出文件，但只回路径 ---
+  const before = new Set(fs.globSync('output/*.xlsx'));
+  const rr = await raw('render_report', {
+    specFile: 'specs/月度保送表.yaml',
+    params: { year: 2026, month: 6 },
+    output: 'e2e-mcp-渲染.xlsx',
+  });
+  check('render_report 成功', !rr.isError);
+  check('渲染写入 20 格', rr.json.cellsWritten === 20, `${rr.json.cellsWritten}`);
+  check('★ render_report 返回值不含金额', findAmountLike(rr.json).length === 0);
+  check('render_report 只回路径不回内容', !('matrix' in rr.json) && !('rows' in rr.json));
+
+  const outFile = rr.json.outputPath;
+  check('渲染产物确实落盘', fs.existsSync(outFile), outFile);
+  // 产物内容用文件读回验证 —— 数值只在这里出现，不走 MCP 返回值
+  {
+    const XLSXPopulate = (await import('xlsx-populate')).default;
+    const wb = await XLSXPopulate.fromFileAsync(outFile);
+    const sheet = wb.sheet('主要指标');
+    check('MCP 渲染出的 B4 是营业收入本年累计 765345', sheet.cell('B4').value() === 765345, String(sheet.cell('B4').value()));
+    check('模板行标签未被覆盖（A4 仍是营业收入）', sheet.cell('A4').value() === '营业收入');
+    check('模板合并区保留 3 处', Object.keys((sheet as any)._mergeCells).length === 3);
+    check('模板另一个 sheet「分板块」还在', wb.sheets().map((s) => s.name()).includes('分板块'));
+  }
+
+  // --- 5. diff_report：换口径只是文本 diff ---
+  const OLD = `id: T
+template: test/fixtures/月度保送表.xlsx
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: { name: DATA_START }
+        rows: { dim: metric, order: [营业收入, 利润总额] }
+        cols: { dim: period_type, order: [本年累计, 去年同期累计, 单月, 账面累计] }
+        value: { measure: amount, agg: sum }`;
+  const NEW = OLD.replace('dim: metric', 'dim: company')
+    .replace('order: [营业收入, 利润总额]', 'order: [集团公司, 华东子公司]')
+    .replace('order: [本年累计, 去年同期累计, 单月, 账面累计]', 'order: [本年累计, 单月]');
+  const dr = await raw('diff_report', { before: OLD, after: NEW });
+  check('diff_report 成功且识别出差异', !dr.isError && dr.json.changed === true);
+  check('diff 精确到字段路径（rows.dim）', dr.json.changes.some((c: any) => c.path === 'sheets[0].blocks[0].rows.dim' && c.before === 'metric' && c.after === 'company'));
+  check('diff 报出口径顺序变化（不是 [object Object]）', dr.json.changes.some((c: any) => c.path.endsWith('cols.order') && c.after === '[本年累计, 单月]'));
+  check('diff 结果不含金额', findAmountLike(dr.json).length === 0);
+
+  // --- 错误路径 ---
+  const bad1 = await raw('render_report', { spec: OLD.replace('test/fixtures/月度保送表.xlsx', '/nope.xlsx') });
+  check('模板不存在 → isError', bad1.isError && /模板不存在/.test(bad1.text));
+  const bad2 = await raw('preview_spec', {});
+  check('缺 spec → isError', bad2.isError && /需要 spec/.test(bad2.text));
+  const bad3 = await raw('no_such_tool', {});
+  check('未知工具 → isError 且列出可用工具', bad3.isError && /可用工具/.test(bad3.text));
+
+  // --- ★ 机械兜底：金额形状的数字必须被拦下 ---
+  check('金额兜底能识别 >10000 的数字', findAmountLike({ a: 765345 }).length === 1);
+  check('金额兜底放过分档字符串与结构计数', findAmountLike({ v: '76.5万', cells: 20, year: 2026 }).length === 0);
+
+  // --- 审计日志：只记字段名不记值 ---
+  const auditLog = 'data/audit/mcp.jsonl';
+  check('审计日志已写出', fs.existsSync(auditLog));
+  const auditText = fs.readFileSync(auditLog, 'utf8');
+  check('审计记录工具名与结果字段名', auditText.includes('"tool":"render_report"') && auditText.includes('"resultKeys"'));
+  check('★ 审计日志不含任何金额', !/\d{5,}/.test(auditText.replace(/"ms":\d+/g, '')), '已剔除耗时字段后仍无 5 位以上数字');
+
+  await client.close();
+} catch (e) {
+  mcpSkipReason = (e as Error).message;
+}
+
+if (!mcpOk) {
+  check('MCP 阶段可运行', false, mcpSkipReason);
+}
 
 // ============ 汇总 ============
 log('\n════════════════════════════════');
