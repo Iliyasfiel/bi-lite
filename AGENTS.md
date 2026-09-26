@@ -32,7 +32,7 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 ## 2. 铁律（违反任何一条 = 回滚，不接受"临时"例外）
 
 1. **明细数据不出 DuckDB 进程；金额不进 LLM 上下文。**
-   - agent **没有 SQL 权**。只暴露 §7.1 的五个工具，无 shell。
+   - agent **没有 SQL 权**。只暴露 §7.1 的六个工具，无 shell。
    - 给 agent 的预览（`planOf()`）**只含坐标与形状，不含数值**。
    - 新增任何"返回查询结果"的工具或接口前，先确认它是否会把明细值送进 LLM。
    - 参考：Lightdash/Metabase/Superset 三家都给 LLM SQL 权再加闸门，**bi-lite 是根本不给**。
@@ -84,19 +84,33 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
     这道兜底**不替代铁律 1 的结构性设计**（如 `preview_spec` 根本不查库）：
     它防的是"将来某次改动不小心把数值带进返回值"，作用是把**安静的泄漏**变成**响亮的报错**。
     已知局限：分档串（`12.3亿`）与真正的低额金额都过不了它 —— 所以它只是第四道防线，不是第一道。
+14. **上报的数字必须按声明的 params 过滤；"静默算错"比"拒绝出表"危险得多。**
+    `parseSpec()` 会检查 `params` 的每个键是否真的被 `{{key}}` 引用过（`findUnusedParams()`），
+    没有引用就**解析即报错**。判例（§11.3）：`specs/月度保送表.yaml` 曾声明 `year/month` 却从不引用，
+    于是"2026 年 6 月月报"静默地把 **12 个月全加总**（B4 得 765345，真值 66826）——
+    数字同量级、格式正常，人不会怀疑它。更糟的是**错数字被写进了 e2e 断言**，测试反而成了 bug 的守卫。
+    - 改 spec 结构时，**先确认 `scope.time` 还在**；新增会用到 `params` 的字段，记得同步
+      `substitutableStrings()`（必须与 `compile.ts` 里所有 `substitute()` 调用点一致）。
+    - 发现断言里的数字与独立算法（如直接 SQL）不一致时，**先怀疑断言**，别急着改代码迁就它。
+15. **模板推断是"提案"，不是"决策"。** `src/spec/infer.ts` 的每个轴必须带 `source`
+    （`template` = 读到的 / `guessed` = 猜的）与 `evidence`（判断依据），
+    "猜的"要单独列出来给人核对。**不许把猜出来的东西标成读到的** —— 那会让人失去核对的机会。
+    判维要求**全部标签命中**某维度，不许"半数像就算"。
+    公式行必须**先排除、再判维**（首版顺序反了，导致「合计」行的标签被送去匹配指标表而失败）。
 
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，138 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，155 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 13 个阶段：模板指纹 → 开库 → STAGED 校验 →
+- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 14 个阶段：模板指纹 → 开库 → STAGED 校验 →
   提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
-  语义层 → 图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端）**。
+  语义层 → 图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
+  **spec 校验（防静默算错，铁律 14）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -173,8 +187,15 @@ src/
                    三态：STAGED → SYNCING → READY / ERROR
   spec/
     types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
+                   + findUnusedParams()（★ 防"声明了 params 却没用"的静默算错，铁律 14）
     compile.ts     ★ DIMENSIONS 白名单 + compileBlock() → 参数化 SQL
                    + runCompiled() + planOf()（给 agent 的坐标预览，不含金额）
+    template.ts    模板结构读取：表头/行标签/合并区/定义名称/公式行
+                   + readTemplateSchema() / readRegion() / textAt()（数字在类型层面没出口）
+    infer.ts       ★ 模板 → spec 草稿（铁律 15）
+                   + 每个轴带 source（template=读到的 / guessed=猜的）+ evidence（依据）
+                   + 公式行先排除再判维；判维要求全部标签命中
+                   + 手写 YAML 输出（注释是草稿的主要价值）
   semantic/
     query.ts       ★ queryMetrics()：唯一的自由查询出口
                    + staticCatalog()（元数据，零金额）+ band() 分档脱敏
@@ -187,11 +208,12 @@ src/
     chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
                    + chartShape()（只含结构与标签、不含数据点，可给 agent）
   mcp/
-    tools.ts       ★ 五个工具（list_metrics / get_template_schema / preview_spec /
-                   render_report / diff_report）
+    tools.ts       ★ 六个工具（list_metrics / get_template_schema / preview_spec /
+                   render_report / diff_report / generate_spec）
                    + callTool()：★ 金额兜底（铁律 13）+ 审计（只记字段名）
                    + findAmountLike()（递归找 ≥ AMOUNT_TRIPWIRE 的数字，给 e2e 复用）
                    + previewSpec() ★ 不查库 —— 坐标纯从 spec 的 order 长度 + 锚点推出
+                   + generateSpec() ★ 不查库 —— 只读模板结构与注册表（铁律 15）
     server.ts      零依赖 MCP stdio 服务端（JSON-RPC 2.0，按 \n 分帧）
                    ⚠️ stdout 是协议通道，日志一律走 stderr
                    server/discover 必须回 -32601 才会让客户端回落 legacy（§3.2）
@@ -219,15 +241,29 @@ data/              ⚠️ 真实财务数据，永不提交
 | 1. 导入闭环 | ✅ **完成**（服务端 960 行/320–380ms + Web 导入向导 + Parquet 归档） |
 | 2. 语义层 + 查询 | ✅ **完成**（`queryMetrics` 受众分级 / 反推防护 / 注入防护 + Web 看板查询页） |
 | 3. 规格引擎 | ✅ **完成**（Excel 模板填充 + ECharts 两个 renderer + Web 报表预览/导出） |
-| 4. agent 入口 | ✅ **完成**（MCP 五工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
+| 4. agent 入口 | ✅ **完成**（MCP 六工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
+| 5. 模板 → spec 自动生成 | ✅ **完成**（`template.ts` + `infer.ts` + `generate_spec` + Web 上传模板出草稿） |
 
-四步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**138 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端）守着。
+五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
+**155 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+第 14 阶段 spec 校验防静默算错）守着。
 
-**下一步（尚未开始）**：第 5 步「模板 → spec 的自动生成」——
-现在 agent 只能**校验人写好的 spec**（`preview_spec` / `diff_report` / `render_report`），
-还不能自己读一个新模板并产出 spec 草稿（`get_template_schema` 已提供所需的结构信息，
-缺的是把结构转成 spec 的那一步）。以及真实数据接入时的 R1 主数据对齐。
+**下一步（尚未开始）**：真实数据接入时的 **R1 主数据对齐** ——
+现在 `stage()` 只会把"未识别名称"列成清单给人看，人要重新建维。
+真正的解法是加 `dim_company_alias` / `dim_metric_alias` 两张别名映射表，
+导入时自动归并（"集团有限公司" → "集团公司"），人工只需确认增量。
+**不做这件事，三个月后数据全是孤儿行。**
+另外 §7.2 路径 2（自然语言描述口径 → spec）目前仍是空白。
+
+### 6.1 本轮的教训：测试也会成为 bug 的守卫
+
+第 5 步发现 `specs/月度保送表.yaml` 声明 `year/month` 却从不引用，
+"2026年6月月报"实际把 **12 个月全加总**（B4 = 765345，真值 66826）。
+**错的数字已经被写进 `test/e2e.ts` 的断言**，此后一直是绿的 ——
+测试不但没抓住 bug，反而把它锁死了（详见 §2 铁律 14、`docs/需求与架构.md` §11.3）。
+
+**推论**：断言里的期望值必须来自**独立算法**（如直接 SQL 查一遍），
+不能来自"上一次跑出来的结果"。发现数字对不上时，**先怀疑断言**。
 
 **新增 MCP 工具时**：必须走 `callTool()`（铁律 13），并在 `test/e2e.ts` 第 13 阶段补断言
 （工具数、返回值零金额、错误路径）。

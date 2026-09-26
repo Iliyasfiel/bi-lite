@@ -21,12 +21,15 @@ import { parseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
 import { renderTemplate, type RenderBlock } from './render/excel.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
+import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
 
 const require = createRequire(import.meta.url);
 const PORT = Number(process.env.PORT ?? 4319);
 const WEB_DIR = path.join(import.meta.dirname, 'web');
 const UPLOAD_DIR = 'data/uploads';
 const OUTPUT_DIR = 'output';
+/** 用户上传的待推断模板（临时）；`templates/` 下人工维护的模板才是正式版本 */
+const TEMPLATE_UPLOAD_DIR = 'templates/uploads';
 
 // ---------------- 工具 ----------------
 
@@ -171,6 +174,72 @@ const routes: Record<string, Handler> = {
   /** 已注册报表列表（specs/*.yaml） */
   'GET /api/specs': async (_req, res) => {
     json(res, 200, listSpecs());
+  },
+
+  /**
+   * 从模板推断 spec 草稿（§7.2 路径 1）。
+   *
+   * 与 `/api/import/stage` 同一套路：原始二进制 body + `X-Filename` 头，不用 multipart。
+   * 上传的模板落在 `templates/uploads/`，与 `templates/` 下人工维护的模板分开，
+   * 避免临时上传被当成正式模板版本化（`.gitignore` 只忽略后者）。
+   */
+  'POST /api/template/infer': async (req, res) => {
+    const rawName = String(req.headers['x-filename'] ?? '模板.xlsx');
+    const name = safeName(decodeURIComponent(rawName));
+    if (!name) return json(res, 400, { error: '缺少文件名' });
+
+    const buf = await readBody(req, 32 * 1024 * 1024);
+    if (!buf.length) return json(res, 400, { error: '文件为空' });
+
+    fs.mkdirSync(TEMPLATE_UPLOAD_DIR, { recursive: true });
+    const dest = path.join(TEMPLATE_UPLOAD_DIR, `${Date.now()}-${name}`);
+    fs.writeFileSync(dest, buf);
+
+    try {
+      const cat = await catalog();
+      const registry: Registry = {
+        metrics: cat.metrics.map((m) => m.name),
+        companies: cat.companies.map((c) => c.name),
+        periodTypes: cat.periodTypes.map((p) => p.id),
+        axisNames: cat.dimensions.map((d) => d.label),
+      };
+      const r = await inferSpec({ template: dest, registry });
+      json(res, 200, {
+        template: dest,
+        specId: r.spec.id,
+        yaml: r.yaml,
+        blocks: r.blocks,
+        guessed: guessedAxes(r),
+        unmatched: r.unmatched,
+        issues: r.issues,
+      });
+    } catch (e) {
+      // 推断失败要说清原因（模板识别不出数据区是常见的用户错误，不是内部故障）
+      json(res, 422, { error: (e as Error).message, template: dest });
+    }
+  },
+
+  /** 保存推断出的 spec 到 specs/（人工确认后的一步） */
+  'POST /api/specs/save': async (req, res) => {
+    const { id, yaml } = await readJson<{ id?: string; yaml: string }>(req);
+    if (!yaml || typeof yaml !== 'string') return json(res, 400, { error: '缺少 yaml' });
+
+    // ★ 定稿前必须过校验 —— 拒绝把"声明了 params 却没用"这类静默算错的 spec 写进仓库
+    let spec;
+    try {
+      spec = parseSpec(yaml);
+    } catch (e) {
+      return json(res, 400, { error: (e as Error).message });
+    }
+
+    // 文件名以 **YAML 里的 id** 为准，而不是前端传来的 id ——
+    // 人可能在文本框里改了 `id:` 那一行，用前端参数会出现"文件名与内容里的 id 不一致"。
+    const base = safeName(spec.id || id || '');
+    if (!base) return json(res, 400, { error: '非法 id（YAML 里的 id 不能为空且不能全是特殊字符）' });
+    fs.mkdirSync('specs', { recursive: true });
+    const dest = path.join('specs', `${base}.yaml`);
+    fs.writeFileSync(dest, yaml);
+    json(res, 200, { file: dest, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length });
   },
 
   /** 报表预览：出坐标计划（不含金额）+ 矩阵（含数值，给浏览器） */

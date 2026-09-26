@@ -67,7 +67,7 @@ export function toRef(row: number, col: number): string {
  *   写值 + 读 .style() 7947 字节 / 24 fonts / 28 cellXfs ← 仅"读"就污染了
  * 所以改为从 cellXfs 节点直接取 numFmtId，再查格式码。
  */
-function readNumberFormat(wb: Workbook, cell: Cell): string {
+export function readNumberFormat(wb: Workbook, cell: Cell): string {
   const styleId = (cell as unknown as { _styleId?: number })._styleId;
   if (styleId === undefined || styleId === null) return 'General';
   const ss = wb.styleSheet();

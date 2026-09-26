@@ -601,11 +601,11 @@ try {
   const list = await client.listTools();
   const names = list.tools.map((t) => t.name).sort();
   check('MCP 握手成功（auto 协商 → legacy 回落）', true, '真实客户端已连接');
-  check('恰好暴露 5 个工具', names.length === 5, names.join(', '));
+  check('恰好暴露 6 个工具', names.length === 6, names.join(', '));
   check(
     '工具集与 §7.1 一致',
     JSON.stringify(names) ===
-      JSON.stringify(['diff_report', 'get_template_schema', 'list_metrics', 'preview_spec', 'render_report']),
+      JSON.stringify(['diff_report', 'generate_spec', 'get_template_schema', 'list_metrics', 'preview_spec', 'render_report']),
   );
   check(
     '每个工具都有 description 与 inputSchema',
@@ -657,7 +657,7 @@ try {
     const XLSXPopulate = (await import('xlsx-populate')).default;
     const wb = await XLSXPopulate.fromFileAsync(outFile);
     const sheet = wb.sheet('主要指标');
-    check('MCP 渲染出的 B4 是营业收入本年累计 765345', sheet.cell('B4').value() === 765345, String(sheet.cell('B4').value()));
+    check('MCP 渲染出的 B4 是营业收入 2026-06 本年累计 66826', sheet.cell('B4').value() === 66826, String(sheet.cell('B4').value()));
     check('模板行标签未被覆盖（A4 仍是营业收入）', sheet.cell('A4').value() === '营业收入');
     check('模板合并区保留 3 处', Object.keys((sheet as any)._mergeCells).length === 3);
     check('模板另一个 sheet「分板块」还在', wb.sheets().map((s) => s.name()).includes('分板块'));
@@ -701,6 +701,39 @@ sheets:
   check('审计记录工具名与结果字段名', auditText.includes('"tool":"render_report"') && auditText.includes('"resultKeys"'));
   check('★ 审计日志不含任何金额', !/\d{5,}/.test(auditText.replace(/"ms":\d+/g, '')), '已剔除耗时字段后仍无 5 位以上数字');
 
+  // --- 6. generate_spec：模板 → spec 草稿（第 5 步，§7.2 路径 1）---
+  const gs = await raw('generate_spec', { template: TPL });
+  check('generate_spec 成功', !gs.isError, gs.text.slice(0, 160));
+  check('★ generate_spec 返回值不含金额', findAmountLike(gs.json).length === 0);
+  check('推断出两个数据区（主要指标 / 分板块）', gs.json.blocks.length === 2, String(gs.json.blocks.length));
+
+  const main = gs.json.blocks.find((b: any) => b.sheet === '主要指标');
+  check('主要指标 rows 识别为 metric 且来源是模板', main?.rows.dim === 'metric' && main?.rows.source === 'template');
+  check('主要指标 cols 识别为 period_type（4 个口径）', main?.cols.dim === 'period_type' && main?.cols.count === 4);
+  check('★ 公式行「合计」被排除，不在 rows.order 里', !main?.rows.labels.includes('合计') && main?.rows.count === 5, main?.rows.labels.join(','));
+  check('排除项带原因说明', main?.excluded.length === 1 && /SUM\(B4:B8\)/.test(main.excluded[0].reason));
+
+  const seg = gs.json.blocks.find((b: any) => b.sheet === '分板块');
+  check('分板块 rows 来源标记为 guessed（模板未预置行标签）', seg?.rows.source === 'guessed' && seg?.rows.dim === 'company');
+  check('猜的轴被显式列出（供人核对）', gs.json.guessed.length === 1 && gs.json.guessed[0].sheet === '分板块');
+
+  // 生成的 YAML 必须真能用：解析 → 编译 → 出正确数字
+  const genSpec = parseSpec(gs.json.yaml);
+  check('★ 推断出的 YAML 可以被 parseSpec 解析', genSpec.id === gs.json.specId);
+  {
+    const gb = genSpec.sheets.find((s) => s.name === '主要指标')!.blocks[0];
+    const gc = compileBlock(gb, genSpec.params ?? {});
+    const gres = await runCompiled(gc, (sql) => db.query(sql));
+    const b4 = gres.matrix[0].values[0];
+    check('★ 推断出的 spec 算出的是"2026-06 单月"而非 12 个月加总', b4 === 66826, String(b4));
+  }
+
+  // 时间范围必须被显式声明（这是本轮修掉的真 bug）
+  check(
+    '推断结果显式声明了 scope.time（不再静默汇总全部期间）',
+    genSpec.sheets.every((s) => s.blocks.every((b) => b.scope?.time?.year === '{{year}}' && b.scope?.time?.month === '{{month}}')),
+  );
+
   await client.close();
 } catch (e) {
   mcpSkipReason = (e as Error).message;
@@ -708,6 +741,53 @@ sheets:
 
 if (!mcpOk) {
   check('MCP 阶段可运行', false, mcpSkipReason);
+}
+
+// ============ 14. spec 校验：静默算错必须变成硬错误 ============
+log('\n════════ 14. spec 校验（防"静默算错"）════════');
+{
+  const { findUnusedParams } = await import('../src/spec/types.ts');
+
+  // ★ 回归防线：这正是 specs/月度保送表.yaml 曾经的真实缺陷 ——
+  //   声明了 params.year/month 却从未引用，于是 12 个月被静默加总。
+  const BUGGY = `
+id: 缺时间范围
+template: test/fixtures/月度保送表.xlsx
+params: { year: 2026, month: 6 }
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: { name: DATA_START }
+        rows: { dim: metric, order: [营业收入] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+`;
+  let rejected = false;
+  let msg = '';
+  try {
+    parseSpec(BUGGY);
+  } catch (e) {
+    rejected = true;
+    msg = (e as Error).message;
+  }
+  check('★ 声明了 params 却未引用 → 解析即拒绝', rejected, '若这里通过，说明"静默算错"防线失效');
+  check('拒绝理由指明是时间范围问题', /params 声明了但从未被引用/.test(msg) && /scope\.time/.test(msg));
+
+  // 正例：用了 params 就不该误报
+  const GOOD = BUGGY.replace(
+    'value: { measure: amount, agg: sum }',
+    'value: { measure: amount, agg: sum }\n        scope: { time: { year: "{{year}}", month: "{{month}}" } }',
+  );
+  const ok = parseSpec(GOOD);
+  check('引用了 params 的 spec 正常通过', findUnusedParams(ok).length === 0);
+
+  // 没有 params 的 spec 不该被这条规则波及
+  const NO_PARAMS = BUGGY.replace('params: { year: 2026, month: 6 }', '');
+  check('未声明 params 的 spec 不受影响', findUnusedParams(parseSpec(NO_PARAMS)).length === 0);
+
+  // 发布出去的示例 spec 必须是好的
+  const shipped = parseSpec(fs.readFileSync('specs/月度保送表.yaml', 'utf8'));
+  check('★ 仓库里的 specs/月度保送表.yaml 已修正（含 scope.time）', findUnusedParams(shipped).length === 0);
 }
 
 // ============ 汇总 ============

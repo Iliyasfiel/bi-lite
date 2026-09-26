@@ -31,7 +31,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 138 项断言全流程验收
+npm run e2e             # ★ 155 项断言全流程验收
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -98,10 +98,41 @@ sheets:
           measure: amount
           agg: sum
           format: "#,##0.00"               # 同时管 Excel 单元格格式与看板显示
+        scope:                             # ★ 必须写！见下方"静默算错"
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
 ```
 
 **换一种表格口径**，就是把 `rows.dim` 换成 `company`、`cols.order` 砍成两列——
 数据与版式都不用重抄。
+
+> ### ⚠️ 静默算错：`params` 声明了就必须用
+>
+> `scope.time` 不是可选的。少了它，spec 编译出的 SQL 里**没有任何时间条件** ——
+> 一张写着"2026 年 6 月"的月报会把**12 个月全加总**，而数字看起来完全合理
+> （实测 B4 = 765345，真值 66826）。最险的是这个错数字还被写进了 e2e 断言，
+> 测试不但没抓住 bug，反而成了 bug 的守卫。
+>
+> 所以 `parseSpec()` 会硬校验：**`params` 里声明的每个键都必须被 `{{key}}` 引用过**，
+> 否则解析直接报错。Web 保存 spec 时也走同一道校验。
+
+### 从模板自动生成规格
+
+不必手写上面那段 YAML。上传一个人工做好的空模板，系统会推断出草稿：
+
+- **Web**：「报表报送」页 → 上传 `.xlsx` → 看到每个轴的来源与判断依据 → 核对后保存
+- **MCP**：agent 调 `generate_spec`，拿到同样的草稿
+
+推断结果是**提案**，不是决策。每个轴都标注来源：
+
+| 标记 | 含义 |
+|---|---|
+| **读到的** | 模板里真的写了（如 B4 左方一列预置了 5 个指标名） |
+| **猜的** | 从角格「公司」对照注册表推出，模板里没有预置行清单 |
+
+模板里的「合计」公式行会被自动排除（保留原样、不写入），
+推断出的 spec 固定带上 `scope.time`，让上面那个"静默算错"默认不发生。
 
 ### 渲染
 
@@ -128,7 +159,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 
 | 层 | 手段 |
 |---|---|
-| ① 能力边界 | agent **没有 SQL 权**，只暴露 5 个 MCP 工具，无 shell |
+| ① 能力边界 | agent **没有 SQL 权**，只暴露 6 个 MCP 工具，无 shell |
 | ② 给坐标不给数值 | `preview_spec` 返回 `B4:E8 将填 5 行 × 4 列`，看不到任何金额 |
 | ③ 查询下推 | spec 在服务端编译成参数化 SQL，在 DuckDB 内执行；维度只能来自白名单 |
 | ④ 分档 + 审计 | agent 视角的金额返 `12.3亿` 而非精确值，每格须 ≥3 行明细支撑；字段级审计 |
@@ -136,7 +167,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 **关键推论**：改口径只需要 spec 的文本 diff，**不需要任何数值参与**。
 所以"财务数据不进上下文"是架构上自然达成的，而不是靠事后过滤。
 
-### MCP 工具集（仅此五个）
+### MCP 工具集（仅此六个）
 
 | 工具 | 作用 | 返回数值？ |
 |---|---|---|
@@ -145,6 +176,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | `preview_spec` | 返回将填充的坐标网格 | **否，且本工具不查库** |
 | `render_report` | 渲染 Excel，返回文件路径 | 否（只回路径与计数） |
 | `diff_report` | 比较两版 spec 的差异 | 否 |
+| `generate_spec` | 从模板推断 spec 草稿（区分"读到的"与"猜的"） | 否（**不查库**，只读模板结构） |
 
 另有一道**机械兜底**：任何工具返回值里若出现 ≥ 10000 的数字，本次调用直接失败。
 它不替代上面的结构设计，只是让"将来某次改动不小心泄漏"变成一个响亮的错误。
@@ -164,7 +196,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 }
 ```
 
-协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 5 个工具要拉 16MB，
+协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 6 个工具要拉 16MB，
 而实际协议面只有 4 个方法。漂移风险用 e2e 对冲：验收阶段**用真实 MCP 客户端**连本服务，
 不是自打 mock。
 
@@ -180,7 +212,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 138 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 155 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -196,10 +228,12 @@ src/
   import/longtable.ts 长表解析 + STAGED 三态校验 + 提交 + Parquet 归档
   spec/types.ts      spec 类型与校验（YAML → Spec）
   spec/compile.ts    ★ 维度白名单 DIMENSIONS + spec → 参数化 SQL + planOf
+  spec/template.ts   模板结构读取（表头/行标签/合并区/定义名称/公式行）
+  spec/infer.ts      ★ 模板 → spec 草稿（带 source/evidence，猜的要人确认）
   semantic/query.ts  ★ 唯一的自由查询出口 + 受众分级 + 反推防护
   render/excel.ts    ★ xlsx-populate 模板填充（保版式）
   render/chart.ts    ★ 同一 spec → ECharts option / 形状描述
-  mcp/tools.ts       ★ 五个 MCP 工具 + 金额兜底 + 审计
+  mcp/tools.ts       ★ 六个 MCP 工具 + 金额兜底 + 审计
   mcp/server.ts      零依赖 MCP stdio 服务端
   server.ts          零框架本地 Web 服务
   web/               三个页签的前端（原生 JS）
@@ -215,7 +249,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，138 项断言，13 个阶段
+npm run e2e        # ★ 唯一门禁，155 项断言，14 个阶段
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -231,7 +265,8 @@ npm run bench      # ⚠️ 未实现
 | 1. 导入闭环 | ✅ 服务端 + Web 导入向导 + Parquet 归档 |
 | 2. 语义层 + 查询 | ✅ 受众分级 / 反推防护 / 注入防护 + Web 看板 |
 | 3. 规格引擎 | ✅ Excel + ECharts 两个渲染器 + Web 报表预览导出 |
-| 4. agent 入口 | ✅ MCP 五工具（真实 MCP 客户端验收通过） |
+| 4. agent 入口 | ✅ MCP 六工具（真实 MCP 客户端验收通过） |
+| 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
 
 ### 已知限制
 
@@ -249,7 +284,7 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（12 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（15 条铁律）
 
 ## License
 

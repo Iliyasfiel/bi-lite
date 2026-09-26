@@ -17,20 +17,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import XLSXPopulate from 'xlsx-populate';
-import type { Workbook, Sheet } from 'xlsx-populate';
+import type { Workbook } from 'xlsx-populate';
 import * as db from '../db/index.ts';
 import { catalog } from '../semantic/query.ts';
 import { parseSpec, expandBlock, type Spec } from '../spec/types.ts';
 import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
-import { renderTemplate, type RenderBlock } from '../render/excel.ts';
+import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
+import { readTemplateSchema, textAt } from '../spec/template.ts';
+import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
 import { chartShape, type ChartSpec } from '../render/chart.ts';
 
 const OUTPUT_DIR = 'output';
 const DEFAULT_TEMPLATE = 'test/fixtures/月度保送表.xlsx';
 const AUDIT_LOG = 'data/audit/mcp.jsonl';
 
-/** 模板标签扫描上限（防止一个畸形模板把整张表灌进上下文） */
-const TEXT_SCAN_LIMIT = 40;
+/** 模板标签扫描上限（防止一个畸形模板把整张表灌进上下文）—— 已在 src/spec/template.ts 统一 */
 
 // ---------------- 审计（§6.2 第④层：记录字段级输出） ----------------
 
@@ -87,37 +88,8 @@ async function listMetrics() {
 }
 
 /** 单元格地址 "B4" → {row, col} */
-function parseRef(ref: string): { row: number; col: number } {
-  const m = ref.match(/^\$?([A-Za-z]+)\$?(\d+)$/);
-  if (!m) throw new Error(`非法单元格引用: ${ref}`);
-  let col = 0;
-  for (const ch of m[1].toUpperCase()) col = col * 26 + (ch.codePointAt(0)! - 64);
-  return { row: Number(m[2]), col };
-}
-
-function toRef(row: number, col: number): string {
-  let s = '';
-  while (col > 0) {
-    const r = (col - 1) % 26;
-    s = String.fromCharCode(65 + r) + s;
-    col = Math.floor((col - 1) / 26);
-  }
-  return `${s}${row}`;
-}
-
-/**
- * 只取**文本**单元格。模板里若有残留数字（脏模板），一律不返回 ——
- * 这是"模板必须为空表"（AGENTS.md 铁律 3 注）在 agent 侧的对应防线。
- */
-function textAt(sheet: Sheet, row: number, col: number): string | null {
-  if (row < 1 || col < 1) return null;
-  try {
-    const v = sheet.cell(row, col).value();
-    return typeof v === 'string' && v.trim() ? v.trim() : null;
-  } catch {
-    return null;
-  }
-}
+const parseRef = excelParseRef;
+const toRef = excelToRef;
 
 /** 解析 spec 里的 anchor；定义名称要给模板才能解析 */
 function resolveAnchor(
@@ -144,56 +116,19 @@ function resolveAnchor(
 async function getTemplateSchema(args: { template?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
-  const wb = await XLSXPopulate.fromFileAsync(tpl);
-
-  const sheets = wb.sheets().map((s) => {
-    const ur = s.usedRange();
-    return {
-      name: s.name(),
-      usedRange: ur ? `${ur.startCell().address()}:${ur.endCell().address()}` : null,
-      // 合并区：往合并区写值只能写左上角（§5.3.4 坑 3）
-      mergedCells: Object.keys((s as unknown as { _mergeCells?: Record<string, unknown> })._mergeCells ?? {}),
-      dataValidationCount: Object.keys((s as unknown as { _dataValidations?: Record<string, unknown> })._dataValidations ?? {}).length,
-    };
-  });
-
-  // 定义名称 —— agent 最该用的锚点形式（模板改版式时命名区域跟着走）
-  const dnNode = (wb as unknown as { _node?: { children?: Array<{ name: string; children?: unknown[] }> } })._node?.children?.find(
-    (c) => c.name === 'definedNames',
-  );
-  const anchors = (dnNode?.children ?? []).map((n) => {
-    const node = n as { attributes?: { name?: string }; children?: unknown[] };
-    const name = node.attributes?.name ?? '(unnamed)';
-    const refersTo = String(node.children?.[0] ?? '');
-    const m = refersTo.match(/^'?([^'!]+)'?!\$?([A-Z]+)\$?(\d+)$/);
-    if (!m) return { name, refersTo, cell: null, sheet: null, headerAbove: [], labelsLeft: [] };
-    const [, sheetName, colLetters, rowNum] = m;
-    const row = Number(rowNum);
-    let col = 0;
-    for (const ch of colLetters.toUpperCase()) col = col * 26 + (ch.codePointAt(0)! - 64);
-    const sheet = wb.sheet(sheetName);
-    const headerAbove: string[] = [];
-    const labelsLeft: string[] = [];
-    if (sheet) {
-      // 表头在锚点上方一行、行标签在锚点左方一列 —— 这是本项目的模板约定
-      for (let c = col, n = 0; n < TEXT_SCAN_LIMIT; n++, c++) {
-        const t = textAt(sheet, row - 1, c);
-        if (t === null) break;
-        headerAbove.push(t);
-      }
-      for (let r = row, n = 0; n < TEXT_SCAN_LIMIT; n++, r++) {
-        const t = textAt(sheet, r, col - 1);
-        if (t === null) break;
-        labelsLeft.push(t);
-      }
-    }
-    return { name, refersTo, cell: `${colLetters}${row}`, sheet: sheetName, headerAbove, labelsLeft };
-  });
+  const schema = await readTemplateSchema(tpl);
 
   return {
-    template: tpl,
-    sheets,
-    anchors,
+    template: schema.template,
+    sheets: schema.sheets,
+    anchors: schema.anchors.map((a) => ({
+      name: a.name,
+      refersTo: a.refersTo,
+      cell: a.cell,
+      sheet: a.sheet,
+      headerAbove: a.headerAbove,
+      labelsLeft: a.labelsLeft,
+    })),
     hint: 'anchor 优先用定义名称；headerAbove 是锚点上一行、labelsLeft 是锚点左一列，可直接对应 rows.order / cols.order',
     note: '本结构只含标签文本，模板里的任何数字都不会回传',
   };
@@ -419,6 +354,45 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
   };
 }
 
+/** 6. generate_spec —— 从模板推断 spec 草稿（§7.2 路径 1） */
+async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
+  const tpl = args.template ?? DEFAULT_TEMPLATE;
+  if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
+
+  const cat = await catalog();
+  const registry: Registry = {
+    metrics: cat.metrics.map((m) => m.name),
+    companies: cat.companies.map((c) => c.name),
+    periodTypes: cat.periodTypes.map((p) => p.id),
+    axisNames: cat.dimensions.map((d) => d.label),
+  };
+
+  const r = await inferSpec({ template: tpl, registry, sheets: args.sheets, id: args.id, title: args.title });
+
+  return {
+    template: tpl,
+    specId: r.spec.id,
+    yaml: r.yaml,
+    blocks: r.blocks.map((b) => ({
+      sheet: b.sheet,
+      anchor: b.anchor,
+      anchorNote: b.anchorNote,
+      rows: { dim: b.rows.dim, source: b.rows.source, count: b.rows.order.length, labels: b.rows.order, evidence: b.rows.evidence },
+      cols: { dim: b.cols.dim, source: b.cols.source, count: b.cols.order.length, labels: b.cols.order, evidence: b.cols.evidence },
+      format: b.format,
+      excluded: b.excluded,
+    })),
+    // 猜的部分必须显式列出来 —— 人只核对这些，不必通读整份 YAML
+    guessed: guessedAxes(r),
+    unmatched: r.unmatched,
+    issues: r.issues,
+    note:
+      '这是**草稿**，不是定稿。source=guessed 的轴与 issues 里的 warn/error 需要人工确认；' +
+      'unmatched 里的名字不在注册表中，导入数据前必须先建映射（文档 R1 主数据对齐）。' +
+      '本工具只读模板结构与标签文本，不读模板里的任何数字，也不查数据库。',
+  };
+}
+
 // ---------------- 工具注册表 ----------------
 
 export interface ToolDef {
@@ -499,6 +473,25 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
     handler: (a) => diffReport(a as { before?: string; after?: string; beforeFile?: string; afterFile?: string }),
+  },
+  {
+    name: 'generate_spec',
+    description:
+      '从一个 Excel 报送模板**推断**出 spec 草稿（YAML）。识别表头口径、预置行标签、定义名称锚点，' +
+      '并自动排除模板里的公式行（如「合计 =SUM(...)」）。返回草稿 YAML + 证据链 + 未识别清单（unmatched）。' +
+      'source=guessed 的轴是推断的，必须人工确认后再用 preview_spec / render_report。' +
+      '本工具只读模板标签文本，不读任何数字，也不查数据库。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        template: { type: 'string', description: '模板路径；省略则用默认示例模板' },
+        sheets: { type: 'array', items: { type: 'string' }, description: '只推断这些 sheet；省略则自动识别所有含已注册表头的 sheet' },
+        id: { type: 'string', description: '生成的 spec id（可选）' },
+        title: { type: 'string', description: '生成的 spec 标题（可选）' },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => generateSpec(a as { template?: string; sheets?: string[]; id?: string; title?: string }),
   },
 ];
 

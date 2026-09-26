@@ -99,6 +99,21 @@
   <!-- ═══════════ 3. 报表报送 ═══════════ -->
   <section id="tab-report" class="panel">
     <div class="card">
+      <h2>从模板生成规格</h2>
+      <p class="hint">
+        上传一个人工做好的空报送模板，自动推断出 spec 草稿（表头口径、预置行标签、定义名称锚点，
+        并排除模板里的「合计」公式行）。<b>推断只是草稿</b>：带「猜」标记的轴需要你确认后再定稿。
+        全过程在本地完成，不经过任何 AI。
+      </p>
+      <div class="dropzone" id="tplDrop">
+        <input type="file" id="tplFile" accept=".xlsx" hidden>
+        <p><button class="primary" id="tplPick">选择模板文件</button></p>
+        <p class="hint" id="tplMsg">或把 .xlsx 拖到这里</p>
+      </div>
+      <div id="tplResult"></div>
+    </div>
+
+    <div class="card">
       <h2>已注册报表</h2>
       <p class="hint">
         每张报送表是一个声明式 spec（<code>specs/*.yaml</code>）。换口径只改 spec 里的

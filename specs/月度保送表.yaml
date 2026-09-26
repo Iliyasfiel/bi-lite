@@ -20,3 +20,9 @@ sheets:
           measure: amount
           agg: sum
           format: "#,##0.00"              # 同时管 Excel 单元格格式与看板显示
+        # 时间范围必须显式声明。曾漏掉这一段，结果 12 个月的数被静默加总
+        # （B4 得 765345，而非 2026-06 的 66826）。现由 parseSpec 硬校验兜住。
+        scope:
+          time:
+            year: "{{year}}"
+            month: "{{month}}"

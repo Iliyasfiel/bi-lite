@@ -67,6 +67,46 @@ export function parseSpec(yamlText: string): Spec {
 
 export class SpecError extends Error {}
 
+/**
+ * 收集 spec 中**所有会被 substitute() 作用的字符串**。
+ * 这份清单必须与 compile.ts 里实际调用 substitute() 的位置保持一致 ——
+ * 漏掉一处，下面的「未使用参数」检查就会误报。
+ */
+function substitutableStrings(s: Spec): string[] {
+  const out: string[] = [];
+  for (const sheet of s.sheets ?? []) {
+    for (const b of sheet.blocks ?? []) {
+      out.push(...(b.rows?.order ?? []).map(String));
+      out.push(...(b.cols?.order ?? []).map(String));
+      for (const f of [b.rows?.filter, b.cols?.filter, b.scope?.company?.filter]) {
+        for (const v of Object.values(f ?? {})) {
+          Array.isArray(v) ? out.push(...v.map(String)) : out.push(String(v));
+        }
+      }
+      if (b.scope?.time?.year !== undefined) out.push(String(b.scope.time.year));
+      if (b.scope?.time?.month !== undefined) out.push(String(b.scope.time.month));
+    }
+  }
+  return out;
+}
+
+/**
+ * 找出声明了却从未被引用的参数。
+ *
+ * ★ 这条校验来自一次真实故障：`specs/月度保送表.yaml` 声明了
+ *   `params: { year: 2026, month: 6 }`，但整个 spec 从未引用它们 ——
+ *   于是「2026 年 6 月」的报送表静默地把 **12 个月全部加总**（B4 得 765345，
+ *   而不是 66826）。数字看起来完全合理，没有任何报错，人工核对才能发现。
+ *
+ *   所以这里把它升级成**硬错误**：财务场景下，"静默算错"比"拒绝出表"危险得多。
+ */
+export function findUnusedParams(s: Spec): string[] {
+  const declared = Object.keys(s.params ?? {});
+  if (declared.length === 0) return [];
+  const texts = substitutableStrings(s);
+  return declared.filter((k) => !texts.some((t) => t.includes(`{{${k}}}`)));
+}
+
 function validateSpec(s: Spec) {
   const errs: string[] = [];
   if (!s.id) errs.push('缺少 id');
@@ -99,6 +139,17 @@ function validateSpec(s: Spec) {
       }
     }
   }
+
+  const unused = findUnusedParams(s);
+  if (unused.length) {
+    errs.push(
+      `params 声明了但从未被引用: ${unused.join(', ')}。` +
+        `这通常意味着报表**没有按参数过滤时间**，会把所有期间的数字加总。` +
+        `请在 block 里加 scope.time（如 scope: { time: { year: "{{year}}", month: "{{month}}" } }），` +
+        `或删掉这些 params。`,
+    );
+  }
+
   if (errs.length) throw new SpecError('spec 校验失败:\n  - ' + errs.join('\n  - '));
 }
 

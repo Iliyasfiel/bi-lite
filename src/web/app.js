@@ -284,6 +284,123 @@ window.addEventListener('resize', () => chart && chart.resize());
 let currentSpec = null;
 const reportCharts = [];
 
+// ── 从模板生成 spec 草稿（§7.2 路径 1）──
+let inferred = null;   // { template, specId, yaml, blocks, guessed, unmatched, issues }
+
+$('tplPick').addEventListener('click', () => $('tplFile').click());
+$('tplFile').addEventListener('change', (e) => { if (e.target.files[0]) inferTemplate(e.target.files[0]); });
+
+{
+  const tdz = $('tplDrop');
+  ['dragenter', 'dragover'].forEach((ev) => tdz.addEventListener(ev, (e) => {
+    e.preventDefault(); tdz.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => tdz.addEventListener(ev, (e) => {
+    e.preventDefault(); tdz.classList.remove('over');
+  }));
+  tdz.addEventListener('drop', (e) => {
+    if (e.dataTransfer.files[0]) inferTemplate(e.dataTransfer.files[0]);
+  });
+}
+
+async function inferTemplate(file) {
+  $('tplMsg').textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）· 解析中…`;
+  $('tplResult').innerHTML = '';
+  try {
+    const res = await fetch('/api/template/infer', {
+      method: 'POST',
+      headers: { 'x-filename': encodeURIComponent(file.name), 'content-type': 'application/octet-stream' },
+      body: await file.arrayBuffer(),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    inferred = body;
+    $('tplMsg').textContent = `${file.name} · 识别出 ${body.blocks.length} 个数据区`;
+    renderInference(body);
+  } catch (e) {
+    // 识别不出数据区是常见的用户错误（模板没有表头），要说清原因而不是静默失败
+    $('tplMsg').textContent = '解析失败';
+    $('tplResult').innerHTML = `<div class="issue err"><span class="lv">失败</span><span>${esc(e.message)}</span></div>`;
+  }
+}
+
+function renderInference(inf) {
+  let html = '';
+
+  if (inf.issues.length) {
+    html += `<h3>需要人工确认（${inf.issues.length}）</h3>`;
+    html += inf.issues.map((i) => `<div class="issue ${i.level}">
+        <span class="lv">${i.level === 'error' ? '错误' : '提示'}</span>
+        <span>${esc(i.sheet)}：${esc(i.message)}</span></div>`).join('');
+  }
+
+  if (inf.unmatched.length) {
+    const names = inf.unmatched.flatMap((u) => u.names);
+    html += `<h3>未识别的名称（${names.length}）</h3>
+      <div class="issue warn"><span class="lv">主数据</span><span>${esc(names.join('、'))}</span></div>
+      <p class="hint">这些名字不在注册表里。若是别名（如「集团有限公司」vs「集团公司」），
+        必须先建映射 —— 否则同一家公司会被拆成两条主数据（文档 R1）。</p>`;
+  }
+
+  html += `<h3>识别结果</h3>`;
+  for (const b of inf.blocks) {
+    // InferredAxis = { dim, order, source, evidence }（见 src/spec/infer.ts）
+    const axis = (a, axisName) => `
+      <tr>
+        <td>${axisName}</td>
+        <td><code>${esc(a.dim)}</code></td>
+        <td>${a.source === 'guessed'
+          ? '<span class="pill err">猜的</span>'
+          : '<span class="pill ok">读到的</span>'}</td>
+        <td>${a.order.length} 项</td>
+        <td class="tiny">${esc(a.order.join('、'))}<br><span class="ev">${esc(a.evidence)}</span></td>
+      </tr>`;
+    html += `<div class="spec-item" style="display:block">
+      <div class="meta"><b>${esc(b.sheet)}</b>
+        <span>锚点 <code>${esc(typeof b.anchor === 'object' ? b.anchor.name : b.anchor)}</code> · ${esc(b.anchorNote)}</span></div>
+      <table class="mini" style="margin-top:8px">
+        <tr><th>轴</th><th>维度</th><th>来源</th><th>数量</th><th>取值 / 依据</th></tr>
+        ${axis(b.rows, '行')}
+        ${axis(b.cols, '列')}
+      </table>
+      ${b.excluded.length ? `<p class="hint">已排除 ${b.excluded.length} 行：${
+        b.excluded.map((e) => `第 ${e.row} 行${e.label ? `「${esc(e.label)}」` : ''}`).join('、')
+      } —— ${esc(b.excluded[0].reason)}</p>` : ''}
+    </div>`;
+  }
+
+  html += `<h3>spec 草稿</h3>
+    <p class="hint">下面是推断出的 YAML。<b>推断只是草稿</b>：请核对带「猜的」标记的轴后再保存。</p>
+    <textarea id="specYaml" spellcheck="false">${esc(inf.yaml)}</textarea>
+    <div class="actions" style="margin-top:8px">
+      <button class="primary" id="saveSpec">保存到 specs/</button>
+      <span class="hint" id="saveMsg"></span>
+    </div>`;
+
+  $('tplResult').innerHTML = html;
+  $('saveSpec').addEventListener('click', saveSpec);
+}
+
+async function saveSpec() {
+  const yaml = $('specYaml').value;
+  const id = inferred?.specId ?? '推断的报表';
+  $('saveMsg').textContent = '保存中…';
+  try {
+    const res = await api('/api/specs/save', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id, yaml }),
+    });
+    $('saveMsg').textContent = `已保存 ${res.file}`;
+    await loadSpecs();
+  } catch (e) {
+    // 校验不通过的 spec 会被服务端拒绝 —— 这是刻意的（防"静默算错"）
+    $('saveMsg').textContent = '';
+    $('tplResult').insertAdjacentHTML('beforeend',
+      `<div class="issue err"><span class="lv">拒绝保存</span><span>${esc(e.message)}</span></div>`);
+  }
+}
+
 async function loadSpecs() {
   try {
     const specs = await api('/api/specs');
