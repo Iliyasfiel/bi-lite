@@ -18,7 +18,7 @@ import * as db from './db/index.ts';
 import { stage, commit, readLongTable, type DimDecision } from './import/longtable.ts';
 import { normalizeName, type DimKind } from './import/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
-import { parseSpec, SpecError } from './spec/types.ts';
+import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
 import { renderTemplate, type RenderBlock } from './render/excel.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
@@ -282,6 +282,32 @@ const routes: Record<string, Handler> = {
   },
 
   /** 保存推断出的 spec 到 specs/（人工确认后的一步） */
+  /**
+   * spec 静态诊断：**在任何数字被算出来之前**告诉人哪里会出错。
+   *
+   * ★ 与 `/api/specs/save` 用的是同一套判据（`diagnoseSpec` → `lintSpec`）。
+   *   两份判据一定会漂移：诊断说没问题、保存却被拒，是最难查的那类 bug。
+   *   这里返回 200（诊断本身不是错误），用 `willBeRejected` 表达"能不能存"。
+   */
+  'POST /api/specs/lint': async (req, res) => {
+    const { yaml, specFile } = await readJson<{ yaml?: string; specFile?: string }>(req);
+    let text = yaml;
+    if (!text && specFile) {
+      if (!fs.existsSync(specFile)) return json(res, 404, { error: `spec 文件不存在: ${specFile}` });
+      text = fs.readFileSync(specFile, 'utf8');
+    }
+    if (!text) return json(res, 400, { error: '需要 yaml 或 specFile' });
+    const d = diagnoseSpec(text);
+    json(res, 200, {
+      ok: !d.willBeRejected,
+      willBeRejected: d.willBeRejected,
+      parseError: d.parseError,
+      errors: d.errors,
+      issues: d.issues,
+      unusedParams: d.unusedParams,
+    });
+  },
+
   'POST /api/specs/save': async (req, res) => {
     const { id, yaml } = await readJson<{ id?: string; yaml: string }>(req);
     if (!yaml || typeof yaml !== 'string') return json(res, 400, { error: '缺少 yaml' });

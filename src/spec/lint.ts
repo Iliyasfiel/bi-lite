@@ -1,0 +1,353 @@
+/**
+ * spec 的静态诊断（docs/需求与架构.md §5.5、§7.2 路径 2）
+ *
+ * 定位：在**任何数值被计算之前**，回答一个问题 ——
+ * 「这份 spec 描述的口径是不是完整的、会不会算出一个看起来正常但其实错误的值？」
+ *
+ * ★ 为什么这个模块存在（三条实测出来的静默算错）：
+ *
+ *   ① **缺指标约束**：`rows: company / cols: period_type` 却没写指标 →
+ *      SQL 里没有任何 metric 条件，**五个指标的钱被加成一行**。
+ *      实测：利润总额那一格返回 67283，真值 65198。
+ *      两数同量级、格式正常，人不会怀疑。
+ *
+ *   ② **value.expr 被忽略**：写了 `expr: (本年累计-去年同期累计)/去年同期累计`，
+ *      编译器却不认这个字段 → 同比被算成两个累计额本身（实测 `[65198, 60870]`，
+ *      而期望 `0.0711`）。声明了却静默不生效，比不支持更糟。
+ *
+ *   ③ **scope.company.filter 不建 join**：WHERE 里引用了 dim_company、
+ *      FROM 里却没有 JOIN dim_company → DuckDB 直接报"列不存在"。
+ *      （这条会报错，不算静默；但同样属于"写的时候看不出来"。）
+ *
+ *   这三条有一个共同点：**spec 语法上完全合法，只有跑出来才知道错。**
+ *   而 §7.2 路径 2 是「让 agent 从一句自然语言写 spec」—— 如果语言本身允许
+ *   欠约束的 spec，那么 agent 每写一次都可能静默算错一次。
+ *   所以路径 2 的前置条件不是"提示词写得好"，而是**语言本身把错误挡在解析期**。
+ *
+ * 本模块**只吃 spec 结构，不碰数据库、不碰任何数值** ——
+ * 因此它的诊断结果可以安全地进 LLM 上下文（铁律 1）。
+ */
+import type { Spec, Block, SheetSpec } from './types.ts';
+import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
+import { exprRefs, ExprError, parseExpr } from './expr.ts';
+
+export type LintLevel = 'error' | 'warn';
+
+export interface LintIssue {
+  level: LintLevel;
+  /** 机器可读的代号，便于 e2e 与前端分支 */
+  code:
+    | 'UNCONSTRAINED_DIM'
+    | 'EXPR_REFS'
+    | 'EXPR_BAD'
+    | 'FILTER_UNKNOWN_DIM'
+    | 'FILTER_BAD_COLUMN'
+    | 'DIM_UNKNOWN'
+    | 'ORDER_EMPTY'
+    | 'ORDER_DUPLICATE'
+    | 'VALUE_MISSING'
+    | 'ANCHOR_MISSING'
+    | 'SHEET_NO_BLOCK'
+    | 'NO_ID_OR_SHEET';
+  /** 出问题的位置，人能直接对着 YAML 找（如 `sheets[0].blocks[1]`） */
+  at: string;
+  message: string;
+  /** 建议怎么改 —— 给人也给 agent 看 */
+  hint?: string;
+}
+
+/**
+ * 财务事实的两个「量纲维」：**指标与口径**。
+ *
+ * 为什么只有这两个必须被约束、而公司/月份/年份可以留空：
+ *   - `rows: metric, cols: period_type`、不限定公司 → 是**集团合计**，完全合法
+ *     （实测：4 家公司 16811+15940+17234+16841 = 66826，正是 B4 的值）
+ *   - `rows: company, cols: period_type`、不限定指标 → 把 5 个指标加在一起，
+ *     得到的数**没有任何业务含义**（实测 67283 vs 65198）
+ *
+ * 所以判据是「这个维度是不是金额含义的一部分」：
+ * 指标与口径决定"这个数是什么"，公司/期间只决定"哪些数加进来"。
+ */
+export const MEANING_DIMS: DimName[] = ['metric', 'period_type'];
+
+/** 一个 block 里某个维度是否被"钉住"了（作为轴，或被 filter 显式限定） */
+function isPinned(b: Block, dim: DimName): boolean {
+  if (b.rows?.dim === dim || b.cols?.dim === dim) return true;
+  // 自己的轴 filter（rows.filter 作用在 rows.dim 上，cols.filter 同理）
+  if (b.rows?.dim === dim && Object.keys(b.rows?.filter ?? {}).length) return true;
+  if (b.cols?.dim === dim && Object.keys(b.cols?.filter ?? {}).length) return true;
+  // 通用 scope.filter（路径 2 主要靠它：不把指标做成轴，而是钉死成某一个指标）
+  const sf = b.scope?.filter?.[dim];
+  if (sf && Object.keys(sf).length) return true;
+  // 兼容文档 §5.2 的 scope.company.filter 写法
+  if (dim === 'company' && Object.keys(b.scope?.company?.filter ?? {}).length) return true;
+  return false;
+}
+
+/**
+ * 哪些「量纲维」（指标 / 口径）没有被钉住。
+ *
+ * 导出给 infer.ts 用 —— 模板推断遇到"表里根本没有指标信息"的 sheet
+ * （如一个只有「公司 × 本年累计」的分板块表）时，必须据此显式告诉人，
+ * 而不是产出一份会静默加总五个指标的 spec。
+ */
+export function unpinnedMeaningDims(b: Block): DimName[] {
+  return MEANING_DIMS.filter((d) => !isPinned(b, d));
+}
+
+/** 检查一组 filter 的字段名，避免写出 "dim_metric.nmae" 这类拼错 */
+function checkFilter(
+  filter: Record<string, string | string[]> | undefined,
+  dim: DimName,
+  at: string,
+  out: LintIssue[],
+) {
+  if (!filter) return;
+  for (const col of Object.keys(filter)) {
+    // compile.ts 只接受合法标识符（它会把列名直接拼进 SQL）
+    if (!/^[a-z_][a-z0-9_]*$/i.test(col)) {
+      out.push({
+        level: 'error',
+        code: 'FILTER_BAD_COLUMN',
+        at,
+        message: `filter 的字段名「${col}」不是合法列名。`,
+        hint: '列名只能是字母/数字/下划线，且以字母或下划线开头（它会被直接拼进 SQL）。',
+      });
+      continue;
+    }
+    // 常见笔误提示：name 是最常用的列
+    const known = new Set(['name', 'id', 'category', 'unit', 'direction', 'level', 'group_name', 'parent_id', 'alias']);
+    if (DIMENSIONS[dim].table && !known.has(col)) {
+      out.push({
+        level: 'warn',
+        code: 'FILTER_BAD_COLUMN',
+        at,
+        message: `filter 的字段「${col}」不在 ${DIMENSIONS[dim].table} 的常用列里。`,
+        hint: `常用列：${[...known].join(' / ')}。写错列名会在查库时报"列不存在"，现在提前告诉你。`,
+      });
+    }
+  }
+}
+
+/** 诊断单个 block */
+function lintBlock(b: Block, at: string, out: LintIssue[]) {
+  if (!b.anchor) {
+    out.push({ level: 'error', code: 'ANCHOR_MISSING', at, message: '缺少 anchor（数据写入位置）。' });
+  }
+
+  // ---- 维度名必须是白名单里的 ----
+  for (const [axis, spec] of [['rows', b.rows], ['cols', b.cols]] as const) {
+    if (!spec?.dim) {
+      out.push({
+        level: 'error',
+        code: 'DIM_UNKNOWN',
+        at: `${at}.${axis}`,
+        message: `${axis}.dim 缺失。`,
+        hint: `只能取 ${DIM_NAMES.join(' / ')}`,
+      });
+      continue;
+    }
+    if (!isRegisteredDim(spec.dim)) {
+      out.push({
+        level: 'error',
+        code: 'DIM_UNKNOWN',
+        at: `${at}.${axis}.dim`,
+        message: `未注册的维度「${spec.dim}」。`,
+        hint: `只能取 ${DIM_NAMES.join(' / ')}。写成已注册的名字，否则查询会报错。`,
+      });
+    }
+    // order 是显式清单 —— 留空会退化成"整张表"，数字会随数据增长而变化
+    const order = spec.order ?? [];
+    if (order.length === 0) {
+      out.push({
+        level: 'warn',
+        code: 'ORDER_EMPTY',
+        at: `${at}.${axis}.order`,
+        message: `${axis}.order 为空。`,
+        hint: 'order 是显式清单：建议把它写全。留空时该轴不受约束，模板上会填不满或行数随数据变化。',
+      });
+    }
+    if (new Set(order.map(String)).size !== order.length) {
+      out.push({
+        level: 'warn',
+        code: 'ORDER_DUPLICATE',
+        at: `${at}.${axis}.order`,
+        message: `${axis}.order 里有重复项。`,
+        hint: '重复的标签会互相覆盖到同一个格子，只保留一条。',
+      });
+    }
+  }
+
+  // ---- 量纲维必须被钉住（本模块存在的主要理由，见文件头 ①）----
+  for (const dim of MEANING_DIMS) {
+    if (isPinned(b, dim)) continue;
+    const axisHint =
+      dim === 'metric'
+        ? `把这个 block 的指标钉死。两种改法：① 把指标做成轴（rows: { dim: metric, order: [营业收入, 利润总额] }）；② 用 scope.filter 指定单一指标（scope: { filter: { metric: { name: 营业收入 } } }）。`
+        : `把这个 block 的口径钉死。通常把口径做成列：cols: { dim: period_type, order: [本年累计, 去年同期累计] }。`;
+    out.push({
+      level: 'error',
+      code: 'UNCONSTRAINED_DIM',
+      at: `${at}`,
+      message:
+        `这个 block 没有任何${dim === 'metric' ? '指标' : '口径'}约束：` +
+        `行和列分别是 ${b.rows?.dim ?? '?'} / ${b.cols?.dim ?? '?'}，` +
+        `这会把多个${dim === 'metric' ? '指标' : '口径'}的金额**加成一个数**。`,
+      hint: axisHint + '（这不是格式问题，是会让结果静默出错的问题。）',
+    });
+  }
+
+  // ---- value ----
+  const v = b.value;
+  if (!v || (!v.measure && !v.expr)) {
+    out.push({
+      level: 'error',
+      code: 'VALUE_MISSING',
+      at: `${at}.value`,
+      message: 'value 既没有 measure 也没有 expr。',
+      hint: '通常写 measure: amount（事实表金额列）。',
+    });
+  }
+
+  // ---- 派生表达式（见文件头 ②）----
+  if (v?.expr) {
+    try {
+      // 语法必须先能解析 —— 否则求值时会抛，等于"写到 spec 里才炸"
+      parseExpr(v.expr);
+      const refs = exprRefs(v.expr);
+      const known = new Set((b.cols?.order ?? []).map(String));
+      const unknown = refs.filter((r) => !known.has(r));
+      if (unknown.length && b.cols?.dim === 'period_type') {
+        out.push({
+          level: 'error',
+          code: 'EXPR_REFS',
+          at: `${at}.value.expr`,
+          message: `派生表达式引用了 cols.order 里没有的口径: ${unknown.join(', ')}。`,
+          hint: 'expr 只能引用同一 block 的 cols.order 里声明过的口径 —— 那些才是计算结果里真正存在的列。',
+        });
+      }
+      if (b.cols?.dim !== 'period_type') {
+        out.push({
+          level: 'warn',
+          code: 'EXPR_REFS',
+          at: `${at}.value.expr`,
+          message: `派生表达式引用口径名，但 cols.dim 是「${b.cols?.dim}」而不是 period_type。`,
+          hint: 'expr 的变量来自列标签。若列不是口径，表达式里的名字对不上，会求值失败。',
+        });
+      }
+    } catch (e) {
+      out.push({
+        level: 'error',
+        code: 'EXPR_BAD',
+        at: `${at}.value.expr`,
+        message: `派生表达式无法解析: ${(e as Error).message}`,
+        hint: 'expr 只支持 数字、口径名、+ - * / % 与圆括号。',
+      });
+    }
+    if (v.measure) {
+      out.push({
+        level: 'warn',
+        code: 'EXPR_BAD',
+        at: `${at}.value`,
+        message: 'value 同时写了 measure 和 expr。',
+        hint: 'expr 优先：数值会按派生式算，measure 只用来决定从哪个列取数。确认这是你要的。',
+      });
+    }
+  }
+
+  // ---- filter 字段名 ----
+  checkFilter(b.rows?.filter, (b.rows?.dim ?? 'metric') as DimName, `${at}.rows.filter`, out);
+  checkFilter(b.cols?.filter, (b.cols?.dim ?? 'period_type') as DimName, `${at}.cols.filter`, out);
+  if (b.scope?.filter) {
+    for (const [dim, f] of Object.entries(b.scope.filter)) {
+      if (!isRegisteredDim(dim)) {
+        out.push({
+          level: 'error',
+          code: 'FILTER_UNKNOWN_DIM',
+          at: `${at}.scope.filter.${dim}`,
+          message: `scope.filter 里有未注册的维度「${dim}」。`,
+          hint: `key 只能是 ${DIM_NAMES.join(' / ')}。`,
+        });
+        continue;
+      }
+      checkFilter(f, dim, `${at}.scope.filter.${dim}`, out);
+    }
+  }
+  if (b.scope?.company?.filter) checkFilter(b.scope.company.filter, 'company', `${at}.scope.company.filter`, out);
+
+  // ---- chart 的 include 必须真的存在于 order 里 ----
+  if (b.chart?.include) {
+    for (const [axis, items] of Object.entries(b.chart.include)) {
+      const pool = axis === 'rows' ? (b.rows?.order ?? []) : (b.cols?.order ?? []);
+      const missing = (items ?? []).filter((x) => !pool.map(String).includes(String(x)));
+      if (missing.length) {
+        out.push({
+          level: 'warn',
+          code: 'ORDER_EMPTY',
+          at: `${at}.chart.include.${axis}`,
+          message: `chart.include.${axis} 里的 ${missing.join(', ')} 不在 ${axis}.order 里，不会被画出来。`,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * 诊断整份 spec。
+ *
+ * 返回值按 level 排序（error 在前），方便人先看要紧的。
+ * `parseSpec` 只在有 error 时抛；这个函数的完整清单给 lint_spec 工具与 Web 诊断面板用
+ * —— 人需要看到"哪些是提醒、哪些是必须改"。
+ */
+export function lintSpec(spec: Spec): LintIssue[] {
+  const out: LintIssue[] = [];
+
+  if (!spec?.id) out.push({ level: 'error', code: 'NO_ID_OR_SHEET', at: 'id', message: '缺少 id。', hint: 'id 是保存时的文件名，也是报表的标识。' });
+  if (!Array.isArray(spec?.sheets) || spec.sheets.length === 0) {
+    out.push({ level: 'error', code: 'NO_ID_OR_SHEET', at: 'sheets', message: '至少需要一个 sheet。' });
+    return out;
+  }
+
+  (spec.sheets as SheetSpec[]).forEach((sheet, i) => {
+    const sat = `sheets[${i}]`;
+    if (!sheet?.name) out.push({ level: 'error', code: 'SHEET_NO_BLOCK', at: sat, message: '缺少 name。' });
+    if (!Array.isArray(sheet?.blocks) || sheet.blocks.length === 0) {
+      out.push({
+        level: 'error',
+        code: 'SHEET_NO_BLOCK',
+        at: sat,
+        message: `sheet「${sheet?.name ?? i}」至少需要一个 block。`,
+        hint: 'block 是"数据区"的声明：anchor + rows + cols + value。',
+      });
+      return;
+    }
+    sheet.blocks.forEach((b, j) => lintBlock(b, `${sat}.blocks[${j}]`, out));
+  });
+
+  // 模板路径：定了 anchor 为定义名称却没有模板 → 解析不出坐标
+  if (!spec.template) {
+    const usesName = (spec.sheets ?? []).some((s) => (s?.blocks ?? []).some((b) => typeof b?.anchor === 'object'));
+    if (usesName) {
+      out.push({
+        level: 'error',
+        code: 'ANCHOR_MISSING',
+        at: 'template',
+        message: 'block 用了定义名称锚点，但 spec 没有声明 template，无法解析坐标。',
+        hint: '补上 template: templates/xxx.xlsx，或把 anchor 改成 "B4" 这样的绝对坐标。',
+      });
+    }
+  }
+
+  // error 排前面，人先看必须改的
+  return out.sort((a, b) => (a.level === b.level ? 0 : a.level === 'error' ? -1 : 1));
+}
+
+/** 把 error 级诊断压成一条可读的异常消息（parseSpec 用） */
+export function formatLintErrors(issues: LintIssue[]): string {
+  return issues
+    .filter((i) => i.level === 'error')
+    .map((i) => `${i.at}: ${i.message}${i.hint ? `\n      → ${i.hint}` : ''}`)
+    .join('\n  - ');
+}
+
+export { ExprError };

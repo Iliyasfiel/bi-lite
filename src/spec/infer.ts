@@ -15,6 +15,7 @@
  *   这也是「agent 当入口」能成立的前提。
  */
 import type { Spec, Block, SheetSpec } from './types.ts';
+import { unpinnedMeaningDims } from './lint.ts';
 import {
   openTemplate,
   readRegion,
@@ -280,6 +281,30 @@ function inferSheet(
     // 报送表按「某年某月」出，所以 scope.time 不是可选项。
     scope: { time: { year: '{{year}}', month: '{{month}}' } },
   };
+
+  // ★ 量纲维（指标/口径）必须被钉住，否则五个指标的金额会被加成一格。
+  //
+  // 真实场景：一张「分板块」表只有「公司 × 本年累计」，模板里**根本没有指标信息**
+  // —— 这是模板本身的缺失，不是推断器能从表头看出来的。
+  // 推断器必须**明说"我不知道这里填哪个指标"**，而不是产出一份
+  // 语法合法、跑得通、数字却错了的 spec。
+  //
+  // ★ 刻意**不**注入占位 filter：那样 spec 会重新变得"合法"，
+  //   保存能成功、预览能出数，只是数字全是空 —— 人会把空当成"没数据"，
+  //   而不是"我忘了指定指标"。宁可让 parseSpec 直接拒绝，把问题挡在保存之前。
+  //   （规则只有一份：lint.ts 的 UNCONSTRAINED_DIM。）
+  const unpinned = unpinnedMeaningDims(specBlock);
+  if (unpinned.length) {
+    const names = unpinned.map((d) => (d === 'metric' ? '指标' : '口径'));
+    issues.push({
+      level: 'error',
+      sheet: sheetName,
+      message:
+        `这张表里找不到${names.join(' 和 ')}的信息：表头只有 ${region.colLabels.join(' / ')}（列）` +
+        `与角格「${cornerCell ?? '(空)'}」（行），推不出这一格该填哪个指标。` +
+        `草稿因此**无法保存**，请先补上指标约束。`,
+    });
+  }
 
   return {
     block,

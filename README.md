@@ -31,7 +31,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 192 项断言全流程验收
+npm run e2e             # ★ 231 项断言全流程验收
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -164,6 +164,50 @@ sheets:
 
 模板里的「合计」公式行会被自动排除（保留原样、不写入），
 推断出的 spec 固定带上 `scope.time`，让上面那个"静默算错"默认不发生。
+如果模板里**根本没有指标信息**（比如只有「公司 × 本年累计」的板块表），
+推断器会**直接说"这张表我推不出来"**并给出 error，草稿无法保存 ——
+它不会注入一个占位指标让 spec "看起来合法"。
+
+### 用一句话写规格（§7.2 路径 2）
+
+「按板块对比今年和去年的利润总额」→ agent 产出 spec 草稿 → 你确认。
+
+这条路**不是靠提示词**实现的，而是靠让 spec 语言本身**在解析期就挡住欠约束**。
+因为实测确认过：只要语言允许欠约束的写法，写的人（无论人还是 agent）迟早会写出来。
+
+最典型的一种：**不写指标约束**。
+
+```yaml
+rows: { dim: company, order: [华东子公司] }
+cols: { dim: period_type, order: [本年累计] }
+value: { measure: amount, agg: sum }     # ← 没说要哪个指标
+```
+
+这段 YAML 语法完全合法，跑出来的数字也"正常"，但它把**五个指标的金额加成了一个数**
+（实测 67283，真值 65198）。同量级、格式正常、人不会怀疑它 —— 这就是最危险的那种错误。
+现在它会被**解析即拒绝**：
+
+```
+这个 block 没有任何指标约束：行和列分别是 company / period_type，
+这会把多个指标的金额**加成一个数**。
+  → 把这个 block 的指标钉死。两种改法：
+     ① 把指标做成轴（rows: { dim: metric, order: [营业收入, 利润总额] }）；
+     ② 用 scope.filter 指定单一指标（scope: { filter: { metric: { name: 营业收入 } } }）
+```
+
+**为什么是"拒绝"而不是"警告"**：财务场景下**静默算错比拒绝出表危险得多** ——
+错数字同量级、格式正常，人不会怀疑；表出不来，人一定会来查。
+
+配套的三处入口用的是**同一套判据**（`lintSpec`，写在 `src/spec/lint.ts`）：
+
+| 入口 | 用途 |
+|---|---|
+| `lint_spec`（MCP 工具） | agent 写草稿后**自己先撞一次墙**，按 issues 修完再交给人 |
+| `POST /api/specs/lint` | 诊断接口，一次返回**全部**问题（不是只报第一条） |
+| Web 草稿框 | **边打字边诊断**，有问题时保存按钮直接置灰 |
+
+派生表达式（`value.expr`）也会真的参与计算 —— 例如"同比"可以直接写成
+`(本年累计 - 去年同期累计) / 去年同期累计`，求值走的是手写求值器而不是 `eval`。
 
 ### 渲染
 
@@ -198,12 +242,13 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 **关键推论**：改口径只需要 spec 的文本 diff，**不需要任何数值参与**。
 所以"财务数据不进上下文"是架构上自然达成的，而不是靠事后过滤。
 
-### MCP 工具集（仅此六个）
+### MCP 工具集（仅此七个）
 
 | 工具 | 作用 | 返回数值？ |
 |---|---|---|
 | `list_metrics` | 列出已注册指标/维度/口径/公司 | 否 |
 | `get_template_schema` | 解析模板结构（锚点、表头、行标签、合并区） | 否（模板里的数字也不回传） |
+| `lint_spec` | **静态诊断**：欠约束/表达式/join 等结构问题 | 否（只读 spec 文本，**不查库**） |
 | `preview_spec` | 返回将填充的坐标网格 | **否，且本工具不查库** |
 | `render_report` | 渲染 Excel，返回文件路径 | 否（只回路径与计数） |
 | `diff_report` | 比较两版 spec 的差异 | 否 |
@@ -231,7 +276,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 }
 ```
 
-协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 6 个工具要拉 16MB，
+协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 7 个工具要拉 16MB，
 而实际协议面只有 4 个方法。漂移风险用 e2e 对冲：验收阶段**用真实 MCP 客户端**连本服务，
 不是自打 mock。
 
@@ -247,7 +292,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 192 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 231 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -263,14 +308,17 @@ src/
   import/longtable.ts 长表解析 + STAGED 三态校验 + 提交 + Parquet 归档
                       commit() 两阶段：有歧义整体不落库
   import/resolve.ts  ★ 主数据两档归并（Tier 1 自动 / Tier 2 人拍板）+ 别名表
-  spec/types.ts      spec 类型与校验（YAML → Spec）
-  spec/compile.ts    ★ 维度白名单 DIMENSIONS + spec → 参数化 SQL + planOf
+  spec/types.ts      spec 类型与校验 + diagnoseSpec()（一次给全所有问题）
+  spec/dims.ts       ★ 维度角色表（量纲维 / 筛选维），DIMENSIONS 的单一来源
+  spec/expr.ts       ★ 派生表达式求值器（手写，不是 eval）
+  spec/lint.ts       ★ 结构诊断的唯一判据（欠约束 / expr / join / order）
+  spec/compile.ts    ★ 维度白名单 + spec → 参数化 SQL + runCompiled + planOf
   spec/template.ts   模板结构读取（表头/行标签/合并区/定义名称/公式行）
   spec/infer.ts      ★ 模板 → spec 草稿（带 source/evidence，猜的要人确认）
   semantic/query.ts  ★ 唯一的自由查询出口 + 受众分级 + 反推防护
   render/excel.ts    ★ xlsx-populate 模板填充（保版式）
   render/chart.ts    ★ 同一 spec → ECharts option / 形状描述
-  mcp/tools.ts       ★ 六个 MCP 工具 + 金额兜底 + 审计
+  mcp/tools.ts       ★ 七个 MCP 工具（含 lint_spec）+ 金额兜底 + 审计
   mcp/server.ts      零依赖 MCP stdio 服务端
   server.ts          零框架本地 Web 服务
   web/               三个页签的前端（原生 JS）
@@ -286,7 +334,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，192 项断言，15 个阶段
+npm run e2e        # ★ 唯一门禁，231 项断言，15 个阶段
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -302,9 +350,10 @@ npm run bench      # ⚠️ 未实现
 | 1. 导入闭环 | ✅ 服务端 + Web 导入向导 + Parquet 归档 |
 | 2. 语义层 + 查询 | ✅ 受众分级 / 反推防护 / 注入防护 + Web 看板 |
 | 3. 规格引擎 | ✅ Excel + ECharts 两个渲染器 + Web 报表预览导出 |
-| 4. agent 入口 | ✅ MCP 六工具（真实 MCP 客户端验收通过） |
+| 4. agent 入口 | ✅ MCP 七工具（真实 MCP 客户端验收通过） |
 | 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
 | R1. 主数据对齐 | ✅ 两档归并（Tier 1 自动 / Tier 2 人拍板）+ `dim_alias` 表 + Web 待确认卡片 |
+| §7.2 路径 2 | ✅ 自然语言 → spec：靠"spec 语言挡住欠约束"实现（`lint_spec` + 边打字边诊断） |
 
 ### 已知限制
 
@@ -326,7 +375,7 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（16 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（17 条铁律）
 
 ## License
 

@@ -230,6 +230,10 @@ check('第二张表还在', !!wbOut.sheet('分板块'));
 
 // ============ 8. 同一数据、不同口径出第二张表 ============
 log('\n════════ 8. 换口径出第二张表（核心价值验证）════════');
+// ★ 这个 spec 曾经是"静默算错"的又一个实例：rows=company / cols=period_type，
+//   却没有任何指标约束 —— 于是五个指标的钱被加进同一格。它之所以一直没被发现，
+//   是因为下面那句断言写的是 `check('第二张表数据已填', true)`（恒真，什么都没验证）。
+//   现在用 scope.filter 把指标钉成「营业收入」，并和独立查出的数比对。
 const spec2 = parseSpec(`
 id: 分板块简报
 template: ${TPL}
@@ -247,6 +251,8 @@ sheets:
           measure: amount
           agg: sum
           format: "#,##0"
+        scope:
+          filter: { metric: { name: 营业收入 } }
 `);
 const b2 = spec2.sheets[0].blocks[0];
 const c2 = compileBlock(b2, {});
@@ -264,7 +270,27 @@ await renderTemplate(TPL, OUT2, [{
 log(`  输出: ${OUT2}，公司 ${r2.rowLabels.join(', ')}`);
 const fp2 = await fingerprint(OUT2);
 check('第二张表同样零部件丢失', fp2.entries.length === fpBefore.entries.length);
-check('第二张表数据已填', true);
+
+// ★ 真实断言（替代原来那句恒真的 check）：
+//   营业收入 × 集团公司 × 全年的「本年累计」之和，用独立 SQL 查出来比对，
+//   而不是"跑出来多少就写多少"。
+const expectedMg = await db.query<{ v: string }>(`
+  SELECT sum(f.amount) AS v FROM fact_finance f
+  JOIN dim_company ON f.company_id = dim_company.id
+  JOIN dim_metric ON f.metric_id = dim_metric.id
+  WHERE dim_company.name = '集团公司' AND dim_metric.name = '营业收入' AND f.period_type = '本年累计'`);
+const mgRow = r2.matrix.find((m) => m.label === '集团公司');
+check(
+  '★ 第二张表的数值确实只含「营业收入」（未被静默加总其他指标）',
+  mgRow !== undefined && Number(mgRow.values[0]) === Number(expectedMg[0].v),
+  `表内 ${mgRow?.values[0]} vs 独立查出 ${expectedMg[0].v}`,
+);
+// 反证：若指标真被加总，这个数会明显偏大
+check(
+  '★ 第二张表数值不等于「全部指标之和」（防止再次静默加总）',
+  mgRow !== undefined && Number(mgRow.values[0]) !== 67283,
+  '若等于 67283 说明指标未被约束',
+);
 
 // ============ 9. 安全边界验证 ============
 log('\n════════ 9. 安全边界 ════════');
@@ -638,6 +664,64 @@ check('别名指向不存在的目标 → 拒绝', /目标主数据不存在/.te
 const badKind = await postJson('/api/aliases', { kind: 'nope', raw: 'x', targetId: hzId });
 check('别名 kind 只接受 company/metric', /kind/.test(badKind.error ?? ''), badKind.error ?? '');
 
+// --- /api/specs/lint：把"静默算错"提前到打字时（§7.2 路径 2）---
+{
+  const bad = await postJson('/api/specs/lint', {
+    yaml: `id: T
+sheets:
+  - name: S
+    blocks:
+      - anchor: B4
+        rows: { dim: company, order: [华东子公司] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }`,
+  });
+  check('HTTP 诊断接口可用（200，诊断本身不是错误）', bad.willBeRejected === true && bad.ok === false);
+  check('★ 诊断接口与保存用同一套判据（都指向"没有指标约束"）', /没有任何指标约束/.test((bad.errors ?? []).join('')));
+  check('诊断返回可分支的 issues（含 code 与 hint）', (bad.issues ?? []).some((i: any) => i.code === 'UNCONSTRAINED_DIM' && i.hint));
+
+  const good = await postJson('/api/specs/lint', {
+    yaml: `id: T
+params: { year: 2026, month: 6 }
+sheets:
+  - name: S
+    blocks:
+      - anchor: B4
+        rows: { dim: metric, order: [营业收入] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+        scope: { time: { year: "{{year}}", month: "{{month}}" } }`,
+  });
+  check('★ 合法的 spec 诊断放行', good.ok === true && good.willBeRejected === false);
+
+  // ★ 判据一致性：诊断说**不能存** → 保存就必须真的被拒（防"两边打架"）。
+  //   反方向（诊断放行 → 保存成功）用仓库里已存在的 spec 验证，避免往 specs/ 写测试文件。
+  const rejectProbe = await postJson('/api/specs/save', {
+    yaml: `id: e2e-lint-reject
+sheets:
+  - name: S
+    blocks:
+      - anchor: B4
+        rows: { dim: company, order: [华东子公司] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }`,
+  });
+  check(
+    '★ 诊断说「无法保存」的 spec，保存也必须被拒（判据不漂移）',
+    bad.willBeRejected === true && /没有任何指标约束/.test(rejectProbe.error ?? ''),
+    rejectProbe.error ?? '',
+  );
+  const repoLint = await postJson('/api/specs/lint', { specFile: 'specs/月度保送表.yaml' });
+  check(
+    '★ 仓库里定稿的 spec 诊断放行（与保存行为一致）',
+    repoLint.ok === true && (repoLint.errors ?? []).length === 0,
+    JSON.stringify(repoLint.errors ?? []),
+  );
+
+  const badFile = await postJson('/api/specs/lint', { specFile: 'specs/不存在的.yaml' });
+  check('诊断不存在的文件 → 404 错误', /不存在/.test(badFile.error ?? ''), badFile.error ?? '');
+}
+
 stop();
 
 // ============ 13. MCP 工具集（第 4 步：agent 入口）============
@@ -650,6 +734,13 @@ log('\n════════ 13. MCP 工具集（真实客户端 · 零依赖
 const SDK_DIR = '/Applications/DSH Desktop.app/Contents/Resources/app/node_modules/@modelcontextprotocol/client/dist/';
 let mcpOk = false;
 let mcpSkipReason = '';
+// ★ 单独记「这一段是否跑完」。
+//   只靠 mcpOk 会漏：它在 connect 成功后立刻为 true，若之后某条断言炸了，
+//   catch 只是把原因记进 mcpSkipReason，而 `if (!mcpOk)` 不成立 ——
+//   于是**这一段剩下的断言被静默跳过**，总数从 192 掉到 190 却依然全绿。
+//   实测教训：改 lint 规则后 E2E 少了 2 项断言（generate_spec 那三条），
+//   打印的却是"通过 190 / 失败 0"，差点当成回归通过。
+let mcpFinished = false;
 try {
   const { Client } = await import(SDK_DIR + 'index.mjs');
   const { StdioClientTransport } = await import(SDK_DIR + 'stdio.mjs');
@@ -679,11 +770,11 @@ try {
   const list = await client.listTools();
   const names = list.tools.map((t) => t.name).sort();
   check('MCP 握手成功（auto 协商 → legacy 回落）', true, '真实客户端已连接');
-  check('恰好暴露 6 个工具', names.length === 6, names.join(', '));
+  check('恰好暴露 7 个工具', names.length === 7, names.join(', '));
   check(
     '工具集与 §7.1 一致',
     JSON.stringify(names) ===
-      JSON.stringify(['diff_report', 'generate_spec', 'get_template_schema', 'list_metrics', 'preview_spec', 'render_report']),
+      JSON.stringify(['diff_report', 'generate_spec', 'get_template_schema', 'lint_spec', 'list_metrics', 'preview_spec', 'render_report']),
   );
   check(
     '每个工具都有 description 与 inputSchema',
@@ -742,6 +833,8 @@ try {
   }
 
   // --- 5. diff_report：换口径只是文本 diff ---
+  // ★ NEW 把行维从 metric 改成 company 时，必须用 scope.filter 把指标钉住 ——
+  //   否则又是一个"没有指标约束"的 spec（lint 会拒绝，这正是它该做的事）。
   const OLD = `id: T
 template: test/fixtures/月度保送表.xlsx
 sheets:
@@ -753,9 +846,13 @@ sheets:
         value: { measure: amount, agg: sum }`;
   const NEW = OLD.replace('dim: metric', 'dim: company')
     .replace('order: [营业收入, 利润总额]', 'order: [集团公司, 华东子公司]')
-    .replace('order: [本年累计, 去年同期累计, 单月, 账面累计]', 'order: [本年累计, 单月]');
+    .replace('order: [本年累计, 去年同期累计, 单月, 账面累计]', 'order: [本年累计, 单月]')
+    .replace(
+      'value: { measure: amount, agg: sum }',
+      'value: { measure: amount, agg: sum }\n        scope: { filter: { metric: { name: 营业收入 } } }',
+    );
   const dr = await raw('diff_report', { before: OLD, after: NEW });
-  check('diff_report 成功且识别出差异', !dr.isError && dr.json.changed === true);
+  check('diff_report 成功且识别出差异', !dr.isError && dr.json.changed === true, dr.text.slice(0, 200));
   check('diff 精确到字段路径（rows.dim）', dr.json.changes.some((c: any) => c.path === 'sheets[0].blocks[0].rows.dim' && c.before === 'metric' && c.after === 'company'));
   check('diff 报出口径顺序变化（不是 [object Object]）', dr.json.changes.some((c: any) => c.path.endsWith('cols.order') && c.after === '[本年累计, 单月]'));
   check('diff 结果不含金额', findAmountLike(dr.json).length === 0);
@@ -779,6 +876,65 @@ sheets:
   check('审计记录工具名与结果字段名', auditText.includes('"tool":"render_report"') && auditText.includes('"resultKeys"'));
   check('★ 审计日志不含任何金额', !/\d{5,}/.test(auditText.replace(/"ms":\d+/g, '')), '已剔除耗时字段后仍无 5 位以上数字');
 
+  // --- 5.5 lint_spec：把"静默算错"挡在数字出现之前（§7.2 路径 2 的前置条件）---
+  // 场景：agent 从一句自然语言写出 spec，先自检再交给人。
+  const lintBad = await raw('lint_spec', {
+    spec: `id: T
+params: { year: 2026, month: 6 }
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: B4
+        rows: { dim: company, order: [华东子公司] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+        scope: { time: { year: "{{year}}", month: "{{month}}" } }`,
+  });
+  check('lint_spec 成功（诊断工具本身不该抛）', !lintBad.isError, lintBad.text.slice(0, 160));
+  check('★ lint_spec 抓出「没有指标约束」', lintBad.json.willBeRejected === true && lintBad.json.errorCount === 1, JSON.stringify(lintBad.json.errors));
+  check('★ 诊断给出可行动的修法提示', /scope.filter|dim: metric/.test(JSON.stringify(lintBad.json.issues)));
+  check('lint_spec 不含金额', findAmountLike(lintBad.json).length === 0);
+
+  // 正例：钉住指标后应当放行
+  const lintGood = await raw('lint_spec', {
+    spec: `id: T
+params: { year: 2026, month: 6 }
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: B4
+        rows: { dim: metric, order: [营业收入] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+        scope: { time: { year: "{{year}}", month: "{{month}}" } }`,
+  });
+  check('★ 指标被钉住 → lint 放行', lintGood.json.willBeRejected === false && lintGood.json.errorCount === 0);
+
+  // 一次报全（而不是"改一条撞一条"）
+  const lintMulti = await raw('lint_spec', {
+    spec: `id: T
+sheets:
+  - name: S
+    blocks:
+      - anchor: B4
+        rows: { dim: 不存在的维度, order: [x, x] }
+        cols: { dim: company, order: [] }
+        value: { expr: "(本年累计 - 去年同期累计) / 去年同期累计" }`,
+  });
+  check(
+    '★ 一次报全所有问题（不是只报第一条）',
+    lintMulti.json.errorCount >= 3 && lintMulti.json.issues.some((i: any) => i.code === 'DIM_UNKNOWN'),
+    `errorCount=${lintMulti.json.errorCount} codes=${lintMulti.json.issues.map((i: any) => i.code).join(',')}`,
+  );
+
+  // YAML 语法错与语义错分开报
+  const lintSyntax = await raw('lint_spec', { spec: 'id: [unclosed\n  bad: :' });
+  check('★ YAML 语法错单独报（不与语义错混在一起）', lintSyntax.json.parseError !== null && lintSyntax.json.issues.length === 0);
+
+  // 仓库里真实在用的 spec 必须是干净的
+  const lintRepo = await raw('lint_spec', { specFile: 'specs/月度保送表.yaml' });
+  check('★ 仓库里已定稿的 spec 零 error（防规则过严）', lintRepo.json.errorCount === 0, JSON.stringify(lintRepo.json.errors));
+
   // --- 6. generate_spec：模板 → spec 草稿（第 5 步，§7.2 路径 1）---
   const gs = await raw('generate_spec', { template: TPL });
   check('generate_spec 成功', !gs.isError, gs.text.slice(0, 160));
@@ -795,9 +951,35 @@ sheets:
   check('分板块 rows 来源标记为 guessed（模板未预置行标签）', seg?.rows.source === 'guessed' && seg?.rows.dim === 'company');
   check('猜的轴被显式列出（供人核对）', gs.json.guessed.length === 1 && gs.json.guessed[0].sheet === '分板块');
 
-  // 生成的 YAML 必须真能用：解析 → 编译 → 出正确数字
-  const genSpec = parseSpec(gs.json.yaml);
-  check('★ 推断出的 YAML 可以被 parseSpec 解析', genSpec.id === gs.json.specId);
+  // ★ 这张「分板块」表只有「公司 × 本年累计」，模板里根本没有指标信息
+  //   → 推断器必须明说"草稿保存不了"，而不是产出一份会静默加总五个指标的 spec。
+  check(
+    '★ 模板缺指标信息时草稿直接被校验拒绝（draftValid=false）',
+    gs.json.draftValid === false && /没有任何指标约束/.test(gs.json.draftError ?? ''),
+    `draftValid=${gs.json.draftValid}`,
+  );
+  check(
+    '★ 对应的 error 级 issue 说明了缺什么',
+    gs.json.issues.some((i: any) => i.level === 'error' && i.sheet === '分板块' && /找不到指标/.test(i.message)),
+    JSON.stringify(gs.json.issues.filter((i: any) => i.level === 'error')),
+  );
+  // 而且必须**真的**解析失败 —— 不能只是"回报说失败"
+  let genSpecRejected = false;
+  try {
+    parseSpec(gs.json.yaml);
+  } catch {
+    genSpecRejected = true;
+  }
+  check('★ 而且 parseSpec 确实拒绝（回报与行为一致）', genSpecRejected);
+
+  // 人按 error 提示补上指标后，同一份草稿必须能通过 —— 证明提示是可行动的。
+  // 注意是**往已有的 scope 里加一行**，不能再写一个 scope:（YAML 重复 key 会直接报错）
+  const fixedYaml = gs.json.yaml.replace(
+    /(      - anchor: B4\n(?:.*\n)*?        scope:\n)/,
+    '$1          filter: { metric: { name: 营业收入 } }\n',
+  );
+  const genSpec = parseSpec(fixedYaml);
+  check('★ 按提示补上指标后草稿即可用（提示可行动）', genSpec.id === gs.json.specId);
   {
     const gb = genSpec.sheets.find((s) => s.name === '主要指标')!.blocks[0];
     const gc = compileBlock(gb, genSpec.params ?? {});
@@ -812,13 +994,27 @@ sheets:
     genSpec.sheets.every((s) => s.blocks.every((b) => b.scope?.time?.year === '{{year}}' && b.scope?.time?.month === '{{month}}')),
   );
 
+  // 补上指标之后的「分板块」必须真的只算营业收入（而不是加总五个指标）
+  {
+    const sb = genSpec.sheets.find((s) => s.name === '分板块')!.blocks[0];
+    const sc = compileBlock(sb, genSpec.params ?? {});
+    const sres = await runCompiled(sc, (sql) => db.query(sql));
+    const vals = sres.matrix.map((m) => Number(m.values[0]));
+    check('★ 补上指标后「分板块」表数值合理（未被静默加总）', vals.every((v) => v > 0) && !vals.includes(67283), JSON.stringify(vals));
+  }
+
   await client.close();
+  mcpFinished = true;
 } catch (e) {
   mcpSkipReason = (e as Error).message;
 }
 
 if (!mcpOk) {
   check('MCP 阶段可运行', false, mcpSkipReason);
+} else if (!mcpFinished) {
+  // ★ 连上了、但中途炸了 —— 这是**真失败**，绝不能因为"连接成功"就放过。
+  //   漏掉这一条会变成：断言越炸越少，测试却越来越绿。
+  check('MCP 阶段跑完（中途异常不得被当成跳过）', false, mcpSkipReason);
 }
 
 // ============ 14. spec 校验：静默算错必须变成硬错误 ============
@@ -866,6 +1062,176 @@ sheets:
   // 发布出去的示例 spec 必须是好的
   const shipped = parseSpec(fs.readFileSync('specs/月度保送表.yaml', 'utf8'));
   check('★ 仓库里的 specs/月度保送表.yaml 已修正（含 scope.time）', findUnusedParams(shipped).length === 0);
+
+  // ---------------- 15 阶段的前置：三个"静默算错"的回归防线 ----------------
+  const { lintSpec, unpinnedMeaningDims } = await import('../src/spec/lint.ts');
+  const { diagnoseSpec } = await import('../src/spec/types.ts');
+  const { compileBlock, runCompiled } = await import('../src/spec/compile.ts');
+
+  // ★ bug A：block 没有任何指标约束 → 多个指标的金额被加成一格。
+  //   实测：利润总额那一格返回 67283，真值 65198（同量级、格式正常、人不会怀疑）。
+  const UNCONSTRAINED = `
+id: 无指标约束
+sheets:
+  - name: 分板块
+    blocks:
+      - anchor: B4
+        rows: { dim: company, order: [华东子公司] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }`;
+  const dUn = diagnoseSpec(UNCONSTRAINED);
+  check('★ bug A：无指标约束 → 解析即拒绝', dUn.willBeRejected && /没有任何指标约束/.test(dUn.errors.join('')));
+  check('★ bug A：错误码是可分支的 UNCONSTRAINED_DIM', dUn.issues.some((i) => i.code === 'UNCONSTRAINED_DIM'));
+  check('★ bug A：提示给出两种可行动的改法', /scope\.filter/.test(JSON.stringify(dUn.issues)) && /dim: metric/.test(JSON.stringify(dUn.issues)));
+
+  // 反证：口径没钉住同样拒绝（量纲维是两个，不是一个）
+  const NO_PERIOD = UNCONSTRAINED.replace('dim: period_type', 'dim: company').replace('order: [本年累计]', 'order: [华东子公司]');
+  check('★ 口径没钉住也拒绝（量纲维是「指标 + 口径」两个）', diagnoseSpec(NO_PERIOD).willBeRejected);
+
+  // 正例①：把指标做成轴 → 合法（集团合计的常用形状）
+  const BY_METRIC = UNCONSTRAINED
+    .replace('dim: company', 'dim: metric')
+    .replace('order: [华东子公司]', 'order: [营业收入, 利润总额]');
+  check('★ 指标做成轴 → 通过（不误伤合法形状）', !diagnoseSpec(BY_METRIC).willBeRejected);
+
+  // 正例②：用 scope.filter 钉死单一指标 → 合法，且**数值必须真的只含那一个指标**
+  const PINNED = UNCONSTRAINED.replace(
+    'value: { measure: amount, agg: sum }',
+    'value: { measure: amount, agg: sum }\n        scope: { filter: { metric: { name: 利润总额 } } }',
+  );
+  check('★ 用 scope.filter 钉死指标 → 通过', !diagnoseSpec(PINNED).willBeRejected);
+  {
+    const pb = parseSpec(PINNED).sheets[0].blocks[0];
+    const pres = await runCompiled(compileBlock(pb, {}), (sql) => db.query(sql));
+    const v = Number(pres.matrix[0].values[0]);
+    // ★ 两个断言都来自独立事实，不写死"跑出来是多少"（那正是上一轮 bug 的教训）：
+    //   ① 真值 = 华东子公司 × 利润总额 × 本年累计 × 全部 12 个月
+    //   ② 反证 = 同公司同口径下**五个指标加总**，钉住后必须不等于它
+    const q = async (extra: string) =>
+      Number((await db.query<{ v: string }>(`
+        SELECT sum(f.amount) AS v FROM fact_finance f
+        JOIN dim_company ON f.company_id = dim_company.id
+        JOIN dim_metric ON f.metric_id = dim_metric.id
+        WHERE dim_company.name = '华东子公司' AND f.period_type = '本年累计'${extra}`))[0].v);
+    const want = await q(` AND dim_metric.name = '利润总额'`);
+    const allMetrics = await q('');
+    check(
+      '★ bug A 的修复真的生效：数值只含被钉住的那个指标',
+      v === want && v !== allMetrics,
+      `钉住后=${v} 独立查出=${want} 五指标加总=${allMetrics}`,
+    );
+  }
+
+  // ★ bug B：value.expr 曾经被静默忽略（写了却不算，比不支持更糟）
+  const EXPR = `
+id: 同比
+params: { year: 2026, month: 6 }
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: B4
+        rows: { dim: metric, order: [利润总额] }
+        cols: { dim: period_type, order: [本年累计, 去年同期累计] }
+        value: { expr: "(本年累计 - 去年同期累计) / 去年同期累计", format: "0.0%" }
+        scope: { time: { year: "{{year}}", month: "{{month}}" } }`;
+  {
+    const eb = parseSpec(EXPR).sheets[0].blocks[0];
+    const eres = await runCompiled(compileBlock(eb, { year: 2026, month: 6 }), (sql) => db.query(sql));
+    const v = Number(eres.matrix[0].values[0]);
+    // 真值用独立 SQL 算，不写死：集团 2026-06 利润总额的 (本年累计-去年同期累计)/去年同期累计
+    const pv = await db.query<{ m: string; prev: string }>(`
+      SELECT sum(CASE WHEN f.period_type='本年累计' THEN f.amount END) AS m,
+             sum(CASE WHEN f.period_type='去年同期累计' THEN f.amount END) AS prev
+      FROM fact_finance f
+      JOIN dim_metric ON f.metric_id = dim_metric.id
+      JOIN dim_period ON dim_period.fin_month = f.fin_month
+      WHERE dim_metric.name = '利润总额' AND dim_period.year = 2026 AND dim_period.month = 6`);
+    const want = (Number(pv[0].m) - Number(pv[0].prev)) / Number(pv[0].prev);
+    check('★ bug B：expr 真的被求值（不再返回两个累计额本身）', Math.abs(v - want) < 1e-9, `表内=${v} 独立算出=${want}`);
+    // ★ 反证：若 expr 仍被忽略，返回的会是两个原始累计额（断言它们都不等于 v）
+    check(
+      '★ bug B：返回值不是原始累计额（expr 确实参与了计算）',
+      v !== Number(pv[0].m) && v !== Number(pv[0].prev),
+      `本年累计=${pv[0].m} 去年同期=${pv[0].prev} 表内=${v}`,
+    );
+    check('★ bug B：列标签是表达式本身（一行一个派生值）', eres.colLabels.length === 1 && /去年同期累计/.test(eres.colLabels[0]), eres.colLabels.join(','));
+  }
+  check('★ expr 里出现非法字符（代码注入）→ 解析即拒绝', diagnoseSpec(EXPR.replace('"0.0%"', '"x"').replace('(本年累计 - 去年同期累计) / 去年同期累计', "require('fs')")).willBeRejected);
+  // expr 引用不存在的口径 → 拒绝（而不是求值时抛）
+  {
+    const badRef = diagnoseSpec(EXPR.replace('order: [本年累计, 去年同期累计]', 'order: [本年累计]'));
+    check('★ expr 引用了 cols.order 里没有的口径 → 诊断报出', badRef.issues.some((i) => i.code === 'EXPR_REFS'), JSON.stringify(badRef.issues.map((i) => i.code)));
+  }
+
+  // ★ bug C：scope.company.filter 引用 dim_company 却不建 JOIN（曾经直接报"列不存在"）
+  const COMP_FILTER = `
+id: 单公司
+params: { year: 2026, month: 6 }
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: B4
+        rows: { dim: metric, order: [利润总额] }
+        cols: { dim: period_type, order: [本年累计] }
+        value: { measure: amount, agg: sum }
+        scope:
+          time: { year: "{{year}}", month: "{{month}}" }
+          company: { filter: { name: 华东子公司 } }`;
+  {
+    const cb = parseSpec(COMP_FILTER).sheets[0].blocks[0];
+    let joined = true;
+    let v: number | null = null;
+    try {
+      const cres = await runCompiled(compileBlock(cb, { year: 2026, month: 6 }), (sql) => db.query(sql));
+      v = Number(cres.matrix[0].values[0]);
+    } catch {
+      joined = false;
+    }
+    check('★ bug C：scope.company.filter 会自动 JOIN dim_company（不再报列不存在）', joined);
+    check('★ bug C：数值确实被公司过滤（华东 ≠ 集团合计）', v === 17116 && v !== 65198, `值=${v}`);
+  }
+
+  // ---- 一次报全，而不是"改一条撞一条" ----
+  const multi = diagnoseSpec(`
+id: T
+sheets:
+  - name: S
+    blocks:
+      - anchor: B4
+        rows: { dim: 不存在的维度, order: [x, x] }
+        cols: { dim: company, order: [] }
+        value: { expr: "(本年累计 - 去年同期累计) / 去年同期累计" }`);
+  check('★ 一次给全所有问题（不是只报第一条）', multi.errors.length >= 3, `errors=${multi.errors.length}`);
+
+  // ---- YAML 语法错与语义错分开报 ----
+  const syn = diagnoseSpec('id: [unclosed\n  bad: :');
+  check('★ YAML 语法错单独归入 parseError', syn.parseError !== null && syn.issues.length === 0);
+
+  // ---- 判据只有一份：lint 与 parseSpec 不漂移 ----
+  check(
+    '★ lintSpec 判定「可保存」⇔ parseSpec 不抛（同一套判据，不会两边打架）',
+    [UNCONSTRAINED, PINNED, BY_METRIC, EXPR, COMP_FILTER].every((y) => {
+      const d = diagnoseSpec(y);
+      let threw = false;
+      try { parseSpec(y); } catch { threw = true; }
+      return d.willBeRejected === threw;
+    }),
+  );
+
+  // ---- unpinnedMeaningDims 导出给推断器用（模板缺指标时必须能自报家门）----
+  // ⚠️ UNCONSTRAINED 现在会被 parseSpec 拒绝，所以这里必须用 parseSpecLenient
+  //    取结构 —— 诊断工具链本身要能处理"不合法的 spec"。
+  {
+    const { parseSpecLenient } = await import('../src/spec/types.ts');
+    const pinnedBlock = parseSpecLenient(PINNED).spec!.sheets[0].blocks[0];
+    const unBlock = parseSpecLenient(UNCONSTRAINED).spec!.sheets[0].blocks[0];
+    check(
+      '★ unpinnedMeaningDims 能识别缺失的量纲维',
+      unpinnedMeaningDims(pinnedBlock).length === 0 && unpinnedMeaningDims(unBlock).includes('metric'),
+      `pinned=${JSON.stringify(unpinnedMeaningDims(pinnedBlock))} unconstrained=${JSON.stringify(unpinnedMeaningDims(unBlock))}`,
+    );
+  }
+  check('lintSpec 导出可用（供 MCP / Web 诊断复用）', Array.isArray(lintSpec(parseSpec(PINNED))));
 }
 
 // ============ 15. 主数据对齐（§10 R1）============

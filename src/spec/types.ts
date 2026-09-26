@@ -5,6 +5,7 @@
  * 人和 agent 都写它；Excel 与图表都是它的渲染器。
  */
 import { parse as parseYaml } from 'yaml';
+import { lintSpec, type LintIssue } from './lint.ts';
 
 export interface Spec {
   id: string;
@@ -25,10 +26,21 @@ export interface Block {
   rows: AxisSpec;
   cols: AxisSpec;
   value: ValueSpec;
-  /** 参数化范围：时间 / 公司 */
+  /** 参数化范围：时间 / 公司 / 任意维度 */
   scope?: {
     time?: { year?: string | number; month?: string | number };
     company?: { dim?: string; filter?: Record<string, string> };
+    /**
+     * 通用维度过滤：`{ metric: { name: 营业收入 }, company: { level: "2" } }`。
+     *
+     * ★ 存在的理由（§7.2 路径 2）：不把某个维度做成轴，而是**钉死成一个值**。
+     *   典型场景：「本月营业收入」这张表里，指标不该出现在行列上，
+     *   但 block 又必须限定它是哪个指标 —— 没有这个字段，`rows: company /
+     *   cols: period_type` 就只能把五个指标加在一起（详见 lint.ts 文件头）。
+     *
+     * 与 `company.filter` 的关系：后者是它的特例，保留只为兼容文档 §5.2 的旧写法。
+     */
+    filter?: Record<string, Record<string, string | string[]>>;
   };
   /**
    * 可选图表声明 —— 同一份 spec 的第二个 renderer（§5.3、F5）。
@@ -65,7 +77,66 @@ export function parseSpec(yamlText: string): Spec {
   return raw;
 }
 
+/**
+ * 解析但**不校验** —— 给"诊断"场景用。
+ *
+ * ★ 为什么需要它：`/api/specs/lint`、`lint_spec` 工具的职责正是
+ *   **告诉人哪里错了**。如果先用 parseSpec（它遇到 error 就抛），
+ *   那么用户永远只能看到第一条错误，改一条再撞下一条。
+ *   分开之后，一次就能给全清单。
+ */
+export function parseSpecLenient(yamlText: string): { spec: Spec | null; parseError: string | null } {
+  try {
+    return { spec: parseYaml(yamlText) as Spec, parseError: null };
+  } catch (e) {
+    // YAML 本身语法错误（缩进/引号）—— 这不是 spec 语义问题，单独报
+    return { spec: null, parseError: (e as Error).message };
+  }
+}
+
 export class SpecError extends Error {}
+
+/**
+ * 一次性给全所有诊断 —— `lint_spec` 工具与 Web 诊断面板的唯一入口。
+ *
+ * ★ 为什么不能直接用 parseSpec：它遇到第一条 error 就抛，
+ *   于是人（和 agent）只能"改一条、再撞下一条"。
+ *   这里把 YAML 语法错、结构诊断、params 未引用三类一次性报全。
+ *
+ * ★ 判据只有一份：结构诊断来自 `lintSpec`，与"保存时拒绝"用的是同一个函数。
+ *   两份判据一定会漂移 —— 工具说没问题、保存却被拒，是最难查的那类 bug。
+ */
+export function diagnoseSpec(yamlText: string): {
+  spec: Spec | null;
+  parseError: string | null;
+  issues: LintIssue[];
+  unusedParams: string[];
+  /** 保存时会不会被拒（error 级 issue 或未引用的 params 都会导致拒绝） */
+  willBeRejected: boolean;
+  errors: string[];
+} {
+  const { spec, parseError } = parseSpecLenient(yamlText);
+  if (!spec) {
+    return {
+      spec: null,
+      parseError,
+      issues: [],
+      unusedParams: [],
+      willBeRejected: true,
+      errors: [parseError ?? 'YAML 解析失败'],
+    };
+  }
+  const issues = lintSpec(spec);
+  const unusedParams = findUnusedParams(spec);
+  const errors = issues.filter((i) => i.level === 'error').map((i) => `${i.at}: ${i.message}`);
+  if (unusedParams.length) {
+    errors.push(
+      `params 声明了但从未被引用: ${unusedParams.join(', ')} —— ` +
+        `这通常意味着报表没有按参数过滤时间，会把所有期间的数字加总。`,
+    );
+  }
+  return { spec, parseError: null, issues, unusedParams, willBeRejected: errors.length > 0, errors };
+}
 
 /**
  * 收集 spec 中**所有会被 substitute() 作用的字符串**。
@@ -79,6 +150,12 @@ function substitutableStrings(s: Spec): string[] {
       out.push(...(b.rows?.order ?? []).map(String));
       out.push(...(b.cols?.order ?? []).map(String));
       for (const f of [b.rows?.filter, b.cols?.filter, b.scope?.company?.filter]) {
+        for (const v of Object.values(f ?? {})) {
+          Array.isArray(v) ? out.push(...v.map(String)) : out.push(String(v));
+        }
+      }
+      // ★ scope.filter 里的值也可能带 {{参数}}（比如按板块筛选时 group_name: "{{group}}"）
+      for (const f of Object.values(b.scope?.filter ?? {})) {
         for (const v of Object.values(f ?? {})) {
           Array.isArray(v) ? out.push(...v.map(String)) : out.push(String(v));
         }
@@ -107,50 +184,37 @@ export function findUnusedParams(s: Spec): string[] {
   return declared.filter((k) => !texts.some((t) => t.includes(`{{${k}}}`)));
 }
 
+/**
+ * 校验入口。
+ *
+ * ★ 结构性判断全部委托给 `lintSpec`（src/spec/lint.ts）——
+ *   这样"解析时拒绝"和"lint_spec 工具/Web 诊断面板报告"用的是**同一套判据**。
+ *   两份判据会漂移：工具说没问题、保存时被拒，或者反过来。
+ *
+ * 只有 error 级才抛（"欠约束会静默算错"属于 error，见 lint.ts 文件头）；
+ * warn 级放到诊断面板里给人看，不挡住保存 —— 一条"order 为空"的提醒
+ * 不该让人连草稿都存不下来。
+ */
 function validateSpec(s: Spec) {
-  const errs: string[] = [];
-  if (!s.id) errs.push('缺少 id');
-  if (!Array.isArray(s.sheets) || s.sheets.length === 0) errs.push('至少需要一个 sheet');
-  for (const [i, sheet] of (s.sheets ?? []).entries()) {
-    if (!sheet.name) errs.push(`sheets[${i}] 缺少 name`);
-    if (!Array.isArray(sheet.blocks) || sheet.blocks.length === 0) {
-      errs.push(`sheets[${i}] (${sheet.name}) 至少需要一个 block`);
-      continue;
-    }
-    for (const [j, b] of sheet.blocks.entries()) {
-      const at = `sheets[${i}].blocks[${j}]`;
-      if (!b.anchor) errs.push(`${at} 缺少 anchor`);
-      if (!b.rows?.dim) errs.push(`${at} 缺少 rows.dim`);
-      if (!b.cols?.dim) errs.push(`${at} 缺少 cols.dim`);
-      if (!b.value || (!b.value.measure && !b.value.expr)) {
-        errs.push(`${at} 的 value 需要 measure 或 expr`);
-      }
-      // 派生表达式校验：避免写出不可推导的派生式（见 §4.6.2）
-      if (b.value?.expr && !b.value.measure) {
-        // 纯表达式模式，需要 cols 至少覆盖表达式引用的口径
-        const refs = extractExprRefs(b.value.expr);
-        const known = new Set(b.cols?.order ?? []);
-        if (known.size > 0) {
-          const unknown = refs.filter((r) => !known.has(r) && r !== b.rows.dim);
-          if (unknown.length) {
-            errs.push(`${at} 的 expr 引用了未在 cols.order 中定义的口径: ${unknown.join(', ')}`);
-          }
-        }
-      }
-    }
-  }
+  const issues = lintSpec(s);
+  const errs = issues.filter((i) => i.level === 'error');
 
+  // 「声明了 params 却从未引用」保持独立 —— 它关心的是 params 与引用的**关系**，
+  // 不是单个 block 的结构，放在这里比塞进 lintBlock 更自然。
   const unused = findUnusedParams(s);
-  if (unused.length) {
-    errs.push(
-      `params 声明了但从未被引用: ${unused.join(', ')}。` +
-        `这通常意味着报表**没有按参数过滤时间**，会把所有期间的数字加总。` +
-        `请在 block 里加 scope.time（如 scope: { time: { year: "{{year}}", month: "{{month}}" } }），` +
-        `或删掉这些 params。`,
-    );
-  }
+  const extra = unused.length
+    ? [
+        `params 声明了但从未被引用: ${unused.join(', ')}。` +
+          `这通常意味着报表**没有按参数过滤时间**，会把所有期间的数字加总。` +
+          `请在 block 里加 scope.time（如 scope: { time: { year: "{{year}}", month: "{{month}}" } }），` +
+          `或删掉这些 params。`,
+      ]
+    : [];
 
-  if (errs.length) throw new SpecError('spec 校验失败:\n  - ' + errs.join('\n  - '));
+  if (errs.length || extra.length) {
+    const formatted = errs.map((i) => `${i.at}: ${i.message}${i.hint ? `\n      → ${i.hint}` : ''}`);
+    throw new SpecError('spec 校验失败:\n  - ' + [...formatted, ...extra].join('\n  - '));
+  }
 }
 
 /** 从派生表达式里抽取被引用的口径名 */

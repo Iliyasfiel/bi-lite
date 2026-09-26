@@ -6,38 +6,13 @@
  */
 import type { Block, Spec, SheetSpec } from './types.ts';
 import { substitute } from './types.ts';
+import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
+import { evalExpr, type ExprScope } from './expr.ts';
 
-/**
- * 已注册的维度 —— group_by / rows / cols 只接受这里的名字（防注入 + 防越界）
- *
- * table === null 表示该维度的取值**直接来自事实表**（或是个 SQL 表达式），不需要 join。
- * labelCol 在 table 为 null 时可以是完整表达式（如 `strftime(f.fin_month, '%Y-%m')`）。
- */
-export const DIMENSIONS = {
-  metric: {
-    table: 'dim_metric',
-    labelCol: 'name',
-    idCol: 'id',
-    joinOn: 'f.metric_id = dim_metric.id',
-  },
-  company: {
-    table: 'dim_company',
-    labelCol: 'name',
-    idCol: 'id',
-    joinOn: 'f.company_id = dim_company.id',
-  },
-  // 以下直接来自事实表，不 join
-  period_type: { table: null, labelCol: 'f.period_type', idCol: 'period_type', joinOn: null },
-  // 时间维度：Web 看板要"按月份筛选/分组"（F6）
-  month: { table: null, labelCol: "strftime(f.fin_month, '%Y-%m')", idCol: 'fin_month', joinOn: null },
-  year: { table: null, labelCol: 'CAST(year(f.fin_month) AS VARCHAR)', idCol: 'fin_month', joinOn: null },
-} as const;
-
-export type DimName = keyof typeof DIMENSIONS;
-
-export function isRegisteredDim(d: string): d is DimName {
-  return Object.hasOwn(DIMENSIONS, d);
-}
+// 白名单已抽到 ./dims.ts（lint.ts 与 grammar.ts 也要用，放在这里会成环）。
+// 下面转出去，保持 `from './compile.ts'` 的既有调用点不用改。
+export { DIMENSIONS, DIM_NAMES, isRegisteredDim };
+export type { DimName };
 
 /** SQL 字面量转义（单引号双写）—— 值来自 spec，仍需防御 */
 function q(v: string | number): string {
@@ -57,6 +32,30 @@ export interface CompiledQuery {
   colLabels: string[];
   /** 每行的行维度值 → 用来做 Excel 行定位 */
   block: Block;
+  /**
+   * 聚合之后的派生计算（`value.expr`，见 §5.2.1）。
+   *
+   * 语义：SQL 先把 expr 引用的**输入列**都算出来（columns[0..n]），
+   * 再对每一行按表达式合成**一个**输出值。所以有 expr 时：
+   *   - SQL 的列 = `inputLabels`（expr 的输入）
+   *   - 结果的列 = `colLabels` = 单个标签（expr 的输出）
+   * 这个分工是必要的：expr 是「同一区里几列之间的关系」，
+   * 它不能也不需要下推到 SQL —— 下推反而要重复写聚合逻辑。
+   */
+  expr?: { src: string; inputLabels: string[] };
+}
+
+/** 维度取值在 SQL 里的引用表达式（兼容 table=null 的 period_type/month/year） */
+function labelRef(dim: DimName): string {
+  const d = DIMENSIONS[dim];
+  return d.table ? `${d.table}.${d.labelCol}` : d.labelCol;
+}
+
+/** 维度过滤列的引用表达式（filter 的 key 是列名，不是维度名） */
+function filterRef(dim: DimName, col: string): string {
+  const d = DIMENSIONS[dim];
+  // table=null 的维度取值在事实表上（period_type / fin_month），列名前缀是 f.
+  return d.table ? `${d.table}.${col}` : `f.${col}`;
 }
 
 /**
@@ -80,36 +79,33 @@ export function compileBlock(
 
   // 需要的 join（去重）
   const joins = new Set<string>();
-  for (const d of [rowsDim, colsDim]) {
+  const needJoin = (d: DimName) => {
     const j = DIMENSIONS[d].joinOn;
     if (j) joins.add(`JOIN ${DIMENSIONS[d].table} ON ${j}`);
-  }
+  };
+  needJoin(rowsDim);
+  needJoin(colsDim);
 
-  // 行标签列
-  const rowExpr =
-    DIMENSIONS[rowsDim].table
-      ? `${DIMENSIONS[rowsDim].table}.${DIMENSIONS[rowsDim].labelCol}`
-      : `${DIMENSIONS[rowsDim].labelCol}`;
+  const rowExpr = labelRef(rowsDim);
 
   // 列：条件聚合
   const colExprs = colLabels.map((c, i) => {
-    const cond =
-      colsDim === 'period_type'
-        ? `f.period_type = ${q(c)}`
-        : `${DIMENSIONS[colsDim].table}.${DIMENSIONS[colsDim].labelCol} = ${q(c)}`;
+    const cond = `${labelRef(colsDim)} = ${q(c)}`;
     // 别名用序号，避免中文别名在不同驱动下的引用问题
     return `${agg}(CASE WHEN ${cond} THEN f.${measure} END) AS c${i}`;
   });
 
   // WHERE
   const where: string[] = [];
-  const addFilter = (dim: string, filter?: Record<string, string | string[]>) => {
+  const addFilter = (dim: DimName, filter?: Record<string, string | string[]>) => {
     if (!filter) return;
-    const d = ident(dim);
-    const tbl = DIMENSIONS[d].table;
     for (const [col, val] of Object.entries(filter)) {
       if (!/^[a-z_][a-z0-9_]*$/i.test(col)) throw new Error(`非法过滤字段: ${col}`);
-      const ref = tbl ? `${tbl}.${col}` : `f.${col}`;
+      const ref = filterRef(dim, col);
+      // ★ 修复：引用了某个维度的列，就必须带上它的 JOIN。
+      //   首版只对 rows/cols 建 join，于是 scope.company.filter 生成
+      //   「WHERE dim_company.name = ... 但没有 JOIN dim_company」→ 查库直接报错。
+      needJoin(dim);
       if (Array.isArray(val)) {
         where.push(`${ref} IN (${val.map((v) => q(substitute(String(v), params))).join(', ')})`);
       } else {
@@ -119,7 +115,12 @@ export function compileBlock(
   };
   addFilter(rowsDim, block.rows.filter);
   addFilter(colsDim, block.cols.filter);
+  // 兼容文档 §5.2 的旧写法
   addFilter('company', block.scope?.company?.filter as Record<string, string> | undefined);
+  // 通用维度过滤（§7.2 路径 2 的主力：把某个维度钉死成单一值而不做成轴）
+  for (const [dim, f] of Object.entries(block.scope?.filter ?? {})) {
+    addFilter(ident(dim), f);
+  }
 
   if (block.scope?.time?.year !== undefined) {
     where.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
@@ -148,7 +149,26 @@ export function compileBlock(
     .filter(Boolean)
     .join('\n');
 
+  // ★ 派生表达式（§5.2.1）。
+  //   首版 compile.ts 认得 value.expr 这个字段但从不使用它 —— 于是写了同比表达式
+  //   的 spec 会**静默**返回两个累计额本身（实测 [65198, 60870]，而期望 0.0711）。
+  //   现在：SQL 照常取出所有输入列，输出列变成"每行一个表达式结果"。
+  if (block.value.expr) {
+    return {
+      sql,
+      rowLabels,
+      colLabels: [exprLabel(block.value.expr)],
+      block,
+      expr: { src: block.value.expr, inputLabels: colLabels },
+    };
+  }
+
   return { sql, rowLabels, colLabels, block };
+}
+
+/** 派生列的显示名：优先用 spec 里的 format 提示，否则用表达式原文 */
+function exprLabel(src: string): string {
+  return src.trim();
 }
 
 /** 执行编译结果，返回「行 × 列」矩阵 */
@@ -157,17 +177,25 @@ export async function runCompiled(c: CompiledQuery, query: (sql: string) => Prom
   const byLabel = new Map<string, Record<string, unknown>>();
   for (const r of raw) byLabel.set(String(r.row_label), r);
 
+  // SQL 的列是 expr 的**输入**；没有 expr 时它就是输出
+  const inputLabels = c.expr ? c.expr.inputLabels : c.colLabels;
+
   const matrix = c.rowLabels.map((label) => {
     const row = byLabel.get(label);
-    return {
-      label,
-      values: c.colLabels.map((_, i) => {
-        const v = row?.[`c${i}`];
-        if (v === null || v === undefined) return null;
-        const n = Number(v);
-        return Number.isFinite(n) ? n : null;
-      }),
-    };
+    const inputs = inputLabels.map((_, i) => {
+      const v = row?.[`c${i}`];
+      if (v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    });
+
+    if (c.expr) {
+      // 输入列名 → 值 的上下文（expr 里的变量就是 cols.order 里的口径名）
+      const scope: ExprScope = {};
+      inputLabels.forEach((name, i) => (scope[name] = inputs[i]));
+      return { label, values: [evalExpr(c.expr.src, scope)] };
+    }
+    return { label, values: inputs };
   });
 
   return { rowLabels: c.rowLabels, colLabels: c.colLabels, matrix };

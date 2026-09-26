@@ -483,6 +483,7 @@ function renderInference(inf) {
   html += `<h3>spec 草稿</h3>
     <p class="hint">下面是推断出的 YAML。<b>推断只是草稿</b>：请核对带「猜的」标记的轴后再保存。</p>
     <textarea id="specYaml" spellcheck="false">${esc(inf.yaml)}</textarea>
+    <div id="specLint" class="spec-lint"></div>
     <div class="actions" style="margin-top:8px">
       <button class="primary" id="saveSpec">保存到 specs/</button>
       <span class="hint" id="saveMsg"></span>
@@ -490,6 +491,74 @@ function renderInference(inf) {
 
   $('tplResult').innerHTML = html;
   $('saveSpec').addEventListener('click', saveSpec);
+  // ★ 边改边诊断：把"保存时被拒"提前成"打字时就看见哪里错"。
+  //   对路径 2（自然语言 → spec）尤其重要 —— agent 写出的草稿常常漏掉指标约束，
+  //   而那种错**语法完全合法**，只有诊断能提前发现。
+  $('specYaml').addEventListener('input', () => scheduleLint());
+  scheduleLint();
+}
+
+let lintTimer = null;
+
+/** 防抖：打字时不必每个字符都打一次服务端 */
+function scheduleLint() {
+  clearTimeout(lintTimer);
+  lintTimer = setTimeout(runLint, 250);
+}
+
+async function runLint() {
+  const box = $('specLint');
+  const yaml = $('specYaml')?.value;
+  if (!box || !yaml) return;
+  box.innerHTML = '<span class="hint">检查中…</span>';
+  let d;
+  try {
+    d = await api('/api/specs/lint', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml }),
+    });
+  } catch (e) {
+    box.innerHTML = `<span class="hint">诊断失败：${esc(e.message)}</span>`;
+    return;
+  }
+
+  const btn = $('saveSpec');
+  if (btn) btn.disabled = d.willBeRejected;
+
+  if (d.parseError) {
+    box.innerHTML = `<div class="issue err"><span class="lv">YAML 语法</span><span>${esc(d.parseError)}</span></div>`;
+    return;
+  }
+  if (d.willBeRejected) {
+    // ⚠️ 注意别把 `a + b ? c : d` 写在一起：`+` 比 `?:` 先算，
+    //    整个字符串变成条件，永远走真分支。分开放进数组再 join。
+    const parts = [
+      `<div class="issue err"><span class="lv">无法保存</span>
+        <span>这份 spec 有 ${d.errors.length} 处必须先改 —— 否则会算出一个看起来正常、其实是错的数。</span></div>`,
+    ];
+    for (const i of d.issues.filter((x) => x.level === 'error')) {
+      parts.push(`<div class="issue err"><span class="lv">错误</span>
+        <span><code>${esc(i.at)}</code>：${esc(i.message)}${
+          i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''
+        }</span></div>`);
+    }
+    if (d.unusedParams.length) {
+      parts.push(`<div class="issue err"><span class="lv">参数</span>
+        <span>params 里的 ${esc(d.unusedParams.join(', '))} 从未被引用 ——
+          这通常意味着报表没有按参数过滤时间，会把所有期间加总。</span></div>`);
+    }
+    box.innerHTML = parts.join('');
+    return;
+  }
+  const warns = d.issues.filter((i) => i.level === 'warn');
+  box.innerHTML = warns.length
+    ? `<div class="issue warn"><span class="lv">可保存</span>
+         <span>结构上没问题，但有 ${warns.length} 条提醒（不挡保存）。</span></div>` +
+      warns.map((i) => `<div class="issue warn"><span class="lv">提醒</span>
+        <span><code>${esc(i.at)}</code>：${esc(i.message)}</span></div>`).join('')
+    : `<div class="issue ok"><span class="lv">通过</span>
+         <span>没有发现问题，可以保存。</span></div>`;
 }
 
 async function saveSpec() {
@@ -507,7 +576,7 @@ async function saveSpec() {
   } catch (e) {
     // 校验不通过的 spec 会被服务端拒绝 —— 这是刻意的（防"静默算错"）
     $('saveMsg').textContent = '';
-    $('tplResult').insertAdjacentHTML('beforeend',
+    $('specLint').insertAdjacentHTML('afterbegin',
       `<div class="issue err"><span class="lv">拒绝保存</span><span>${esc(e.message)}</span></div>`);
   }
 }

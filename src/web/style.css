@@ -138,6 +138,14 @@ td.num { font-variant-numeric: tabular-nums; }
 .issue .lv { flex: 0 0 auto; font-size: 11px; padding: 1px 7px; border-radius: 4px; height: fit-content; }
 .issue.error .lv { background: var(--err-soft); color: var(--err); }
 .issue.warn .lv { background: var(--warn-soft); color: var(--warn); }
+/* 诊断结果用的三档（与 .issue.error / .warn 并存，别名而已） */
+.issue.err .lv { background: var(--err-soft); color: var(--err); }
+.issue.ok .lv { background: var(--ok-soft); color: var(--ok); }
+.issue code { font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+
+/* spec 草稿的实时诊断面板（§7.2 路径 2：写的时候就知道会不会算错） */
+.spec-lint { margin: 8px 0 0; }
+.spec-lint .issue { padding: 6px 0; }
 
 .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin: 12px 0; }
 .kv div { background: var(--bg); border-radius: 8px; padding: 10px 12px; }

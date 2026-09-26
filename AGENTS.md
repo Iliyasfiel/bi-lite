@@ -32,7 +32,7 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 ## 2. 铁律（违反任何一条 = 回滚，不接受"临时"例外）
 
 1. **明细数据不出 DuckDB 进程；金额不进 LLM 上下文。**
-   - agent **没有 SQL 权**。只暴露 §7.1 的六个工具，无 shell。
+   - agent **没有 SQL 权**。只暴露 §7.1 的七个工具，无 shell。
    - 给 agent 的预览（`planOf()`）**只含坐标与形状，不含数值**。
    - 新增任何"返回查询结果"的工具或接口前，先确认它是否会把明细值送进 LLM。
    - 参考：Lightdash/Metabase/Superset 三家都给 LLM SQL 权再加闸门，**bi-lite 是根本不给**。
@@ -114,12 +114,30 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
       "写法相近"**必须要求首字相同**（否则「西北子公司」vs「华东子公司」仅差 2 字、相似度 0.6 会误报），
       且**字号一旦对上就直接返回、不补弱信号**（有强信号时就不要弱信号）。
     - 有歧义时接口返 **HTTP 200 + `pendingConfirm:true`**，不是 4xx —— **那是待办，不是失败**。
+17. **量纲维必须被钉住；欠约束的 spec 在解析期就拒绝，不许"先出数再看"。**
+    `metric` 与 `period_type` 是**量纲维**（决定"这个数是什么"）；公司/月份/年份是**筛选维**
+    （只是"哪些数加进来"）。前两者必须有约束，否则多个指标的金额会被**加成一个数**。
+    判例（§7.2.1）：`rows: company / cols: period_type` 无指标约束时，那一格返回 **67283**，
+    真值 **65198** —— 同量级、格式正常、人不会怀疑。
+    - 规则只有一份：`src/spec/lint.ts` 的 `lintSpec()`。`parseSpec()`、`lint_spec` 工具、
+      `/api/specs/lint`、Web 诊断面板**全部**调它。**禁止另写一份判据** ——
+      两份判据会漂移，表现为"工具说没问题、保存却被拒"，这是最难查的那类 bug。
+      e2e 有一条断言专门比对 `lintSpec 判定「可保存」⇔ parseSpec 不抛`。
+    - **一次给全所有问题**（`diagnoseSpec()`），不能"改一条、再撞下一条"。
+      `parseSpec` 遇错即抛是它该做的；`lint_spec` 的职责恰恰是**列清单**。
+    - 量纲维的定义在 `src/spec/dims.ts`，**不要**在别处再写一份"哪些维度重要"的判断。
+    - `value.expr` 必须真的参与计算（判例：曾经写了却不算，静默返回两个原始累计额）。
+      求值走 `src/spec/expr.ts` 的**手写求值器，不是 `eval`**。
+      同类的还有 `scope.company.filter` 引用 `dim_company` 却不建 JOIN —— 修法是补 `needJoin`。
+    - **新增任何"能算出数"的 spec 特性时，必须同时回答：写错了会怎样？**
+      答不上来就先别加 —— 路径 2（自然语言 → spec）的全部工程价值都在这里，
+      **只要语言允许欠约束，写的人（无论人还是 agent）迟早会写出来，而提示词既挡不住也测不了。**
 
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，192 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，231 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -127,7 +145,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 - **`npm run e2e` 必须全绿才可提交。** 断言覆盖 15 个阶段：模板指纹 → 开库 → STAGED 校验 →
   提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
   语义层 → 图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14）** → **主数据对齐（铁律 16）**。
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -212,9 +230,18 @@ src/
                    + 立场：合并两家公司比不合并危险得多
   spec/
     types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
+                   + parseSpecLenient()（解析但不校验，给诊断用）
+                   + diagnoseSpec()（★ 一次给全所有问题，lint/Web/HTTP 共用）
                    + findUnusedParams()（★ 防"声明了 params 却没用"的静默算错，铁律 14）
+    dims.ts        ★ 维度角色表：哪些是「量纲维」、哪些是「筛选维」（铁律 17）
+                   + DIMENSIONS 的单一来源（compile.ts 从这里 re-export）
+    expr.ts        ★ 派生表达式求值器（手写 tokenizer/parser，**不是 eval**）
+                   + evalExpr() —— expr 的输入来自 SQL、输出在 JS 里算
+    lint.ts        ★ 结构诊断的**唯一判据**：欠约束 / expr 引用 / join / order / chart
+                   + lintSpec() + unpinnedMeaningDims()
+                   ⚠️ 禁止另写一份判据 —— 漂移会表现为"说没问题、保存却被拒"
     compile.ts     ★ DIMENSIONS 白名单 + compileBlock() → 参数化 SQL
-                   + runCompiled() + planOf()（给 agent 的坐标预览，不含金额）
+                   + runCompiled()（expr 参与计算）+ planOf()（坐标预览，不含金额）
     template.ts    模板结构读取：表头/行标签/合并区/定义名称/公式行
                    + readTemplateSchema() / readRegion() / textAt()（数字在类型层面没出口）
     infer.ts       ★ 模板 → spec 草稿（铁律 15）
@@ -233,7 +260,7 @@ src/
     chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
                    + chartShape()（只含结构与标签、不含数据点，可给 agent）
   mcp/
-    tools.ts       ★ 六个工具（list_metrics / get_template_schema / preview_spec /
+    tools.ts       ★ 七个工具（list_metrics / get_template_schema / lint_spec /
                    render_report / diff_report / generate_spec）
                    + callTool()：★ 金额兜底（铁律 13）+ 审计（只记字段名）
                    + findAmountLike()（递归找 ≥ AMOUNT_TRIPWIRE 的数字，给 e2e 复用）
@@ -266,19 +293,23 @@ data/              ⚠️ 真实财务数据，永不提交
 | 1. 导入闭环 | ✅ **完成**（服务端 960 行/320–380ms + Web 导入向导 + Parquet 归档） |
 | 2. 语义层 + 查询 | ✅ **完成**（`queryMetrics` 受众分级 / 反推防护 / 注入防护 + Web 看板查询页） |
 | 3. 规格引擎 | ✅ **完成**（Excel 模板填充 + ECharts 两个 renderer + Web 报表预览/导出） |
-| 4. agent 入口 | ✅ **完成**（MCP 六工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
+| 4. agent 入口 | ✅ **完成**（MCP 七工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
 | 5. 模板 → spec 自动生成 | ✅ **完成**（`template.ts` + `infer.ts` + `generate_spec` + Web 上传模板出草稿） |
 | R1. 主数据对齐 | ✅ **完成**（`resolve.ts` 两档归并 + `dim_alias` 表 + 两阶段 commit + Web 待确认卡片，铁律 16） |
+| §7.2 路径 2 | ✅ **完成**（`dims.ts` / `expr.ts` / `lint.ts` 挡住欠约束 + `lint_spec` 工具 + Web 边打字边诊断，铁律 17） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**192 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**231 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐）守着。
 
 **下一步（尚未开始）**：
 - `fact_business_line` 表 —— 运营指标（合同、业务线）独立成表，见铁律 8。
 - §10 **R8**：Parquet 小文件 compaction（归档批次多了以后）。
-- §7.2 **路径 2**：自然语言描述口径 → spec（目前仍是空白）。
-  路径 1（模板 → spec）已在第 5 步完成，路径 2 剩的正是"人不想做模板时怎么办"。
+
+**§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
+真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），
+agent 侧只是多了一个 `lint_spec` 工具让它自己先撞一次墙。
+判据（写进 §7.2.1）：**只要语言允许欠约束，写的人迟早会写出来，而提示词既挡不住也测不了。**
 
 ### 6.1 本轮的教训：测试也会成为 bug 的守卫
 

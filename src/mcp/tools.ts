@@ -20,7 +20,7 @@ import XLSXPopulate from 'xlsx-populate';
 import type { Workbook } from 'xlsx-populate';
 import * as db from '../db/index.ts';
 import { catalog } from '../semantic/query.ts';
-import { parseSpec, expandBlock, type Spec } from '../spec/types.ts';
+import { parseSpec, expandBlock, diagnoseSpec, type Spec } from '../spec/types.ts';
 import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
 import { readTemplateSchema, textAt } from '../spec/template.ts';
@@ -142,6 +142,54 @@ function loadSpec(args: { spec?: string; specFile?: string }): { spec: Spec; fro
   }
   if (args.spec) return { spec: parseSpec(args.spec), from: '(内联 YAML)' };
   throw new Error('需要 spec（YAML 文本）或 specFile（路径）');
+}
+
+/**
+ * 2.5 lint_spec —— 静态诊断（§7.2 路径 2 的前置条件）
+ *
+ * ★ 这是"让 agent 从自然语言写 spec"能成立的关键一步。
+ *   如果语言本身允许欠约束的 spec，agent 每写一次就可能静默算错一次。
+ *   有了本工具，agent 可以在把 spec 交给人之前**自己先撞一次墙**：
+ *   ① 从自然语言写草稿 → ② lint_spec 自检 → ③ 按 issues 修 → ④ preview_spec → ⑤ 人确认。
+ *
+ * 诊断只看 spec 文本结构，不查库、不含金额（铁律 1）。
+ */
+async function lintSpecTool(args: { spec?: string; specFile?: string }) {
+  let yamlText: string;
+  let from: string;
+  if (args.specFile) {
+    if (!fs.existsSync(args.specFile)) throw new Error(`spec 文件不存在: ${args.specFile}`);
+    yamlText = fs.readFileSync(args.specFile, 'utf8');
+    from = args.specFile;
+  } else if (args.spec) {
+    yamlText = args.spec;
+    from = '(内联 YAML)';
+  } else {
+    throw new Error('需要 spec（YAML 文本）或 specFile（路径）');
+  }
+
+  const d = diagnoseSpec(yamlText);
+  const byLevel = (lv: 'error' | 'warn') => d.issues.filter((i) => i.level === lv);
+
+  return {
+    from,
+    specId: d.spec?.id ?? null,
+    ok: !d.willBeRejected,
+    willBeRejected: d.willBeRejected,
+    parseError: d.parseError,
+    errors: d.errors,
+    errorCount: byLevel('error').length,
+    warnCount: byLevel('warn').length,
+    issues: d.issues.map((i) => ({ level: i.level, code: i.code, at: i.at, message: i.message, hint: i.hint ?? null })),
+    unusedParams: d.unusedParams,
+    note:
+      d.willBeRejected
+        ? '这份 spec **保存会被拒绝**。请先修掉 errors 里每一条 —— 尤其是「没有指标/口径约束」：' +
+          '它会把多个指标的金额静默加成同一个数，跑出来的数字同量级、格式正常，人不会怀疑。'
+        : d.issues.length
+          ? '结构上可以保存。warn 级提醒请人工判断（通常是"轴留空""顺序重复"这类不致命但会让人困惑的问题）。'
+          : '没有发现问题。',
+  };
 }
 
 /**
@@ -354,8 +402,7 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
   };
 }
 
-/** 6. generate_spec —— 从模板推断 spec 草稿（§7.2 路径 1） */
-async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
+/** 6. generate_spec —— 从模板推断 spec 草稿（§7.2 路径 1） */async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
 
@@ -369,10 +416,25 @@ async function generateSpec(args: { template?: string; sheets?: string[]; id?: s
 
   const r = await inferSpec({ template: tpl, registry, sheets: args.sheets, id: args.id, title: args.title });
 
+  // ★ 草稿可能**保存不了** —— 这是特性不是故障。
+  //   模板里若没有指标信息（如只有「公司 × 本年累计」的分板块表），
+  //   推断器宁可让 parseSpec 拒绝，也不产出一份语法合法、数字却错了的 spec。
+  //   这里显式回报"能不能直接用"，让人（和 agent）一眼看到该不该先补东西。
+  let draftValid = true;
+  let draftError: string | null = null;
+  try {
+    parseSpec(r.yaml);
+  } catch (e) {
+    draftValid = false;
+    draftError = (e as Error).message;
+  }
+
   return {
     template: tpl,
     specId: r.spec.id,
     yaml: r.yaml,
+    draftValid,
+    draftError,
     blocks: r.blocks.map((b) => ({
       sheet: b.sheet,
       anchor: b.anchor,
@@ -389,6 +451,8 @@ async function generateSpec(args: { template?: string; sheets?: string[]; id?: s
     note:
       '这是**草稿**，不是定稿。source=guessed 的轴与 issues 里的 warn/error 需要人工确认；' +
       'unmatched 里的名字不在注册表中，导入数据前必须先建映射（文档 R1 主数据对齐）。' +
+      'draftValid=false 表示这份草稿**直接被校验拒绝**（通常是模板里没有指标信息），' +
+      '请先按 issues 里的 error 补上约束再保存 —— 不要试图绕过校验。' +
       '本工具只读模板结构与标签文本，不读模板里的任何数字，也不查数据库。',
   };
 }
@@ -422,6 +486,24 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
     handler: (a) => getTemplateSchema(a as { template?: string }),
+  },
+  {
+    name: 'lint_spec',
+    description:
+      '静态诊断一份 spec **在任何数字被算出来之前**：有没有漏掉指标/口径约束（会把多个指标静默加成同一个数）、' +
+      '派生表达式引用了不存在的口径、filter 列名写错、维度名不在白名单里、order 为空或重复、chart.include 引用了不存在的标签。' +
+      '返回 issues 数组（level=error 的必须改，否则 parseSpec 会直接拒绝；level=warn 的请人工判断）。' +
+      '★ 从自然语言写 spec 时，应当先跑本工具自检，再交给 preview_spec / 人确认。' +
+      '本工具只读 spec 文本结构，不查数据库、不返回任何金额。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spec: { type: 'string', description: 'spec 的 YAML 文本（与 specFile 二选一）' },
+        specFile: { type: 'string', description: 'spec 文件路径，如 specs/月度保送表.yaml' },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => lintSpecTool(a as { spec?: string; specFile?: string }),
   },
   {
     name: 'preview_spec',
