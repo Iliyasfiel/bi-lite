@@ -7,7 +7,8 @@
  * 关键：整个链路不经过 LLM（安全设计 §6.2 第⑤层）。
  */
 import XLSXPopulate from 'xlsx-populate';
-import { execute, query, writer } from '../db/index.ts';
+import fs from 'node:fs';
+import { execute, exportParquet, query, writer } from '../db/index.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 
 export interface LongRow {
@@ -261,11 +262,19 @@ export async function commit(
   return { inserted, createdCompanies, createdMetrics };
 }
 
-/** 写 Parquet 归档（备份与溯源用，不在查询关键路径上） */
+/**
+ * 写 Parquet 归档（备份与溯源用，不在查询关键路径上）。
+ *
+ * 注意：必须走 `exportParquet()` 而不是 `execute()` —— 主实例开着
+ * `enable_external_access=false`（见 src/db/index.ts），`COPY ... TO` 会被直接拒绝。
+ * 归档实例是 READ_ONLY 的，因此不可能反过来改动主库。
+ */
 export async function archiveParquet(batchId: string) {
-  await execute(
+  const dir = `data/parquet/fact_finance/batch=${batchId}`;
+  fs.mkdirSync(dir, { recursive: true });
+  await exportParquet(
     `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)})
-     TO 'data/parquet/fact_finance/batch=${batchId}/part.parquet' (FORMAT parquet)`,
+     TO '${dir}/part.parquet' (FORMAT parquet)`,
   );
 }
 

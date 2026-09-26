@@ -430,6 +430,137 @@ sheets:
 `);
 check('spec 支持可选 chart 声明', specWithChart.sheets[0].blocks[0].chart?.type === 'bar');
 
+// ============ 12. Web 服务（F1/F6 的人机界面）============
+log('\n════════ 12. Web 服务（HTTP 全链路）════════');
+const { start, stop } = await import('../src/server.ts');
+const port = await start(0);                       // 0 = 内核分配端口
+const base = `http://127.0.0.1:${port}`;
+log(`  服务已起于 ${base}（只监听回环）`);
+
+const getJson = async (path: string) => (await fetch(base + path)).json() as Promise<any>;
+const postJson = async (path: string, body: unknown) => {
+  const r = await fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json() as Promise<any>;
+};
+
+// 静态资源（本页可离线打开 —— ECharts 从 node_modules 直供，不依赖 CDN）
+const home = await fetch(base + '/');
+check('GET / 返回页面', home.status === 200 && (await home.text()).includes('bi-lite'));
+const vendor = await fetch(base + '/vendor/echarts.min.js');
+const vendorBytes = (await vendor.arrayBuffer()).byteLength;   // 流式响应无 content-length，须按实际字节判
+check('ECharts 本地直供（无 CDN 依赖）', vendor.status === 200 && vendorBytes > 500_000,
+  `${(vendorBytes / 1024 / 1024).toFixed(1)}MB`);
+
+// 目录：零金额
+const webCat = await getJson('/api/catalog');
+check('GET /api/catalog 返回维度与口径', webCat.dimensions.length === 5 && webCat.periodTypes.length === 5,
+  `${webCat.dimensions.length} 维度 / ${webCat.periodTypes.length} 口径`);
+check('目录不含任何金额字段', !/\d{4,}/.test(JSON.stringify(webCat.companies) + JSON.stringify(webCat.metrics)));
+
+// ★ 安全：Web 查询固定 human 视角，即使请求里写 agent 也被覆盖
+const webQuery = await postJson('/api/query', {
+  measures: [{ metric: '营业收入', periodType: '本年累计' }],
+  groupBy: ['company'],
+  filter: { year: '2026' },
+  audience: 'agent',                               // ← 故意写 agent，服务端应忽略
+});
+check('Web 查询固定 human 视角（请求里的 agent 被覆盖）',
+  webQuery.meta.audience === 'human' && webQuery.meta.redaction === 'none',
+  `audience=${webQuery.meta.audience} redaction=${webQuery.meta.redaction}`);
+check('Web 返回精确数值', webQuery.groups.some((g: any) => g.cells.some((c: any) => typeof c === 'number')));
+
+// 同一过细查询：Web（human）放行，agent 被拒 —— 与第 10 阶段一致
+const webFine = await postJson('/api/query', {
+  measures: [{ metric: '营业收入', periodType: '单月' }],
+  groupBy: ['company', 'metric'],
+  filter: { month: '2026-06' },
+});
+check('Web 上同一过细查询被放行（阈值只约束 agent）', !webFine.refused && webFine.groups.length > 0);
+
+// 未注册维度经 HTTP 也被拒
+const webBadDim = await postJson('/api/query', {
+  measures: [{ metric: '营业收入', periodType: '本年累计' }],
+  groupBy: ['secret_table'],
+});
+check('HTTP 层拒绝未注册维度', webBadDim.refused === true && webBadDim.reason === 'UNKNOWN_DIMENSION');
+
+// 图表：option 含数值、shape 不含
+const webChart = await postJson('/api/chart', {
+  query: { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'] },
+  chart: { type: 'bar' },
+});
+check('图表 option 含数值且含 4 个类目', webChart.option.series[0].data.filter((v: any) => typeof v === 'number').length === 4);
+const webShapeStr = JSON.stringify(webChart.shape);
+check('图表 shape 经 HTTP 下发仍不含数值',
+  !/"value":\d|\d{4,}/.test(webShapeStr.replace(/"pointCount":\d+/, '')));
+
+// 报表：预览给出坐标计划，渲染产出可下载的文件
+const webPreview = await postJson('/api/report/preview', { specFile: 'specs/月度保送表.yaml', params: { year: 2026, month: 6 } });
+check('报表预览返回 5×4 矩阵', webPreview.sheets[0].blocks[0].matrix.length === 5 && webPreview.sheets[0].blocks[0].colLabels.length === 4);
+check('报表预览的计划不含数值', !/"value"|\d{4,}/.test(JSON.stringify(webPreview.plan).replace(/"totalCells":\d+/, '')));
+check('报表预览的 plan 只含坐标与形状', webPreview.plan.totalCells === 20 && webPreview.plan.note.includes('不含任何金额'));
+
+const webRender = await postJson('/api/report/render', { specFile: 'specs/月度保送表.yaml', params: { year: 2026, month: 6 }, output: 'e2e-web.xlsx' });
+check('HTTP 渲染写出 20 格', webRender.cellsWritten === 20, `${webRender.cellsWritten}`);
+const dl = await fetch(base + webRender.download);
+check('渲染产物可下载且是 xlsx', dl.status === 200 && (dl.headers.get('content-type') ?? '').includes('spreadsheetml'));
+
+// 路径穿越防护
+const traversal1 = await postJson('/api/import/commit', { batchId: 'x', file: '/etc/passwd' });
+check('拒绝上传目录外的文件路径', /不在上传目录内/.test(traversal1.error ?? ''));
+const traversal2 = await fetch(base + '/static/../server.ts');
+check('拒绝静态目录穿越', traversal2.status === 404);
+const traversal3 = await fetch(base + '/download/../package.json');
+check('拒绝下载目录穿越', traversal3.status === 404);
+
+// 导入：上传二进制 + X-Filename 头（不引 multipart 依赖）
+const upload = await fetch(base + '/api/import/stage', {
+  method: 'POST',
+  headers: { 'x-filename': encodeURIComponent('e2e-上传.xlsx'), 'content-type': 'application/octet-stream' },
+  body: fs.readFileSync(LONG),
+});
+const staged2 = await upload.json() as any;
+check('HTTP 上传并校验 960 行', staged2.rowCount === 960 && staged2.status !== 'error', `${staged2.rowCount} 行`);
+check('重复导入的坐标冲突被识别', staged2.issues.some((i: any) => i.level === 'error' && i.message.includes('重复坐标')) === false,
+  '与库内已有数据不冲突（按坐标 upsert）');
+
+const committed = await postJson('/api/import/commit', { batchId: staged2.batchId, file: staged2.sourceFile, autoCreateDims: true });
+check('HTTP 提交写入 960 行', committed.inserted === 960, `${committed.inserted}`);
+
+const afterCount = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
+check('重复提交后事实表仍是 960 行（坐标主键去重）', Number(afterCount[0].n) === 960, `${afterCount[0].n} 行`);
+
+const batches = await getJson('/api/batches');
+check('批次可追溯（N4）', Array.isArray(batches) && batches.length >= 2, `${batches.length} 个批次`);
+
+// 归档：Parquet 必须真的写出来。
+// 这条断言是为一个真实 bug 立的 —— 主实例开着 enable_external_access=false，
+// 会直接拒绝 COPY ... TO，而服务端当初用裸 catch{} 把它吞了，
+// 于是 Parquet 归档长期「静默不工作」（见 docs/需求与架构.md §4.4）。
+check('提交时 Parquet 归档成功（不静默失败）', committed.archived === true, `archived=${committed.archived}`);
+const archived = fs.globSync('data/parquet/fact_finance/batch=*/part.parquet');
+check('归档文件确实落盘', archived.length >= 1, `${archived.length} 个文件`);
+if (archived.length) {
+  // 注意：不能走主连接读回 —— 主实例的 enable_external_access=false 会连 read_parquet 一起拒
+  // （这正是硬化的预期效果：主库进程不碰任意文件）。用独立实例验证归档文件本身有效。
+  const { DuckDBInstance } = await import('@duckdb/node-api');
+  const verify = await DuckDBInstance.create();
+  const vc = await verify.connect();
+  const vr = await vc.runAndReadAll(
+    `SELECT count(*) AS n FROM read_parquet('data/parquet/fact_finance/*/part.parquet')`,
+  );
+  const n = Number((vr.getRowObjectsJson() as any[])[0].n);
+  vc.closeSync();
+  verify.closeSync();
+  check('归档内容可被 DuckDB 读回（960 行）', n === 960, `${n} 行`);
+}
+
+stop();
+
 // ============ 汇总 ============
 log('\n════════════════════════════════');
 log(`  通过 ${pass} / 失败 ${fail}`);

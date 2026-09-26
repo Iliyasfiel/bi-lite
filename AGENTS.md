@@ -61,19 +61,35 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
     反推保护的判据是**每格背后的明细行数**（`minSupport`），**不是单元格个数** ——
     按单元格个数计会让「公司 × 指标」单月网格（20 格、每格仅 1 行明细）蒙混过关。
     禁止把 `audience` 默认成 `'agent'` 之外的值绕过限制，也禁止给 agent 开精确值出口。
+    **Web 入口（`src/server.ts`）固定 `audience='human'`，并无条件覆盖请求体里的 `audience` 字段**
+    （e2e 有用例专门传 `agent` 验证被覆盖）。受众视角由**服务端按入口**判定，
+    绝不能让前端参数决定 —— 那等于把安全边界交给能构造任意 HTTP 请求的一方。
+11. **`enable_external_access=false` 是安全硬化，不能为了"归档/导出"而放开它。**
+    需要写 Parquet 时走 `src/db/index.ts` 的 **`exportParquet()`** —— 它另开一个
+    **短命只读实例**（`access_mode: READ_ONLY`）来跑 `COPY`，用完 `closeSync()`。
+    只读实例**结构上无法改动主库**（实测 `Cannot execute statement of type "INSERT" ... in read-only mode`），
+    且主实例的硬化完全不受影响（归档前后 `read_text('/etc/passwd')` 始终被拒）。
+    **不要用 `allowed_directories` 来"既允许归档又保持硬化"** —— 实测它与
+    `enable_external_access=false` 互斥，且**不拦截 `read_text`/`read_csv`**，不能当安全边界。
+    详见 §4 备忘 9 与 `docs/需求与架构.md` §4.4.1。
+12. **禁止裸 `catch {}`。** 有意容错的地方必须留下可观测痕迹（打日志 + 回传状态字段）。
+    判例：Parquet 归档曾因裸 `catch {}` **静默失效多轮**而无人察觉（R13）。
+    现在 `POST /api/import/commit` 回传 `archived: boolean`，e2e 有 3 项断言守着。
 
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，71 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，97 项断言，唯一的门禁
+npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
-npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 11 个阶段：模板指纹 → 开库 → STAGED 校验 →
+- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 12 个阶段：模板指纹 → 开库 → STAGED 校验 →
   提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
-  语义层 → 图表渲染。
+  语义层 → 图表渲染 → **Web 服务 HTTP 全链路**。
+- 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
+  传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
 - 验收脚本会 **`rm -rf data/bi.duckdb`**（每次从空库跑）。别拿它对着真实数据库跑。
 
@@ -100,7 +116,9 @@ npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
    报 `SyntaxError: Unexpected end of JSON input`。
 5. **DuckDB 单写者锁**：有跨进程写者时，其它进程**连 `READ_ONLY` 都拿不到锁**。
    当前设计规避了这点：**单进程独占一个 `.duckdb` 文件**，导入与查询用同进程内的两个连接（MVCC 让读不被写阻塞）。
-   导入频率是每月几次，故不需要更复杂的方案。**不要引入第二个进程去开这个库。**
+   导入频率是每月几次，故不需要更复杂的方案。**不要引入第二个常驻进程去开这个库。**
+   （唯一例外：`exportParquet()` 会开一个**同进程内、用完即弃的只读实例**做 Parquet 归档 —— 见备忘 9。
+   它在同进程内，不构成"第二个进程"，且只读。）
 6. **`exceljs` 只能用于生成测试 fixture**（`devDependencies`）。
    **生产路径禁用**：对含批注/图表/图片的真实模板 `readFile` 即崩，写出还会静默删 8/9 类部件（§5.3.1）。
    另外它 `addConditionalFormatting` 用 `type: 'dataBar'` 会崩，测试里用 `cellIs`。
@@ -115,6 +133,22 @@ npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
    `constructor(msg: string, readonly reason: string)` 报
    `SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript parameter property is not supported in strip-only mode`。
    必须写成显式字段赋值（见 `QueryRefused`）。**这是固有约束，会反复遇到。**
+9. **`enable_external_access=false` 会连 `COPY ... TO` 一起拒，Parquet 归档必须另走只读实例。**
+   实测报错：`Permission Error: Cannot access file "..." - file system operations are disabled by configuration`。
+   三条走不通的替代方案（都实测过，别再试）：
+   - `enable_external_access=false` + `allowed_directories` → `Cannot change allowed_directories when enable_external_access is disabled`
+   - 开 `lock_configuration` 后再 `SET allowed_directories` → `configuration has been locked`
+   - 想靠 `allowed_directories` 拦读 → **它不拦截 `read_text`/`read_csv`**，实测能读到 `/etc/passwd`
+   正确做法：`exportParquet()` 开 `{ enable_external_access: 'true', access_mode: 'READ_ONLY' }` 的短命实例，
+   `conn.closeSync()` + `inst.closeSync()` 收尾。**连接与实例都只有 `closeSync()`，没有 `close()`。**
+   另一条实测事实：**归档后主连接也读不回 Parquet**（`read_parquet` 同样被硬化拒），这是预期行为。
+   **另注：`connection.close()` / `instance.close()` 不存在** —— 只有 `closeSync()`；
+   写 `await inst.close()` 会得到 `inst.close is not a function`（我自己踩过）。
+10. **HTTP 层的两条实测坑**：
+    - **流式响应没有 `content-length`**。`fs.createReadStream(...).pipe(res)` 不设该头，
+      断言 `headers.get('content-length')` 会拿到 `null`。要按**实际字节**判（`(await res.arrayBuffer()).byteLength`）。
+    - **不用 multipart 上传**。为省依赖，上传走**原始二进制 body + `X-Filename` 头**（前端 File API 读成 ArrayBuffer 直发）。
+      文件名要 `encodeURIComponent`，服务端 `safeName()` 会剥掉路径成分。
 
 ## 5. 架构地图
 
@@ -122,7 +156,8 @@ npm start          # ⚠️ 未实现（src/server.ts 尚不存在，见 §6）
 src/
   db/
     schema.ts      DDL（四维表 + 事实表 + 批次表）+ PERIOD_TYPES 口径注册表
-    index.ts       open() / writer() / reader() / query() / execute()
+    index.ts       open() / writer() / reader() / query() / execute() / close()
+                   + exportParquet()（★ 短命只读实例写归档，见铁律 11）
                    —— 单进程双连接；query() 已处理 BigInt 与 JSON 解析
   import/
     longtable.ts   长表解析 + stage()（STAGED 校验，不写库）+ commit() + archiveParquet()
@@ -162,12 +197,15 @@ data/              ⚠️ 真实财务数据，永不提交
 
 | 阶段 | 状态 |
 |---|---|
-| 1. 导入闭环 | ✅ 服务端完成（960 行/320–380ms） |
-| 2. 语义层 + 查询 | ✅ 服务端完成（`query_metrics`，71 断言含受众分级/反推/注入）；⬜ Web 看板前端 |
-| 3. 规格引擎 | ✅ 两个 renderer 都完成（Excel 模板填充 + ECharts）；⬜ Web 预览界面 |
+| 1. 导入闭环 | ✅ **完成**（服务端 960 行/320–380ms + Web 导入向导 + Parquet 归档） |
+| 2. 语义层 + 查询 | ✅ **完成**（`queryMetrics` 受众分级 / 反推防护 / 注入防护 + Web 看板查询页） |
+| 3. 规格引擎 | ✅ **完成**（Excel 模板填充 + ECharts 两个 renderer + Web 报表预览/导出） |
 | 4. agent 入口 | ⬜ 未开始 —— MCP 五个工具 + 模板/自然语言 → spec |
 
-**下一步**：第 4 步（MCP 工具集），或先补 Web 前端让前两步的能力真正被人用到。
+前 3 步已由 `src/server.ts` + `src/web/` 打通到人可操作的界面，
+97 项 e2e 断言（含第 12 阶段 HTTP 全链路）守着。
+
+**下一步**：第 4 步（MCP 五工具：`list_metrics` / `get_template_schema` / `preview_spec` / `render_report` / `diff_report`）。
 
 ## 7. 测试纪律
 

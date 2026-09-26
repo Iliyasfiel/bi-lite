@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bi-lite · 经营分析</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>bi-lite</h1>
+  <nav>
+    <button class="tab active" data-tab="import">数据导入</button>
+    <button class="tab" data-tab="explore">看板查询</button>
+    <button class="tab" data-tab="report">报表报送</button>
+  </nav>
+  <span class="pill" id="conn">连接中…</span>
+</header>
+
+<main>
+  <!-- ═══════════ 1. 数据导入 ═══════════ -->
+  <section id="tab-import" class="panel active">
+    <div class="card">
+      <h2>导入财务长表</h2>
+      <p class="hint">
+        从公司平台导出的 Excel 长表（财务期 × 公司名称 × 指标名称 × 口径 × 金额）。
+        先<strong>校验</strong>，确认无误后再<strong>提交</strong>。校验不通过不会写入数据库。
+        整个过程在本地完成，不经过任何 AI。
+      </p>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file" accept=".xlsx" hidden>
+        <p><button class="primary" id="pick">选择文件</button></p>
+        <p class="hint" id="filename">或把 .xlsx 拖到这里</p>
+      </div>
+    </div>
+
+    <div class="card hidden" id="stageCard">
+      <h2>校验结果 <span class="pill" id="stageStatus"></span></h2>
+      <div id="stageSummary"></div>
+      <div id="stageIssues"></div>
+      <div class="actions">
+        <button class="primary" id="doCommit" disabled>确认无误，提交入库</button>
+        <button id="cancelImport">取消</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>导入批次</h2>
+      <div id="batches"><p class="hint">加载中…</p></div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 2. 看板查询 ═══════════ -->
+  <section id="tab-explore" class="panel">
+    <div class="card">
+      <h2>查询条件</h2>
+      <div class="filters">
+        <label>分组维度
+          <select id="qGroup" multiple size="5"></select>
+        </label>
+        <label>公司（不选=全部）
+          <select id="qCompany" multiple size="5"></select>
+        </label>
+        <label>指标（可多选，每个成为一列）
+          <select id="qMetric" multiple size="5"></select>
+        </label>
+        <label>口径（可多选）
+          <select id="qPeriod" multiple size="5"></select>
+        </label>
+        <label>年份
+          <select id="qYear"></select>
+        </label>
+      </div>
+      <div class="actions">
+        <button class="primary" id="doQuery">查询</button>
+        <span class="hint">金额以精确值展示（本页是人的界面，不是 AI 接口）</span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="resultCard">
+      <h2>结果 <span class="pill" id="resultMeta"></span></h2>
+      <div id="resultTable"></div>
+      <div class="chart-toolbar">
+        <label>图表类型
+          <select id="chartType">
+            <option value="bar">柱状图</option>
+            <option value="line">折线图</option>
+            <option value="area">面积图</option>
+            <option value="pie">饼图</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="chartStacked"> 堆叠</label>
+        <button id="doChart">生成图表</button>
+      </div>
+      <div id="chart" class="chart hidden"></div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 3. 报表报送 ═══════════ -->
+  <section id="tab-report" class="panel">
+    <div class="card">
+      <h2>已注册报表</h2>
+      <p class="hint">
+        每张报送表是一个声明式 spec（<code>specs/*.yaml</code>）。换口径只改 spec 里的
+        <code>cols.order</code> 一行，数据与版式都不用手工重抄。
+      </p>
+      <div id="specs"><p class="hint">加载中…</p></div>
+    </div>
+
+    <div class="card hidden" id="reportCard">
+      <h2 id="reportTitle"></h2>
+      <div class="actions">
+        <label>年份 <input type="number" id="rYear" style="width:6em"></label>
+        <label>月份 <input type="number" id="rMonth" min="1" max="12" style="width:5em"></label>
+        <button class="primary" id="doPreview">预览</button>
+        <button id="doRender">导出 Excel</button>
+        <span class="hint" id="renderMsg"></span>
+      </div>
+      <div id="reportPreview"></div>
+      <div id="reportCharts"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/vendor/echarts.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

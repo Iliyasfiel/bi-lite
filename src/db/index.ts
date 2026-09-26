@@ -12,9 +12,11 @@ import path from 'node:path';
 let instance: DuckDBInstance | null = null;
 let writeConn: DuckDBConnection | null = null;
 let readConn: DuckDBConnection | null = null;
+let openedPath: string | null = null;
 
 export async function open(dbPath = 'data/bi.duckdb') {
   if (instance) return;
+  openedPath = dbPath;
 
   // 确保归档目录存在
   fs.mkdirSync(path.join('data/parquet'), { recursive: true });
@@ -61,4 +63,36 @@ export function close() {
   writeConn?.closeSync();
   instance?.closeSync();
   readConn = writeConn = instance = null;
+  openedPath = null;
+}
+
+/**
+ * 导出一段查询结果到 Parquet，**不放松主实例的 `enable_external_access=false` 硬化**。
+ *
+ * 背景（本机实测，见 docs/需求与架构.md §4.4）：`COPY ... TO` 属于外部文件操作，
+ * 被 `enable_external_access=false` 直接拒绝 —— 也就是说主实例永远写不出 Parquet。
+ * 而 `allowed_directories` 与 `enable_external_access=false` 互斥
+ * （`Cannot change allowed_directories when enable_external_access is disabled`），
+ * 且它并不拦截 `read_text` / `read_csv`，所以不能拿它来"既允许归档又保持硬化"。
+ *
+ * 解法：归档时另开一个**短命只读实例**（`access_mode: READ_ONLY`）来跑 COPY。
+ * 它的可写性由 DuckDB 结构性禁止（实测 `Cannot execute statement of type "INSERT"`），
+ * 因此即使这段代码被误用，也无法改动主库；主实例的硬化完全不受影响。
+ */
+export async function exportParquet(sql: string): Promise<void> {
+  if (!openedPath) throw new Error('先调用 open()');
+  const inst = await DuckDBInstance.create(openedPath, {
+    enable_external_access: 'true',
+    access_mode: 'READ_ONLY',
+  });
+  try {
+    const conn = await inst.connect();
+    try {
+      await conn.run(sql);
+    } finally {
+      conn.closeSync();
+    }
+  } finally {
+    inst.closeSync();
+  }
 }

@@ -148,6 +148,28 @@ export function chartShape(chart: ChartSpec, input: ChartInput) {
   };
 }
 
+/**
+ * 把语义层 `query_metrics` 的结果适配成图表输入。
+ *
+ * 这样 Web 看板与 spec 报表**共用同一个图表实现** —— 看板不是第二套画图代码。
+ *
+ * ★ 安全上的顺带好处：agent 视角返回的是分档字符串（"19.3万"），
+ *   这里 `typeof c === 'number'` 会把它们全部变成 null，
+ *   所以即便误把 agent 结果喂进来，也不会画出数值 —— 从严失败。
+ */
+export function chartInputFromMetrics(m: {
+  columns: Array<{ label: string }>;
+  groups: Array<{ values: Array<string | null>; cells: Array<number | string | null> }>;
+}): ChartInput {
+  const labelOf = (g: { values: Array<string | null> }) =>
+    g.values.filter((v): v is string => v !== null).join(' / ') || '合计';
+  return {
+    rowLabels: m.groups.map(labelOf),
+    colLabels: m.columns.map((c) => c.label),
+    matrix: m.groups.map((g) => ({ label: labelOf(g), values: g.cells.map((c) => (typeof c === 'number' ? c : null)) })),
+  };
+}
+
 /** 把「要哪些标签」翻译成「要哪些下标」；未指定则全要 */
 function pick(wanted: string[] | undefined, all: string[]): number[] {
   if (!wanted) return all.map((_, i) => i);
