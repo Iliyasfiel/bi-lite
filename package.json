@@ -1,0 +1,25 @@
+{
+  "name": "bi-lite",
+  "version": "0.1.0",
+  "description": "轻量 BI：长表 → 口径规格 → 多形态产出。财务数据不进 LLM 上下文。",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "fixtures": "node test/make-fixtures.ts",
+    "e2e": "node test/e2e.ts",
+    "bench": "node test/bench.ts",
+    "start": "node src/server.ts"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.5",
+    "jszip": "^3.10.1",
+    "xlsx-populate": "^1.21.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

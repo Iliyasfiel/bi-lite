@@ -1,0 +1,22 @@
+id: 集团月度保送表
+title: 集团经营月报
+template: test/fixtures/月度保送表.xlsx
+
+params:
+  year: 2026
+  month: 6
+
+sheets:
+  - name: 主要指标
+    blocks:
+      - anchor: { name: DATA_START }      # 用定义名称，模板改版式时跟着走
+        rows:
+          dim: metric
+          order: [营业收入, 利润总额, 营业成本, 净利润, 期间费用]
+        cols:
+          dim: period_type                # ← 换口径只改这一行
+          order: [本年累计, 去年同期累计, 单月, 账面累计]
+        value:
+          measure: amount
+          agg: sum
+          format: "#,##0.00"              # 同时管 Excel 单元格格式与看板显示

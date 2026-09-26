@@ -1,0 +1,26 @@
+# ⚠️ 真实财务数据 —— 永不提交（AGENTS.md 铁律 9）
+data/
+*.duckdb
+*.duckdb.wal
+
+# 生成物：可随时用 `npm run fixtures` 重建
+test/fixtures/
+test/output/
+
+# 报送模板：有意纳入版本管理（是"表长什么样"的规格，不是数据）。
+# 前提——模板必须是空表！若某张模板里残留上期实际金额，先清空再提交。
+
+# 报送输出（可能含真实金额）
+output/
+*.报送.xlsx
+*.已填.xlsx
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 本机 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
