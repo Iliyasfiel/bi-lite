@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import * as db from './db/index.ts';
-import { stage, commit, readLongTable, type DimDecision } from './import/longtable.ts';
+import type { DimDecision } from './ingest/types.ts';
 import { normalizeName, type DimKind } from './import/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
@@ -155,62 +155,6 @@ const routes: Record<string, Handler> = {
     });
   },
 
-  /** 导入第一步：STAGED 校验（写入临时文件，不动数据库） */
-  'POST /api/import/stage': async (req, res) => {
-    const rawName = String(req.headers['x-filename'] ?? '上传.xlsx');
-    const name = safeName(decodeURIComponent(rawName));
-    if (!name) return json(res, 400, { error: '缺少文件名' });
-
-    const buf = await readBody(req, 32 * 1024 * 1024);
-    if (!buf.length) return json(res, 400, { error: '文件为空' });
-
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-    const dest = path.join(UPLOAD_DIR, `${Date.now()}-${name}`);
-    fs.writeFileSync(dest, buf);
-
-    const sheet = req.headers['x-sheet'] ? decodeURIComponent(String(req.headers['x-sheet'])) : undefined;
-    const staged = await stage(dest, sheet);
-    json(res, 200, staged);
-  },
-
-  /** 导入第二步：提交（写维度 + 事实表 + Parquet 归档） */
-  'POST /api/import/commit': async (req, res) => {
-    const { batchId, file, sheet, autoCreateDims, decisions } = await readJson<{
-      batchId: string; file: string; sheet?: string; autoCreateDims?: boolean;
-      decisions?: DimDecision[];
-    }>(req);
-
-    // 文件路径必须落在上传目录内，避免被伪造成任意路径
-    const resolved = path.resolve(file);
-    if (!resolved.startsWith(path.resolve(UPLOAD_DIR))) {
-      return json(res, 400, { error: '文件不在上传目录内' });
-    }
-
-    const rows = await readLongTable(resolved, sheet);
-    const result = await commit(batchId, rows, {
-      autoCreateDims: autoCreateDims !== false,
-      decisions,
-    });
-
-    // ★ 有歧义的名字 → 一行都没写，把待确认清单回给前端。
-    //   这不是错误（HTTP 200），是"需要人拍板"的正常中间状态：
-    //   报 4xx 会让前端把它当成失败，而它其实是一条待办。
-    if (result.needsDecision.length) {
-      return json(res, 200, { ...result, archived: false, pendingConfirm: true });
-    }
-
-    let archived = true;
-    try {
-      const { archiveParquet } = await import('./import/longtable.ts');
-      await archiveParquet(batchId, result.inserted);
-    } catch (e) {
-      // 归档失败不影响主链路（查询不依赖 Parquet），但绝不静默 —— 见 §4.4
-      archived = false;
-      console.error(`[归档] 批次 ${batchId} 的 Parquet 归档失败:`, (e as Error).message);
-    }
-    json(res, 200, { ...result, archived });
-  },
-
   /** 别名映射清单（§10 R1）—— 人确认过一次的写法，下月自动命中 */
   'GET /api/aliases': async (_req, res) => {
     const { listAliases } = await import('./import/resolve.ts');
@@ -239,28 +183,7 @@ const routes: Record<string, Handler> = {
     json(res, 200, { ...r, kind, raw, normalized: normalizeName(raw), targetId, targetName: target.name });
   },
 
-  /**
-   * 未识别名称的候选建议（不写库）。
-   *
-   * 页面在提交被 `pendingConfirm` 拦下后调用它拿候选，也可以独立用来
-   * 上传前先看看"这批名字里有多少是见过的"。
-   */
-  'POST /api/import/suggest': async (req, res) => {
-    const { names } = await readJson<{ names: Array<{ kind: DimKind; raw: string }> }>(req);
-    if (!Array.isArray(names)) return json(res, 400, { error: '缺少 names 数组' });
-    const { buildResolver } = await import('./import/resolve.ts');
-    const resolvers = { company: await buildResolver('company'), metric: await buildResolver('metric') };
-    json(res, 200, {
-      suggestions: names.map((n) => ({
-        kind: n.kind,
-        raw: n.raw,
-        resolved: resolvers[n.kind].resolve(n.raw) ?? null,
-        candidates: resolvers[n.kind].candidates(n.raw),
-      })),
-    });
-  },
-
-  /** 已注册报表列表（specs/*.yaml） */
+  /** 已注册报表列表（`specs/*.yaml`）—— 报表页的"已注册报表"就靠它 */
   'GET /api/specs': async (_req, res) => {
     json(res, 200, listSpecs());
   },
@@ -268,7 +191,7 @@ const routes: Record<string, Handler> = {
   /**
    * 从模板推断 spec 草稿（§7.2 路径 1）。
    *
-   * 与 `/api/import/stage` 同一套路：原始二进制 body + `X-Filename` 头，不用 multipart。
+   * 与 `/api/ingest/upload` 同一套路：原始二进制 body + `X-Filename` 头，不用 multipart。
    * 上传的模板落在 `templates/uploads/`，与 `templates/` 下人工维护的模板分开，
    * 避免临时上传被当成正式模板版本化（`.gitignore` 只忽略后者）。
    */
@@ -387,7 +310,7 @@ const routes: Record<string, Handler> = {
    * ★ 为什么必须单独一步：接入规格里的 `source:` 是一个**路径**，而引擎只认白名单内真实
    *   存在的文件（`src/paths.ts` 的 `resolveSource`）。浏览器给不出一个服务端路径，
    *   所以只能先把文件放进来、再让规格指过去。
-   * ★ 与 `/api/import/stage` 同一套路：原始二进制 body + `X-Filename` 头（不为上传引 multipart）。
+   * ★ 与 `/api/ingest/upload` 同一套路：原始二进制 body + `X-Filename` 头（不为上传引 multipart）。
    * ★ 这里**不写任何新判据** —— 校验与落库都在接入层那条路上
    *   （`diagnoseIngest` / `runIngest`）；上传层多一道判断就是多一份会漂的判据（铁律 17）。
    *   唯一要保证的是一个**不变式**：落点必须在 `SOURCE_ROOTS` 内，否则这里给出的路径

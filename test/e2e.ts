@@ -8,7 +8,6 @@
 import fs from 'node:fs';
 import JSZip from 'jszip';
 import * as db from '../src/db/index.ts';
-import { stage, commit, readLongTable, type LongRow } from '../src/import/longtable.ts';
 import { compileBlock, runCompiled } from '../src/spec/compile.ts';
 import { parseSpec } from '../src/spec/types.ts';
 import { renderTemplate, type RenderBlock } from '../src/render/excel.ts';
@@ -645,124 +644,46 @@ check('HTTP 渲染写出 20 格', webRender.cellsWritten === 20, `${webRender.ce
 const dl = await fetch(base + webRender.download);
 check('渲染产物可下载且是 xlsx', dl.status === 200 && (dl.headers.get('content-type') ?? '').includes('spreadsheetml'));
 
-// 路径穿越防护
-const traversal1 = await postJson('/api/import/commit', { batchId: 'x', file: '/etc/passwd' });
-check('拒绝上传目录外的文件路径', /不在上传目录内/.test(traversal1.error ?? ''));
+// 路径穿越防护（静态目录与下载目录）
+// —— 旧路那条"拒绝上传目录外的文件路径"已随 `/api/import/*` 一起退场；
+//    新路径的等价物是第 25 阶段 ③ 的"文件名里的路径成分被剥掉"。
 const traversal2 = await fetch(base + '/static/../server.ts');
 check('拒绝静态目录穿越', traversal2.status === 404);
 const traversal3 = await fetch(base + '/download/../package.json');
 check('拒绝下载目录穿越', traversal3.status === 404);
 
-// 导入：上传二进制 + X-Filename 头（不引 multipart 依赖）
-const upload = await fetch(base + '/api/import/stage', {
-  method: 'POST',
-  headers: { 'x-filename': encodeURIComponent('e2e-上传.xlsx'), 'content-type': 'application/octet-stream' },
-  body: fs.readFileSync(LONG),
-});
-const staged2 = await upload.json() as any;
-check('HTTP 上传并校验 960 行', staged2.rowCount === 960 && staged2.status !== 'error', `${staged2.rowCount} 行`);
-check('重复导入的坐标冲突被识别', staged2.issues.some((i: any) => i.level === 'error' && i.message.includes('重复坐标')) === false,
-  '与库内已有数据不冲突（按坐标 upsert）');
-
-// ★ 两个只有浏览器能撞出来的 bug（都是 e2e 全绿之后在界面上发现的）
-//
-// 先生成一个"下个月改了公司写法"的变体表：把「华东子公司」写成「华东本部」。
-// 这是真实场景的常态，也是 Tier 2 待确认卡的唯一来源。
-// 特意选一个第 15 阶段没用到的写法，避免污染那一段的断言。
+// ★★ 路由表里的 GET 入口必须都真的在（一个都不是 404）。
+//   这条是**事故后补的**：退场那一刀用行号切注释时，把 `GET /api/specs` 连同它的注释体
+//   一起切没了（留下一个未闭合的 `/**`，把那条路由**注释掉**了）—— 而 `node --check`
+//   照样通过、e2e 也照样全绿，因为当时**没有任何断言覆盖这条路由**。
+//   最后是浏览器走查里页面报的那个 404 把它喊出来的。教训：删代码也要有门禁。
 {
-  const XLSXPopulate = (await import('xlsx-populate')).default;
-  const vwb = await XLSXPopulate.fromFileAsync(LONG);
-  const vws = vwb.sheet(0);
-  const used = vws.usedRange();
-  let renamed = 0;
-  for (let r = 1; r <= used.endCell().rowNumber(); r++) {
-    if (vws.cell(r, 2).value() === '华东子公司') { vws.cell(r, 2).value('华东本部'); renamed++; }
-  }
-  fs.mkdirSync('test/output', { recursive: true });
-  await vwb.toFileAsync(VARIANT);
-  check('变体表生成（240 行改名为「华东本部」）', renamed === 240, `${renamed} 行`);
+  const gets = ['/api/catalog', '/api/batches', '/api/aliases', '/api/specs', '/api/ingest/specs'];
+  const codes = await Promise.all(gets.map(async (p) => [p, (await fetch(base + p)).status] as const));
+  check('★ 路由表里的 GET 入口都真的在（一个都不是 404）',
+    codes.every(([, s]) => s === 200), codes.map(([p, s]) => `${p}=${s}`).join(' '));
 }
 
-// (1) 并发 / 连点上传时 batchId 撞车。原来只有 `Date.now()`，同毫秒的两个请求
-//     会生成同一个 id，后到的直接 Duplicate key 失败。
-const parallel = await Promise.all([1, 2, 3, 4, 5].map(() =>
-  fetch(base + '/api/import/stage', {
-    method: 'POST',
-    headers: { 'x-filename': encodeURIComponent('并发.xlsx'), 'content-type': 'application/octet-stream' },
-    body: fs.readFileSync(LONG),
-  }).then((r) => r.json() as any),
-));
-const dupErr = parallel.filter((p) => /Duplicate key|Constraint Error/.test(p.error ?? ''));
-check('★ 并发上传不会撞 batchId（连点两次也不该挂）', dupErr.length === 0 && parallel.every((p) => p.batchId),
-  `${parallel.length} 个并发请求，冲突 ${dupErr.length} 个`);
-check('★ 并发批次的 id 两两不同', new Set(parallel.map((p) => p.batchId)).size === parallel.length);
-
-// (2) 未识别名称必须自带 `kind`。候选清单由「公司」和「指标」两个 Resolver 分别产出，
-//     汇总给前端后就分不出谁是谁了；缺了它前端只能把公司标成「指标」，
-//     而且人拍板回传的决定 `kind=undefined`，服务端永远匹配不上 ——
-//     点「并入」等于没点，提交被无限次拦下。
-const stagedVariant = await fetch(base + '/api/import/stage', {
-  method: 'POST',
-  headers: { 'x-filename': encodeURIComponent('变体.xlsx'), 'content-type': 'application/octet-stream' },
-  body: fs.readFileSync(VARIANT),
-}).then((r) => r.json() as any);
-const un = stagedVariant.unresolved.companies[0];
-check('★ 未识别名称自带 kind（前端靠它区分公司/指标）', un?.kind === 'company', JSON.stringify(un?.kind));
-check('★ 待确认名称带候选与出现行数', un?.rows === 240 && un?.candidates?.[0]?.name === '华东子公司',
-  `${un?.rows} 行 / ${un?.candidates?.[0]?.name}`);
-
-// 端到端复现浏览器路径：把 stagedVariant 的 unresolved 直接转成 decisions 提交。
-// 这一条若失败，就说明「人确认」这个动作在真实链路上是无效的。
-const browserDecisions = [
-  ...stagedVariant.unresolved.companies.map((d: any) => ({ kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id })),
-  ...stagedVariant.unresolved.metrics.map((d: any) => ({ kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id })),
-];
-const confirmed = await postJson('/api/import/commit', {
-  batchId: stagedVariant.batchId, file: stagedVariant.sourceFile, autoCreateDims: true, decisions: browserDecisions,
-});
-check('★ 前端回传的 decisions 被服务端认账（kind 对得上）', !confirmed.pendingConfirm && confirmed.inserted === 960,
-  `pendingConfirm=${confirmed.pendingConfirm} inserted=${confirmed.inserted}`);
-
-const committed = await postJson('/api/import/commit', { batchId: staged2.batchId, file: staged2.sourceFile, autoCreateDims: true });
-check('HTTP 提交写入 960 行', committed.inserted === 960, `${committed.inserted}`);
-
-const afterCount = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
-check('重复提交后事实表仍是 960 行（坐标主键去重）', Number(afterCount[0].n) === 960, `${afterCount[0].n} 行`);
+// ★ 退场守卫：旧导入路由必须**真的不在了**（404），而不是"还在但没人调"。
+//   删掉一段代码容易，之后就再没人知道它删干净了 —— 这条把"删干净"变成断言。
+{
+  const gone = await Promise.all(
+    ['/api/import/stage', '/api/import/commit', '/api/import/suggest'].map((p) =>
+      fetch(base + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }),
+    ),
+  );
+  check('★ 旧导入路由已退场（POST 一律 404）', gone.every((r) => r.status === 404),
+    gone.map((r) => r.status).join(','));
+}
 
 const batches = await getJson('/api/batches');
-check('批次可追溯（N4）', Array.isArray(batches) && batches.length >= 2, `${batches.length} 个批次`);
+check('批次可追溯（N4）', Array.isArray(batches) && batches.length >= 1 && !!batches[0]?.source_file,
+  `${batches.length} 个批次 · ${batches[0]?.source_file ?? '—'}`);
 
-// 归档：Parquet 必须真的写出来。
-// 这条断言是为一个真实 bug 立的 —— 主实例开着 enable_external_access=false，
-// 会直接拒绝 COPY ... TO，而服务端当初用裸 catch{} 把它吞了，
-// 于是 Parquet 归档长期「静默不工作」（见 docs/需求与架构.md §4.4）。
-check('提交时 Parquet 归档成功（不静默失败）', committed.archived === true, `archived=${committed.archived}`);
-const archived = fs.globSync('data/parquet/fact_finance/batch=*/part.parquet');
-check('归档文件确实落盘', archived.length >= 1, `${archived.length} 个文件`);
-if (archived.length) {
-  // 注意：不能走主连接读回 —— 主实例的 enable_external_access=false 会连 read_parquet 一起拒
-  // （这正是硬化的预期效果：主库进程不碰任意文件）。用独立实例验证归档文件本身有效。
-  //
-  // 只读**本批次**的归档目录，不要用 `*/` 汇总 —— 那样断言会随别的测试批次一起变化，
-  // 断言就不再指向"这一次提交归档成功了"这个事实。
-  const { DuckDBInstance } = await import('@duckdb/node-api');
-  const verify = await DuckDBInstance.create();
-  const vc = await verify.connect();
-  const vr = await vc.runAndReadAll(
-    `SELECT count(*) AS n FROM read_parquet('data/parquet/fact_finance/batch=${staged2.batchId}/part.parquet')`,
-  );
-  const n = Number((vr.getRowObjectsJson() as any[])[0].n);
-  vc.closeSync();
-  verify.closeSync();
-  check('归档内容可被 DuckDB 读回（960 行）', n === 960, `${n} 行`);
-}
 
-// 主数据对齐的两个路由（§10 R1）
-const sug = await postJson('/api/import/suggest', { names: [{ kind: 'company', raw: '华东分公司' }] });
-check('HTTP 别名建议接口给出候选', sug.suggestions?.[0]?.candidates?.[0]?.name === '华东子公司',
-  JSON.stringify(sug.suggestions?.[0]?.candidates?.[0] ?? {}));
-check('建议接口不写库（纯查询）', (await getJson('/api/aliases')).filter((a: any) => a.alias === '华东分公司').length === 0);
-
+// 别名路由（§10 R1）
+// —— 旧路的 `/api/import/suggest` 已随旧导入路径退场；它所做的事（给候选、不写库）
+//    现在在接入层的待确认卡里验（第 25 阶段 ⑤：候选带 why、决定才落库）。
 const hzId = (await db.query<{ id: string }>(`SELECT id FROM dim_company WHERE name = '华东子公司'`))[0].id;
 const aliasAdded = await postJson('/api/aliases', { kind: 'company', raw: '别名测试公司', targetId: hzId, note: 'e2e' });
 check('HTTP 登记别名', aliasAdded.targetId === hzId && aliasAdded.normalized === '别名测试公司');
@@ -2391,6 +2312,9 @@ sheets:
     const page = await (await fetch(b2 + '/')).text();
     check('⑦ 首页含接入向导的控件（源文件区 / 规格编辑器 / 干跑 / 待确认 / 落库）',
       ['igDrop', 'igYaml', 'igDryRun', 'igDecisions', 'igRun'].every((id) => page.includes(`id="${id}"`)));
+    check('⑦ 首页里已经**没有**旧导入页的控件（退场不留半截 UI）',
+      ['id="stageCard"', 'id="pick"', 'id="doCommit"', 'id="cancelImport"', 'id="file"']
+        .every((s) => !page.includes(s)));
     const appjs = await (await fetch(b2 + '/static/app.js')).text();
     check('⑦ app.js 调的是**新路径**的那五条路由（不是又绕回旧路径）',
       ['/api/ingest/upload', '/api/ingest/lint', '/api/ingest/dry-run', '/api/ingest/run', '/api/ingest/save']
@@ -2439,12 +2363,13 @@ sheets:
   }
 }
 
-// ============ 26. 新旧接入路径对拍（退场的前提）============
-log('\n════════ 26. 新旧接入路径对拍（同一份长表，两条路逐行相同）════════');
+// ============ 26. 长表接入对拍（与**冻结的**期望值逐行相同）============
+log('\n════════ 26. 长表接入对拍（与冻结的期望值逐行相同）════════');
 {
-  // ★ 为什么要有这一段：要删掉旧长表路径（`src/import/longtable.ts`），先得证明新路径
-  //   **至少一样能打** —— 而且要证明在**值**这一层一样，不是"形状看起来差不多"。
-  //   期望值取自**旧路**（独立算法，AGENTS.md §6.1 的纪律），不是新路自己跑一遍的输出。
+  // ★ 这一段守的是"长表这条路径没被写坏"：新路径跑同一份长表，落库后必须与
+  //   `test/expected/集团导出长表-960行.json` **逐行（含金额）**相同。
+  //   那份快照由**旧长表路径**在它被删除前生成过一次（旧路是独立算法，AGENTS.md §6.1 的纪律），
+  //   此后固化 —— 旧路已删，所以判据从「新路 vs 旧路」变成「新路 vs 旧路留下的期望值」。
   //
   //   它同时钉住这批"新路径必须补上才配取代旧路"的能力（全是长表逼出来的）：
   //     ① 期数认**完整日期**（`2026-01-01`，集团导出最常见的写法）；
@@ -2452,7 +2377,6 @@ log('\n════════ 26. 新旧接入路径对拍（同一份长表�
   //     ③ 行键要**含期数**（否则长表被误报成"80 组行键重复"）；
   //     ④ 期数列里是**日期格/数字格**时要**响亮报错**，不许静默看不见
   //        （旧路对日期格是静默写出 4617 年 —— 见 docs/需求与架构.md §11.6）。
-  const { readLongTable } = await import('../src/import/longtable.ts');
   const { parseIngestSpec } = await import('../src/ingest/types.ts');
   const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
   const { runIngest } = await import('../src/ingest/run.ts');
@@ -2476,10 +2400,16 @@ log('\n════════ 26. 新旧接入路径对拍（同一份长表�
 
   const spec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'));
 
-  // —— ① 独立算法：旧路直接读那 960 行，作为期望值 ——
-  const oldRows = await readLongTable(LONG);
-  const want = oldRows.map((r) => `${r.fin_month}|${r.company}|${r.metric}|${r.period_type}|${r.amount}`).sort();
-  check('对拍的期望值取自旧路（960 行）', oldRows.length === 960, `${oldRows.length} 行`);
+  // —— ① 期望值：**冻结的黄金快照**（由旧长表路径在它被删除前生成过一次）——
+  //    ★ 换成快照不是"降低标准"：那份期望值仍然出自旧路的独立执行，
+  //      只是执行了一次就固化成文件（否则旧路一删，基准就没了）。
+  const golden = JSON.parse(fs.readFileSync('test/expected/集团导出长表-960行.json', 'utf8')) as {
+    rows: Array<[string, string, string, string, number]>;
+  };
+  const want = golden.rows
+    .map(([m, c, mt, pt, a]) => `${m}|${c}|${mt}|${pt}|${a}`)
+    .sort();
+  check('对拍的期望值取自冻结快照（960 行，由旧路生成一次后固化）', golden.rows.length === 960, `${golden.rows.length} 行`);
 
   // —— ② 干跑：新路把长表读成 960 个完整坐标，且一条 error 都没有 ——
   const dry = await dryRunIngest(spec, { catalog: await masterCatalog() });
@@ -2497,9 +2427,9 @@ log('\n════════ 26. 新旧接入路径对拍（同一份长表�
   //    ★ 自己造干净起点：这份长表的坐标与前面阶段已落的行撞车，而规格是 reject。
   await db.execute('DELETE FROM fact_finance');
   const run = await runIngest(spec, { catalog: await masterCatalog(), autoCreateDims: true });
-  check('新路径把同一份长表完整落库（写入数 = 旧路行数）',
-    run.ok === true && run.inserted === oldRows.length,
-    `ok=${run.ok} inserted=${run.inserted} 旧路 ${oldRows.length}`);
+  check('新路径把同一份长表完整落库（写入数 = 快照行数）',
+    run.ok === true && run.inserted === golden.rows.length,
+    `ok=${run.ok} inserted=${run.inserted} 快照 ${golden.rows.length}`);
 
   const got = (await db.query<{ m: string; company: string; metric: string; period_type: string; amount: number }>(
     `SELECT strftime(f.fin_month, '%Y-%m-%d') AS m, c.name AS company, mt.name AS metric,
@@ -2513,7 +2443,7 @@ log('\n════════ 26. 新旧接入路径对拍（同一份长表�
   for (let i = 0; i < Math.max(got.length, want.length); i++) {
     if (got[i] !== want[i]) { firstDiff = i; break; }
   }
-  check('★★ 逐行对拍：新旧两条路落出的事实完全相同（含每一笔金额）',
+  check('★★ 逐行对拍：新路径落出的事实与冻结快照逐行相同（含每一笔金额）',
     firstDiff === -1,
     firstDiff === -1
       ? `${want.length} 行逐行相同`

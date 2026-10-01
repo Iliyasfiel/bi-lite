@@ -75,32 +75,6 @@
       </div>
     </div>
 
-    <!-- ── 旧路径：长表导入（待退场，见 docs/开发计划.md §1）── -->
-    <div class="card">
-      <h2>导入财务长表 <span class="pill warn">旧路径 · 待退场</span></h2>
-      <p class="hint">
-        上一代的导入方式：它把形状写死成「财务期 × 公司名称 × 指标名称 × 口径 × 金额」的长表，
-        导入层的形状一变就得改代码 —— 所以正在被上面的「接入规格」取代（规约只承认 `src/ingest/`）。
-        下面这条暂时留着，供已经用惯的批次继续走。
-      </p>
-      <div class="dropzone" id="dropzone">
-        <input type="file" id="file" accept=".xlsx" hidden>
-        <p><button class="primary" id="pick">选择文件</button></p>
-        <p class="hint" id="filename">或把 .xlsx 拖到这里</p>
-      </div>
-    </div>
-
-    <div class="card hidden" id="stageCard">
-      <h2>校验结果 <span class="pill" id="stageStatus"></span></h2>
-      <div id="stageSummary"></div>
-      <div id="stageIssues"></div>
-      <div id="stageDecisions"></div>
-      <div class="actions">
-        <button class="primary" id="doCommit" disabled>确认无误，提交入库</button>
-        <button id="cancelImport">取消</button>
-      </div>
-    </div>
-
     <div class="card">
       <h2>导入批次</h2>
       <div id="batches"><p class="hint">加载中…</p></div>
