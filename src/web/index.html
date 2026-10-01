@@ -20,12 +20,68 @@
 <main>
   <!-- ═══════════ 1. 数据导入 ═══════════ -->
   <section id="tab-import" class="panel active">
+    <!-- ── 主路径：接入规格（声明式）──
+         人在这里走完「上传源 → 挑/改规格 → 诊断 → 干跑 → 拍板 → 落库」。
+         这条路的校验判据落在**落库路径本身上**（diagnoseIngest / runIngest），
+         不像旧路径那样"校验只活在浏览器那个 disabled 按钮上"。 -->
     <div class="card">
-      <h2>导入财务长表</h2>
+      <h2>接入数据 <span class="pill" id="igStatus">未开始</span></h2>
       <p class="hint">
-        从公司平台导出的 Excel 长表（财务期 × 公司名称 × 指标名称 × 口径 × 金额）。
-        先<strong>校验</strong>，确认无误后再<strong>提交</strong>。校验不通过不会写入数据库。
-        整个过程在本地完成，不经过任何 AI。
+        这条路是<strong>声明式</strong>的：一份「接入规格」YAML 说清这份 Excel 怎么读，
+        引擎按它把网格展开成事实行 —— 它不假设你的表长什么样（下面那条「长表」假设了）。
+        流程：<strong>上传源文件 → 挑/改规格 → 诊断 → 干跑 → 拍板 → 落库</strong>。
+        先干跑是因为它<strong>一次库都不写</strong>：形状、要新建哪些主数据、哪个名字需要你拍板，
+        都在落库之前看清。全过程在本地完成，不经过任何 AI。
+      </p>
+      <div class="dropzone" id="igDrop">
+        <input type="file" id="igFile" accept=".xlsx" hidden>
+        <p><button class="primary" id="igPick">选择源 Excel</button></p>
+        <p class="hint" id="igFileMsg">或把 .xlsx 拖到这里</p>
+      </div>
+      <div class="hidden" id="igSource">
+        <div class="issue ok"><span class="lv">已就位</span>
+          <span>源文件：<code id="igSourcePath"></code></span></div>
+        <p class="hint">规格里的 <code>source:</code> 必须指向它。下面这个按钮替你改那一行 ——
+          改完你能在编辑器里看见，不满意可以自己再改。</p>
+        <div class="actions">
+          <button id="igPoint">把规格的 source 指向这个文件</button>
+          <span class="hint" id="igPointMsg"></span>
+        </div>
+      </div>
+
+      <h3 class="sec">接入规格</h3>
+      <div class="actions">
+        <label>载入已定稿的规格
+          <select id="igSpecs"><option value="">（不载入，直接在下面写）</option></select>
+        </label>
+      </div>
+      <textarea id="igYaml" class="yaml-editor" spellcheck="false"
+        placeholder="id: 月度经营接入&#10;source: data/uploads/xxx.xlsx&#10;sheets: ..."></textarea>
+      <div id="igLint" class="spec-lint"></div>
+      <div class="actions">
+        <button class="primary" id="igDryRun" disabled>干跑（不写库）</button>
+        <button id="igSave" disabled>保存到 ingest/</button>
+        <span class="hint" id="igSaveMsg"></span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="igPlanCard">
+      <h2>干跑结果 <span class="pill" id="igPlanStatus"></span></h2>
+      <div id="igPlan"></div>
+      <div id="igDecisions"></div>
+      <div class="actions">
+        <button class="primary" id="igRun" disabled>确认无误，落库</button>
+        <span class="hint" id="igRunMsg"></span>
+      </div>
+    </div>
+
+    <!-- ── 旧路径：长表导入（待退场，见 docs/开发计划.md §1）── -->
+    <div class="card">
+      <h2>导入财务长表 <span class="pill warn">旧路径 · 待退场</span></h2>
+      <p class="hint">
+        上一代的导入方式：它把形状写死成「财务期 × 公司名称 × 指标名称 × 口径 × 金额」的长表，
+        导入层的形状一变就得改代码 —— 所以正在被上面的「接入规格」取代（规约只承认 `src/ingest/`）。
+        下面这条暂时留着，供已经用惯的批次继续走。
       </p>
       <div class="dropzone" id="dropzone">
         <input type="file" id="file" accept=".xlsx" hidden>

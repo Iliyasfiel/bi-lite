@@ -362,10 +362,56 @@ const routes: Record<string, Handler> = {
   // 这里的三条纪律：诊断 200 + willBeRejected 表达"能不能跑"；干跑不写库；
   // 有歧义的名字整批拒绝、一行都不写（合并两家公司的钱会静默相加，没人会来查）。
 
-  /** 已定稿的接入规格（ingest/ 下） */
+  /**
+   * 已定稿的接入规格（`ingest/` 下）。
+   *
+   * ★ 顺带把文本带回去：向导要"载入某份规格进编辑器"。若另开一条 `?file=` 的读文件路由，
+   *   就得再写一份"这个路径允不允许读"的判断 —— 而**枚举出来的路径天然是允许的**。
+   *   少一处判据，就少一处会漂的判据（铁律 17）。
+   */
   'GET /api/ingest/specs': async (_req, res) => {
     const files = fs.existsSync(INGEST_DIR) ? fs.readdirSync(INGEST_DIR).filter((f) => /\.ya?ml$/.test(f)).sort() : [];
-    json(res, 200, files.map((f) => ({ file: path.join(INGEST_DIR, f), id: f.replace(/\.ya?ml$/, '') })));
+    json(
+      res,
+      200,
+      files.map((f) => {
+        const file = path.join(INGEST_DIR, f);
+        return { file, id: f.replace(/\.ya?ml$/, ''), yaml: fs.readFileSync(file, 'utf8') };
+      }),
+    );
+  },
+
+  /**
+   * 上传**源 Excel**：只落盘，不解析、不落库。
+   *
+   * ★ 为什么必须单独一步：接入规格里的 `source:` 是一个**路径**，而引擎只认白名单内真实
+   *   存在的文件（`src/paths.ts` 的 `resolveSource`）。浏览器给不出一个服务端路径，
+   *   所以只能先把文件放进来、再让规格指过去。
+   * ★ 与 `/api/import/stage` 同一套路：原始二进制 body + `X-Filename` 头（不为上传引 multipart）。
+   * ★ 这里**不写任何新判据** —— 校验与落库都在接入层那条路上
+   *   （`diagnoseIngest` / `runIngest`）；上传层多一道判断就是多一份会漂的判据（铁律 17）。
+   *   唯一要保证的是一个**不变式**：落点必须在 `SOURCE_ROOTS` 内，否则这里给出的路径
+   *   到了 `source:` 里会被接入层拒 —— 那时报错已经离现场很远了。所以直接问那份唯一判据。
+   */
+  'POST /api/ingest/upload': async (req, res) => {
+    const rawName = String(req.headers['x-filename'] ?? '源文件.xlsx');
+    const name = safeName(decodeURIComponent(rawName));
+    if (!name) return json(res, 400, { error: '缺少文件名' });
+
+    const buf = await readBody(req, 32 * 1024 * 1024);
+    if (!buf.length) return json(res, 400, { error: '文件为空' });
+
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const dest = path.join(UPLOAD_DIR, `${Date.now()}-${name}`);
+    fs.writeFileSync(dest, buf);
+
+    try {
+      const { resolveSource } = await import('./paths.ts');
+      resolveSource(dest);
+    } catch (e) {
+      return json(res, 400, { error: (e as Error).message });
+    }
+    json(res, 200, { file: dest, name, size: buf.length });
   },
 
   'POST /api/ingest/lint': async (req, res) => {

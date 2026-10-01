@@ -68,6 +68,8 @@ main { max-width: 1180px; margin: 0 auto; padding: 24px; }
   margin-bottom: 16px;
 }
 .card h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 10px; }
+/* 卡片内的小节标题（只有 .sec 这一个变体，免得动到 #tplResult / .decide-wrap 里既有的 h3） */
+.card h3.sec { font-size: 13px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
 .hidden { display: none !important; }
 
 .hint { color: var(--muted); font-size: 13px; margin: 6px 0; }
@@ -203,7 +205,8 @@ table.mini td.tiny { color: var(--muted); font-size: 12px; }
 /* 「判断依据」——比取值更弱一级的说明文字 */
 table.mini td.tiny .ev { color: #98a1ad; font-size: 11.5px; }
 
-#specYaml {
+/* YAML 编辑器（报表 spec 与接入规格共用一套样式） */
+.yaml-editor {
   width: 100%;
   min-height: 320px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

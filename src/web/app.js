@@ -39,6 +39,435 @@ const hashTab = () => activateTab((location.hash || '').replace('#', '') || 'imp
 window.addEventListener('hashchange', hashTab);
 
 // ═══════════════ 1. 数据导入 ═══════════════
+//
+// 两条路并存，**主路径在上、旧路径在下**：
+//   · 主路径 = 接入规格（`src/ingest/`）：形状写在 YAML 里，换一份表不用改代码。
+//   · 旧路径 = 长表导入（`src/import/`，待退场）：形状写死在代码里。
+// 前端**不做任何判据** —— 诊断、干跑、落库都调服务端那三个路由，它们又都调
+// `diagnoseIngest` / `runIngest`。页面只负责把结论摆清楚，否则判据就漂了（铁律 17）。
+
+// ───────── 主路径：接入规格（声明式）─────────
+let igSource = null;      // 刚上传的源文件 { file, name, size }
+let igPlan = null;        // 最近一次干跑结果（或落库被拦下的结果）
+let igDecisions = {};     // key = `${kind}|${raw}` → { kind, raw, action, targetId }
+let igSpecs = [];         // ingest/ 下已定稿的规格（带文本，供载入编辑器）
+
+const igYaml = () => $('igYaml').value;
+const igDkey = (kind, raw) => `${kind}|${raw}`;
+
+/** 按当前规格与快照，这次会落多少行事实。
+ *  干跑不写库，所以只能从形状里推：坐标总数 − 凑不齐坐标的。 */
+const igWillWrite = (res) =>
+  ((res && res.shape && res.shape.blocks) || []).reduce(
+    (n, b) => n + (b.coordinates.total - b.coordinates.incomplete), 0,
+  );
+
+function igStatus(text, cls) {
+  const el = $('igStatus');
+  el.textContent = text;
+  el.className = `pill ${cls || ''}`;
+}
+
+/** 还有几个名字没拍板 —— 落库按钮的放行条件就是它归零 */
+function igPending() {
+  const need = (igPlan && igPlan.needsDecision) || [];
+  return need.filter((d) => !igDecisions[igDkey(d.kind, d.raw)]).length;
+}
+
+function igSyncRun() {
+  const n = igPending();
+  const btn = $('igRun');
+  btn.disabled = n > 0;
+  btn.textContent = n > 0 ? `还有 ${n} 个名称待确认` : `确认无误，落库（${igWillWrite(igPlan).toLocaleString()} 行）`;
+}
+
+// —— 源文件：先落到白名单目录，再让规格的 source 指过去 ——
+$('igPick').addEventListener('click', () => $('igFile').click());
+$('igFile').addEventListener('change', (e) => { if (e.target.files[0]) igUploadSource(e.target.files[0]); });
+{
+  const dz = $('igDrop');
+  ['dragenter', 'dragover'].forEach((ev) => dz.addEventListener(ev, (e) => {
+    e.preventDefault(); dz.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => {
+    e.preventDefault(); dz.classList.remove('over');
+  }));
+  dz.addEventListener('drop', (e) => { if (e.dataTransfer.files[0]) igUploadSource(e.dataTransfer.files[0]); });
+}
+
+async function igUploadSource(file) {
+  $('igFileMsg').textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）· 上传中…`;
+  try {
+    // 与旧路径同一套路：原始二进制 body + X-Filename 头（不为上传引 multipart 依赖）
+    const res = await fetch('/api/ingest/upload', {
+      method: 'POST',
+      headers: { 'x-filename': encodeURIComponent(file.name), 'content-type': 'application/octet-stream' },
+      body: await file.arrayBuffer(),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    igSource = body;
+    $('igFileMsg').textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）· 已上传`;
+    $('igSource').classList.remove('hidden');
+    $('igSourcePath').textContent = body.file;
+    $('igPointMsg').textContent = '';
+    igStatus('源文件已就位', 'ok');
+  } catch (e) {
+    igSource = null;
+    $('igSource').classList.add('hidden');
+    $('igFileMsg').textContent = `上传失败：${e.message}`;
+  }
+}
+
+/**
+ * 把规格顶层的 `source:` 指向刚上传的文件。
+ *
+ * ★ 只认**顶层**那一行（不缩进的 `source:`），找不到就明说 —— 不替人凭空插一行结构。
+ *   静默改写 YAML 比让人自己补一行危险得多：改错了没人看得见。
+ */
+$('igPoint').addEventListener('click', () => {
+  const p = igSource && igSource.file;
+  if (!p) return;
+  if (/^source\s*:/m.test(igYaml())) {
+    $('igYaml').value = igYaml().replace(/^source\s*:.*$/m, `source: ${p}`);
+    $('igPointMsg').textContent = '已改 source 那一行（在下面编辑器里可见）';
+  } else {
+    $('igPointMsg').innerHTML =
+      `这份 YAML 里没有顶层的 <code>source:</code> 行，请自己加一行：<code>source: ${esc(p)}</code>`;
+  }
+  runIgLint();
+});
+
+// —— 规格：载入已定稿的，或自己写 ——
+async function igLoadSpecs() {
+  try {
+    igSpecs = await api('/api/ingest/specs');
+    $('igSpecs').innerHTML = '<option value="">（不载入，直接在下面写）</option>' +
+      igSpecs.map((s) => `<option value="${esc(s.file)}">${esc(s.id)}</option>`).join('');
+  } catch {
+    igSpecs = [];   // 一份都没定稿过不是错误
+  }
+}
+
+$('igSpecs').addEventListener('change', () => {
+  const hit = igSpecs.find((s) => s.file === $('igSpecs').value);
+  if (!hit) return;
+  $('igYaml').value = hit.yaml;
+  igResetPlan();
+  runIgLint();
+});
+
+// —— 边改边诊断：把"落库时被拒"提前成"打字时就看见哪里错" ——
+let igLintTimer = null;
+function scheduleIgLint() { clearTimeout(igLintTimer); igLintTimer = setTimeout(runIgLint, 250); }
+$('igYaml').addEventListener('input', scheduleIgLint);
+
+async function runIgLint() {
+  const box = $('igLint');
+  const yaml = igYaml();
+  if (!yaml.trim()) {
+    box.innerHTML = '';
+    $('igDryRun').disabled = true;
+    $('igSave').disabled = true;
+    igStatus('未开始', '');
+    return;
+  }
+  box.innerHTML = '<span class="hint">检查中…</span>';
+  let d;
+  try {
+    d = await api('/api/ingest/lint', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml }),
+    });
+  } catch (e) {
+    box.innerHTML = `<span class="hint">诊断失败：${esc(e.message)}</span>`;
+    return;
+  }
+
+  $('igDryRun').disabled = d.willBeRejected;
+  $('igSave').disabled = d.willBeRejected;
+
+  if (d.parseError) {
+    igStatus('YAML 语法错', 'err');
+    box.innerHTML = `<div class="issue err"><span class="lv">YAML 语法</span><span>${esc(d.parseError)}</span></div>`;
+    return;
+  }
+  const errs = d.errors || [];
+  const warns = d.warnings || [];
+  if (d.willBeRejected) {
+    igStatus(`${errs.length} 处要先改`, 'err');
+    box.innerHTML = `<div class="issue err"><span class="lv">不能跑</span>
+      <span>有 ${errs.length} 处必须先改 —— 结构不对时跑进去也只会一行不落地被拒。</span></div>` +
+      errs.map((i) => `<div class="issue err"><span class="lv">错误</span>
+        <span><code>${esc(i.at)}</code>：${esc(i.message)}${
+        i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('');
+    return;
+  }
+  igStatus('可以干跑', 'ok');
+  box.innerHTML = warns.length
+    ? `<div class="issue warn"><span class="lv">可跑</span>
+         <span>结构没问题，但有 ${warns.length} 条提醒（不挡干跑）。</span></div>` +
+      warns.map((i) => `<div class="issue warn"><span class="lv">提醒</span>
+        <span><code>${esc(i.at)}</code>：${esc(i.message)}</span></div>`).join('')
+    : '<div class="issue ok"><span class="lv">通过</span><span>结构没问题，可以干跑。</span></div>';
+}
+
+function igResetPlan() {
+  igPlan = null;
+  igDecisions = {};
+  $('igPlanCard').classList.add('hidden');
+  $('igPlan').innerHTML = '';
+  $('igDecisions').innerHTML = '';
+  $('igRunMsg').textContent = '';
+}
+
+// —— 干跑：形状 + 主数据判定，一次库都不写 ——
+$('igDryRun').addEventListener('click', async () => {
+  const btn = $('igDryRun');
+  btn.disabled = true;
+  btn.textContent = '干跑中…';
+  igDecisions = {};       // 新一轮干跑 → 丢掉上一轮的决定
+  try {
+    const res = await api('/api/ingest/dry-run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml: igYaml(), decisions: [] }),
+    });
+    igPlan = res;
+    renderIgPlan(res);
+  } catch (e) {
+    $('igLint').insertAdjacentHTML('afterbegin',
+      `<div class="issue err"><span class="lv">干跑失败</span><span>${esc(e.message)}</span></div>`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '干跑（不写库）';
+  }
+});
+
+function igBlockHtml(b) {
+  const vals = b.valueColumns.map((v) => `${v.col}${v.header ? `（${v.header}）` : ''} → ${v.periodType || '⚠ 没有口径'}`);
+  const skips = b.skipped.map((s) => `${s.col}（${s.why}）`);
+  const period = b.period ? `${b.period.year}-${String(b.period.month).padStart(2, '0')}（${b.period.evidence}）` : '—';
+  return `<div class="spec-item" style="display:block">
+    <div class="meta">
+      <b>sheet「${esc(b.sheet)}」· 锚点 ${esc(b.anchor)}</b>
+      <span>表头第 ${b.headerRow} 行 · ${b.dataRows} 行数据 × ${b.valueColumns.length} 个值列
+        = ${b.coordinates.total} 个坐标${
+        b.coordinates.incomplete ? `（其中 ${b.coordinates.incomplete} 个凑不齐坐标，落不了库）` : ''}</span>
+    </div>
+    <table class="mini" style="margin-top:8px">
+      <tr><th>行键</th><td>${b.rows.map((r) => `${r.col} → ${esc(r.dim)}`).join('、')}</td></tr>
+      <tr><th>值列</th><td>${vals.map((v) => esc(v)).join('、') || '—'}</td></tr>
+      ${b.skipped.length ? `<tr><th>跳过</th><td>${skips.map((s) => esc(s)).join('、')}</td></tr>` : ''}
+      <tr><th>期数</th><td>${esc(period)}</td></tr>
+      ${b.dropped.length ? `<tr><th>丢掉的行</th><td>${
+        b.dropped.map((d) => `第 ${d.row} 行「${esc(d.label)}」—— ${esc(d.by)}`).join('、')}</td></tr>` : ''}
+    </table>
+  </div>`;
+}
+
+function igPlanLists(res) {
+  const out = [];
+  const wc = res.willCreate || [];
+  if (wc.length) {
+    out.push(`<h3 class="sec">这次会新建的主数据（${wc.length}）</h3>
+      <div class="issue warn"><span class="lv">新建</span><span>${
+        wc.map((w) => `${w.kind === 'company' ? '公司' : '指标'}「${esc(w.raw)}」`).join('、')}</span></div>
+      <p class="hint">只有在它<strong>确实是新的</strong>时才该新建：库里已有同一家的另一种写法时，
+        新建会把那家公司的钱拆成两半。</p>`);
+  }
+  const mg = res.merged || [];
+  if (mg.length) {
+    out.push(`<h3 class="sec">自动归并的写法（${mg.length}）</h3>
+      <div class="issue ok"><span class="lv">归并</span><span>${
+        mg.map((m) => `「${esc(m.raw)}」→「${esc(m.target)}」（${m.rows} 行）`).join('、')}</span></div>`);
+  }
+  return out.join('');
+}
+
+function renderIgPlan(res) {
+  $('igPlanCard').classList.remove('hidden');
+  const errs = res.errors || [];
+
+  if (res.refused || errs.length) {
+    $('igPlanStatus').textContent = '跑不了';
+    $('igPlanStatus').className = 'pill err';
+    $('igPlan').innerHTML = (res.note ? `<p class="hint">${esc(res.note)}</p>` : '') +
+      errs.map((i) => `<div class="issue err"><span class="lv">错误</span>
+        <span><code>${esc(i.code)}</code> @ <code>${esc(i.at)}</code>：${esc(i.message)}${
+        i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('');
+    $('igDecisions').innerHTML = '';
+    $('igRun').disabled = true;
+    $('igRun').textContent = '确认无误，落库';
+    igStatus('干跑被拒', 'err');
+    return;
+  }
+
+  const blocks = (res.shape && res.shape.blocks) || [];
+  const need = res.needsDecision || [];
+  $('igPlanStatus').textContent = need.length ? `${need.length} 个名字待你拍板` : '可以落库';
+  $('igPlanStatus').className = `pill ${need.length ? 'warn' : 'ok'}`;
+
+  $('igPlan').innerHTML = `
+    <div class="kv">
+      <div><div class="k">会写入的事实行</div><div class="v">${igWillWrite(res).toLocaleString()}</div></div>
+      <div><div class="k">数据区</div><div class="v">${blocks.length}</div></div>
+      <div><div class="k">空值格（不落库）</div><div class="v">${(res.emptyMeasureCells || 0).toLocaleString()}</div></div>
+      <div><div class="k">会新建主数据</div><div class="v">${(res.willCreate || []).length}</div></div>
+      <div><div class="k">自动归并写法</div><div class="v">${(res.merged || []).length}</div></div>
+    </div>
+    ${res.note ? `<p class="hint">${esc(res.note)}</p>` : ''}
+    ${blocks.map(igBlockHtml).join('')}
+    ${igPlanLists(res)}`;
+
+  renderIgDecisions(need);
+  igSyncRun();
+  igStatus(need.length ? '待拍板' : '可落库', need.length ? 'warn' : 'ok');
+}
+
+/**
+ * 把「疑似同一家」的名字交给人拍板（铁律 16）。
+ *
+ * ★ 与旧路径那张卡片是同一个立场：**合并两家公司比不合并危险得多**。
+ *   不合并时数字明显不对、人会来查；错合并则报表看起来完全正常，没人会来查。
+ *   所以候选必须带 `why`（判断依据）—— 不给人看依据的推荐等于让他们猜。
+ */
+function renderIgDecisions(need) {
+  if (!need.length) { $('igDecisions').innerHTML = ''; return; }
+
+  const card = (d) => {
+    const cur = igDecisions[igDkey(d.kind, d.raw)];
+    const cands = d.candidates || [];
+    const opts = cands.map((c) => `<option value="${esc(c.id)}"${cur && cur.targetId === c.id ? ' selected' : ''}>${
+      esc(c.name)}（${esc(c.why)}）</option>`).join('');
+    return `<div class="decide" data-key="${esc(igDkey(d.kind, d.raw))}">
+      <div class="decide-head">
+        <strong>${esc(d.raw)}</strong>
+        <span class="tag">${d.kind === 'company' ? '公司' : '指标'}</span>
+        <span class="tag">${d.rows} 行</span>
+        ${cur ? `<span class="pill ok">${cur.action === 'merge' ? '并入已有' : '确认新建'}</span>` : ''}
+      </div>
+      <div class="decide-body">
+        <label>并入已有主数据
+          <select class="decide-target">${opts || '<option value="">（没有相近的已有主数据）</option>'}</select>
+        </label>
+        <button class="decide-merge"${cands.length ? '' : ' disabled'}>并入</button>
+        <button class="decide-new">确认是新建</button>
+      </div>
+      <p class="hint">候选里没有正确的目标，就说明它确实是新的 —— 选「确认是新建」。
+        选「并入」后这个写法会被记住，下个月自动命中，不再问你。</p>
+    </div>`;
+  };
+
+  $('igDecisions').innerHTML = `<div class="decide-wrap">
+    <h3>待确认名称 <span class="pill warn">${need.length}</span></h3>
+    <p class="hint">这些名字第一次出现，但看起来与已有主数据相近。请逐个确认：
+      是同一家的不同写法（并入），还是确实是一家新公司（新建）。
+      合并两家不同的公司会把它们的钱静默加在一起 —— 而报表看起来完全正常，没人会来查。</p>
+    ${need.map(card).join('')}
+  </div>`;
+
+  const refresh = () => {
+    renderIgDecisions(igPlan.needsDecision);
+    // ★ 卡片顶上那颗状态胶囊也要跟着改。只放行按钮而不改胶囊的话，
+    //   人会看到「1 个名字待你拍板」和已经可用的落库按钮同时出现 ——
+    //   同一类"决定记下了、界面没同步"的 bug 本仓库栽过一次（§6.2 第 2 条）。
+    const n = igPending();
+    const ps = $('igPlanStatus');
+    if (ps) {
+      ps.textContent = n > 0 ? `${n} 个名字待你拍板` : '可以落库';
+      ps.className = `pill ${n > 0 ? 'warn' : 'ok'}`;
+    }
+    igSyncRun();
+  };
+  $('igDecisions').querySelectorAll('.decide').forEach((el) => {
+    const key = el.dataset.key;
+    const [kind, raw] = [key.slice(0, key.indexOf('|')), key.slice(key.indexOf('|') + 1)];
+    el.querySelector('.decide-merge').addEventListener('click', () => {
+      const targetId = el.querySelector('.decide-target').value;
+      if (!targetId) return;
+      igDecisions[key] = { kind, raw, action: 'merge', targetId };
+      refresh();
+    });
+    el.querySelector('.decide-new').addEventListener('click', () => {
+      igDecisions[key] = { kind, raw, action: 'create' };
+      refresh();
+    });
+  });
+}
+
+// —— 落库：把决定一起交上去；服务端仍会独立复核一遍 ——
+$('igRun').addEventListener('click', async () => {
+  if (!igPlan) return;
+  const btn = $('igRun');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '落库中…';
+  try {
+    const res = await api('/api/ingest/run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml: igYaml(), decisions: Object.values(igDecisions) }),
+    });
+
+    // 服务端可能回一个「还需要人拍板」的中间态（HTTP 200，不是错误）：
+    // 那种情况它一行都没写。把它当待办渲染出来，而不是当成失败。
+    if (!res.ok) {
+      igPlan = res;
+      renderIgPlan(res);
+      if ((res.needsDecision || []).length) $('igRunMsg').textContent = '还差几个决定 —— 补齐后再点一次。';
+      return;
+    }
+
+    const merged = (res.merged || []).length
+      ? `；自动归并 ${res.merged.length} 个写法（${res.merged.map((m) => `${esc(m.raw)}→${esc(m.target)}`).join('、')}）`
+      : '';
+    $('igPlan').insertAdjacentHTML('afterbegin', `<div class="issue ok"><span class="lv">已落库</span>
+      <span>批次 <code>${esc(res.batchId)}</code>：写入 ${res.inserted.toLocaleString()} 行；
+      新建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个${merged}。
+      ${res.archived === false ? '<strong>⚠️ Parquet 归档失败，请查看服务端日志</strong>' : ''}</span></div>`);
+    $('igRunMsg').textContent = '已落库。上面的干跑结果保留着供对照。';
+    // 卡片顶上的胶囊也交代清楚，别让「1 个名字待你拍板」留在已经落完库的画面上
+    $('igPlanStatus').textContent = '已落库';
+    $('igPlanStatus').className = 'pill ok';
+    igStatus('已落库', 'ok');
+    btn.textContent = '已落库';
+    igPlan = null;
+    igDecisions = {};
+    await Promise.all([loadBatches(), loadCatalog(), igLoadSpecs()]);
+  } catch (e) {
+    $('igRunMsg').textContent = `落库失败：${e.message}`;
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+});
+
+// —— 定稿：先校验再落盘（拒绝把跑不了的规格写进仓库）——
+$('igSave').addEventListener('click', async () => {
+  const btn = $('igSave');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  $('igSaveMsg').textContent = '';
+  try {
+    const res = await api('/api/ingest/save', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml: igYaml() }),
+    });
+    $('igSaveMsg').textContent = `已保存 ${res.file}`;
+    await igLoadSpecs();
+  } catch (e) {
+    $('igSaveMsg').textContent = '';
+    $('igLint').insertAdjacentHTML('afterbegin',
+      `<div class="issue err"><span class="lv">拒绝保存</span><span>${esc(e.message)}</span></div>`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '保存到 ingest/';
+  }
+});
+
+// ───────── 旧路径：长表导入（待退场）─────────
 let staged = null;   // 待提交的批次
 let decisions = {};  // key = `${kind}|${raw}` → {action, targetId}
 
@@ -482,7 +911,7 @@ function renderInference(inf) {
 
   html += `<h3>spec 草稿</h3>
     <p class="hint">下面是推断出的 YAML。<b>推断只是草稿</b>：请核对带「猜的」标记的轴后再保存。</p>
-    <textarea id="specYaml" spellcheck="false">${esc(inf.yaml)}</textarea>
+    <textarea id="specYaml" class="yaml-editor" spellcheck="false">${esc(inf.yaml)}</textarea>
     <div id="specLint" class="spec-lint"></div>
     <div class="actions" style="margin-top:8px">
       <button class="primary" id="saveSpec">保存到 specs/</button>
@@ -692,5 +1121,6 @@ function dimLabel(name) {
   }
   await loadBatches();
   await loadSpecs();
+  await igLoadSpecs();
   hashTab();
 })();

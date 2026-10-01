@@ -147,8 +147,8 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 ## 3. 常用命令
 
 ```bash
-npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，326 项断言，唯一的门禁
+npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格）到 test/fixtures/
+npm run e2e        # ★ 全链路验收，353 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -157,7 +157,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   （条数以实跑输出为准）：模板指纹 → **CLI 解析层与命令表** → 开库 → STAGED 校验 → 提交 →
   spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 → 语义层 →
   图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）**。
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -324,6 +324,17 @@ src/
                    + quoteFormulas()（公式注入防护）
     chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
                    + chartShape()（只含结构与标签、不含数据点，可给 agent）
+  server.ts        ★ **Web 入口**（零框架 node:http；给"人"）—— 三个入口之一
+                   + `audience` 写死 human 并**无条件覆盖**请求体里的同名字段（铁律 10）
+                   + 接入路径路由 `/api/ingest/{specs,lint,upload,dry-run,run,save}`：
+                     upload 只落盘（不解析不落库，落点必须过 `resolveSource`）；
+                     specs 顺带回 YAML 文本（**枚举出来的路径**，不另开一个路径判据）；
+                     其余五条与 MCP 工具共用 `diagnoseIngest` / `runIngest`，不写新判据
+                   ⚠️ 旧路径 `/api/import/*` 仍在（`src/import/` 退场时一起删）
+  web/             ★ Web 界面（零前端框架、零构建；`app.js` + `index.html` + `style.css`）
+    app.js         数据导入 / 看板查询 / 报表报送三块；**页面不写判据**，只把服务端结论摆给人看
+                   + 接入向导：上传源 → 挑/改接入规格 → 边打字诊断 → 干跑 → 待确认拍板 → 落库
+                   + `source:` 由人点按钮改（改完在编辑器里可见）—— 不开"运行时覆盖 source"的第二条真相
   mcp/
     tools.ts       ★ 12 个工具
                    看现状：get_catalog（★ 按需下钻；零金额；把「现在有什么」交给 agent）
@@ -344,8 +355,9 @@ data/              ⚠️ 真实财务数据，永不提交
   audit/           MCP 审计日志（JSONL，只记字段名不记值）
 ```
 
-**数据流**：Excel 长表 →（`import/`，不经 LLM）→ DuckDB →（`spec/` 编译成 SQL，本地执行）
-→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
+**数据流**：Excel（任意形态）→（`land/` 着陆 → `ingest/` 按接入规格展开，不经 LLM）→ DuckDB
+→（`spec/` 编译成 SQL，本地执行）→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
+*（旧长表路径 `import/` 是同一位置的上一代实现，待退场。）*
 **agent 只参与产出 spec，从不接触数值。**
 
 **两条"给 agent 看不给数值"的对称设计**（新增返回数据的接口时照这个套路）：
@@ -369,10 +381,11 @@ data/              ⚠️ 真实财务数据，永不提交
 | CLI 入口 | 🚧 **引擎侧 + 物料侧已落地**（`src/cli.ts` + `bin`：`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show`。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出**。`validate` / `skill export` 也已挂（§7.1 的命令面走完了）—— 见 `docs/开发计划.md` §7） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**326 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
-第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐）守着。
+**353 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路）守着。
 
 **下一步（尚未开始）**：
+- `src/import/` 退场 —— 只剩服务端三条旧路由、旧导入页与 e2e 第 2–15 阶段（Web 侧已改走新路径）。
 - `fact_business_line` 表 —— 运营指标（合同、业务线）独立成表，见铁律 8。
 - §10 **R8**：Parquet 小文件 compaction（归档批次多了以后）。
 

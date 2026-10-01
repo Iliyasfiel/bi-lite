@@ -144,3 +144,72 @@ await wb2.xlsx.writeFile(LONG);
 console.log(`✅ 模板: ${TPL}`);
 console.log(`✅ 长表: ${LONG}  (${n} 行数据)`);
 console.log(`   公司 ${COMPANIES.length} × 指标 ${METRICS.length} × 口径 ${PERIODS.length} × 月份 ${MONTHS.length} = ${n}`);
+
+// ============ 3. 接入路径的源夹具（新接入层：任意形态的 Excel → 星型表）============
+// ★ 为什么它必须由 fixtures 生成：接入层的全链路（源文件 → raw → 事实行）**需要一个真的
+//   存在、且在白名单内的源文件**，而 e2e 此前借用了 `data/` 下的一份探针文件 ——
+//   `data/` 是真实数据目录、又被 `.gitignore` 掉，于是
+//   「洁净 clone → npm run fixtures → npm run e2e」在接入这一段必挂。
+//   **测试不该借生产规格的源**：生产规格（`ingest/月度经营接入.yaml`）指向真实数据，
+//   本来就该在 `data/` 里；夹具是测试自己的，落 `test/fixtures/`。
+//
+// ★ 规格与源在**同一个地方**写出来：两者的路径与几何只有一个来源，不会各自漂。
+const INGEST_SRC = 'test/fixtures/月度经营接入源.xlsx';
+const INGEST_SPEC = 'test/fixtures/月度经营接入.yaml';
+
+const wb3 = new ExcelJS.Workbook();
+const is = wb3.addWorksheet('月报');
+is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%']);
+/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E 两个值列；F 是派生列（规格里跳过） */
+const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, month: number]> = [
+  ['华东子公司', '营业收入', 1234.5, 56.75],
+  ['华东子公司', '净利润', 200.25, 20.125],
+  ['华南子公司', '营业收入', 9876.5, 432.25],
+  ['华南子公司', '净利润', 500.75, 50.375],
+];
+for (const [company, metric, cumulative, month] of INGEST_ROWS) {
+  is.addRow([company, '2026-06', metric, cumulative, month, 0]);
+}
+// 「合计」行刻意留着：规格里的 drop 就是为它写的，夹具必须能真的验到那条规则
+is.addRow(['合计', '2026-06', '合计', null, null, 0]);
+for (let c = 1; c <= 6; c++) is.getColumn(c).width = 16;
+await wb3.xlsx.writeFile(INGEST_SRC);
+
+// 夹具规格：形状与 `ingest/月度经营接入.yaml` 一致，只有 source 指向夹具自己。
+// ★ 不要为了测试去改生产规格的 source —— 那会把"测试依赖"伪装成"生产配置"。
+fs.writeFileSync(
+  INGEST_SPEC,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **接入路径的测试夹具，不是生产规格**。
+# 生产那份在 ingest/ 下，指向 data/ 里的真实数据；这一份的源就在 test/fixtures/ 里，
+# 于是「洁净 clone → npm run fixtures → npm run e2e」不依赖任何不在版本库里的东西。
+id: 月度经营接入-夹具
+source: ${INGEST_SRC}
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: D2
+        rows:
+          - col: A
+            dim: company
+          - col: C
+            dim: metric
+        values:
+          columns: [D, E, F]
+          skip:
+            - columns: [F]
+              why: 同比% 是派生列
+          periodTypes: [本年累计, 单月]
+        keys:
+          - col: B
+            as: period
+        drop:
+          labels: [合计]
+`,
+);
+
+const factRows = INGEST_ROWS.length * 2; // 4 行数据 × 2 个接入的值列
+console.log(`✅ 接入源: ${INGEST_SRC}  (${INGEST_ROWS.length} 行数据 → ${factRows} 条事实 + 1 行「合计」被 drop)`);
+console.log(`✅ 接入规格: ${INGEST_SPEC}`);

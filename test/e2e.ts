@@ -1725,7 +1725,9 @@ log('\n════════ 17. 重放（raw 是值的唯一来源）══�
   const { parseIngestSpec } = await import('../src/ingest/types.ts');
   const { runIngest } = await import('../src/ingest/run.ts');
 
-  const SPEC = 'ingest/月度经营接入.yaml';
+  // ★ 用**夹具规格**，不是 `ingest/月度经营接入.yaml` —— 那份是生产规格，源在 data/ 里，
+  //   不在版本库里。测试借它的源，等于让门禁依赖一个洁净 clone 上不存在的东西。
+  const SPEC = 'test/fixtures/月度经营接入.yaml';
   const spec = parseIngestSpec(fs.readFileSync(SPEC, 'utf8'));
   const cat = await masterCatalog();
 
@@ -1877,13 +1879,13 @@ log('\n════════ 20. 源文件被删之后仍能重放 ═══�
   const { masterCatalog } = await import('../src/ingest/master.ts');
   const { runIngest } = await import('../src/ingest/run.ts');
 
-  // 把真源拷到白名单内的一个探针路径，规格里的 source 换成它。
+  // 把夹具源拷到白名单内的一个探针路径，规格里的 source 换成它。
   // 字节完全相同 → raw 走"复用"，正是"同一份文件换个路径传进来"那条路：
   // 若不额外记路径，源文件一删就再也找不回 raw 了。
   const PROBE = 'test/fixtures/.replay-probe.xlsx';
-  fs.copyFileSync('data/probe-run/月度经营接入源.xlsx', PROBE);
+  fs.copyFileSync('test/fixtures/月度经营接入源.xlsx', PROBE);
   const spec = parseIngestSpec(
-    fs.readFileSync('ingest/月度经营接入.yaml', 'utf8').replace(/^source:.*$/m, `source: ${PROBE}`),
+    fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8').replace(/^source:.*$/m, `source: ${PROBE}`),
   );
   try {
     const landed = await landRawFile(spec.source);
@@ -2112,6 +2114,236 @@ log('\n════════ 24. skill export 与手册对拍 ═════
     code === 0 && (JSON.parse(o.join('')) as { tools: unknown[] }).tools.length === TOOLS.length &&
       e.join('').includes('没有**覆盖'),
     `code=${code}`);
+}
+
+// ============ 25. Web 接入向导：新接入路径的 HTTP 面 ============
+log('\n════════ 25. Web 接入向导（/api/ingest/* 的 HTTP 面）════════');
+{
+  // ★ 这一段补的是一个**结构性空白**：新接入路径（`src/ingest/`）此前只在**库层**
+  //   （第 17–20 阶段直接 import `runIngest` / `dryRunIngest`）与 CLI 层被验过，
+  //   而 Web 向导要走的这几条 HTTP 路由**一条断言都没有**。接口层没人守，
+  //   等的就是"工具说没问题、页面却被拒"那类漂移（铁律 17 的判例）。
+  const { start, stop } = await import('../src/server.ts');
+  const { resolveSource } = await import('../src/paths.ts');
+  const { diagnoseIngest } = await import('../src/ingest/types.ts');
+  const port2 = await start(0);
+  const b2 = `http://127.0.0.1:${port2}`;
+  const post2 = async (p: string, body: unknown) =>
+    (await fetch(b2 + p, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json() as any;
+  const up2 = async (name: string, bytes: Buffer) =>
+    (await fetch(b2 + '/api/ingest/upload', {
+      method: 'POST',
+      headers: { 'x-filename': encodeURIComponent(name), 'content-type': 'application/octet-stream' },
+      body: bytes,
+    })).json() as any;
+  const facts = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+
+  try {
+    // ★ 自己造一个干净起点：夹具的坐标与第 20 阶段重建出来的那批**完全撞车**，
+    //   而规格是 `onConflict: reject` —— 不清空就只会拿到"整批拒绝"，
+    //   后面每条断言都在验一件没发生的事（第 17 阶段踩过的同款教训）。
+    await db.execute('DELETE FROM fact_finance');
+
+    const SRC = 'test/fixtures/月度经营接入源.xlsx';
+    const baseYaml = fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8');
+
+    // —— ① 已定稿的规格：列表要**带文本**（向导靠它把规格载入编辑器）——
+    const specs = await (await fetch(b2 + '/api/ingest/specs')).json() as any[];
+    check('① GET /api/ingest/specs 列出已定稿规格并带 YAML 文本（向导据此载入编辑器）',
+      specs.length >= 1 && specs.some((s) => s.id === '月度经营接入') &&
+        specs.every((s) => s.file.startsWith('ingest/') && typeof s.yaml === 'string' && s.yaml.length > 0),
+      `${specs.length} 份：${specs.map((s) => s.id).join(', ')}`);
+    check('① 列表只扫 ingest/ —— 测试夹具（test/fixtures/ 下的那份）不该混进来',
+      specs.every((s) => !s.file.includes('fixtures')));
+
+    // —— ② 诊断：与库层**同一份判据**，且一次给全所有问题 ——
+    const lintOk = await post2('/api/ingest/lint', { yaml: baseYaml });
+    check('② POST /api/ingest/lint 放行一份合法规格',
+      lintOk.ok === true && lintOk.willBeRejected === false,
+      `ok=${lintOk.ok} warns=${(lintOk.warnings ?? []).length}`);
+    const brokenYaml = `id: 故意写坏的接入规格
+source: test/fixtures/月度经营接入源.xlsx
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: 不是坐标
+        values:
+          columns: [D]
+`;
+    const lintBad = await post2('/api/ingest/lint', { yaml: brokenYaml });
+    const inProc = diagnoseIngest(brokenYaml);
+    check('② ★ 一次给全所有问题（不是"改一条、再撞下一条"）',
+      lintBad.willBeRejected === true && (lintBad.errors ?? []).length >= 3,
+      `${(lintBad.errors ?? []).length} 条：${(lintBad.errors ?? []).map((e: any) => e.code).join(',')}`);
+    check('② ★ HTTP 报的问题与库层判断**同一份判据**（铁律 17：两份判据一定漂）',
+      JSON.stringify((lintBad.errors ?? []).map((e: any) => e.code)) ===
+        JSON.stringify(inProc.issues.filter((i) => i.level === 'error').map((i) => i.code)));
+    const lintSyntax = await post2('/api/ingest/lint', { yaml: 'id: [未闭合\n  source: x' });
+    check('② YAML 语法错被单独报出来（不混进结构诊断）',
+      lintSyntax.willBeRejected === true && typeof lintSyntax.parseError === 'string' &&
+        lintSyntax.parseError.length > 0,
+      String(lintSyntax.parseError).slice(0, 60));
+
+    // —— ③ 上传源文件：落点必须在白名单内，且文件名不能带路径成分 ——
+    const buf = fs.readFileSync(SRC);
+    const upl = await up2('e2e-接入源.xlsx', buf);
+    check('③ POST /api/ingest/upload 把源文件落在白名单目录内，字节数不变',
+      upl.file.startsWith('data/uploads/') && upl.size === buf.length &&
+        fs.existsSync(upl.file) && fs.statSync(upl.file).size === buf.length,
+      `${upl.file} ${upl.size}B`);
+    check('③ ★ 上传回来的路径真的能当 source —— 判据问的是 src/paths.ts 那一份',
+      (() => { try { resolveSource(upl.file); return true; } catch { return false; } })());
+    const upEvil = await up2('../../etc/evil.xlsx', buf);
+    check('③ ★ 文件名里的路径成分被剥掉（safeName），落点仍在 data/uploads/',
+      upEvil.file.startsWith('data/uploads/') && !upEvil.file.includes('..'), upEvil.file);
+
+    // —— ④ 干跑：形状说清楚，且**一次库都不写** ——
+    const yaml = baseYaml.replace(/^source\s*:.*$/m, `source: ${upl.file}`);
+    const before4 = await facts();
+    const dry = await post2('/api/ingest/dry-run', { yaml, decisions: [] });
+    check('④ ★ 干跑一次库都不写（也不归档）',
+      (await facts()) === before4 && dry.inserted === 0 && dry.archived === false &&
+        typeof dry.note === 'string' && dry.note.includes('可以落库'),
+      `事实行 ${before4} → ${await facts()}；inserted=${dry.inserted}`);
+    const blk = dry.shape?.blocks?.[0];
+    check('④ 干跑报出形状：4 行数据 × 2 个值列 = 8 个坐标，一个都不缺',
+      blk?.dataRows === 4 && blk?.coordinates.total === 8 && blk?.coordinates.incomplete === 0,
+      `dataRows=${blk?.dataRows} 坐标=${blk?.coordinates.total} 不完整=${blk?.coordinates.incomplete}`);
+    const vcols = (blk?.valueColumns ?? []).map((v: any) => `${v.col}→${v.periodType}`).join(',');
+    check('④ 值列口径按位置对上、派生列被跳过、合计行被 drop（形状就摆在眼前）',
+      vcols === 'D→本年累计,E→单月' &&
+        (blk?.skipped ?? []).map((s: any) => s.col).join(',') === 'F' &&
+        (blk?.dropped ?? []).some((d: any) => d.row === 6),
+      `值列=${vcols} 跳过=${(blk?.skipped ?? []).map((s: any) => s.col).join(',')} drop=${(blk?.dropped ?? []).map((d: any) => d.row).join(',')}`);
+    check('④ ★ 干跑返回值里没有任何金额（走与 MCP 同款的那道兜底扫描）',
+      findAmountLike(dry).length === 0, `${findAmountLike(dry).length} 处`);
+
+    // —— ⑤ 拍板回路：把「待确认」转成决定再落库 —— 端到端复现前端那一步。
+    //    第 12 阶段那条断言教的：只检查"中间产物存在"等于不设防，必须走完整回路。
+    const XLSXPopulate = (await import('xlsx-populate')).default;
+    const V = 'test/fixtures/.e2e-接入变体.xlsx';
+    let done: any;
+    let vupFile = '';
+    try {
+      // ★ 用哪个写法是有讲究的，别随手换：
+      //   ① 它必须**剥壳后与某条已有主数据同字号**（华南本部 → 华南 ＝ 华南子公司），
+      //      否则走不到「交给人拍板」那一档，会直接按 unknownMaster 新建；
+      //   ② 它还必须**没被 dim_alias 命中过** —— 第 12 阶段那条端到端回路把
+      //      「华东本部」永久写进了别名表（那正是"确认一次、下月不再问"的机制），
+      //      所以这里坚决不能用「华东本部」，否则它已是已知写法、当场归并、不问了。
+      const PRE = await db.query<{ n: number }>(
+        `SELECT count(*) AS n FROM dim_alias WHERE kind = 'company' AND normalized = '华南本部'`,
+      );
+      check('⑤ 前置条件：「华南本部」还没被别名表命中（命中过就成了已知写法，这里就验不到拍板那一步）',
+        Number(PRE[0]!.n) === 0);
+
+      const vwb = await XLSXPopulate.fromFileAsync(SRC);
+      const vws = vwb.sheet('月报');
+      let renamed = 0;
+      for (let r = 1; r <= vws.usedRange().endCell().rowNumber(); r++) {
+        if (vws.cell(r, 1).value() === '华南子公司') { vws.cell(r, 1).value('华南本部'); renamed++; }
+      }
+      await vwb.toFileAsync(V);
+      check('⑤ 变体源生成（同一家公司换了个写法：「华南子公司」→「华南本部」）', renamed === 2, `${renamed} 行`);
+
+      const vup = await up2('e2e-接入变体.xlsx', fs.readFileSync(V));
+      vupFile = vup.file;
+      const vYaml = baseYaml.replace(/^source\s*:.*$/m, `source: ${vupFile}`);
+
+      const vdry = await post2('/api/ingest/dry-run', { yaml: vYaml, decisions: [] });
+      const need = vdry.needsDecision ?? [];
+      check('⑤ ★ 干跑把「看起来像已有的名字」交给人拍板，并带 kind（丢了它按钮就永远点不动）',
+        need.length === 1 && need[0].kind === 'company' && need[0].raw === '华南本部' && need[0].rows === 4,
+        (need as any[]).map((d) => `${d.kind}|${d.raw}|${d.rows}`).join(', ') || '（没有待确认项）');
+      check('⑤ 候选自带依据（why）—— 不给人看依据的推荐等于让他猜',
+        need[0]?.candidates?.[0]?.name === '华南子公司' &&
+          String(need[0]?.candidates?.[0]?.why).includes('字号'),
+        `${need[0]?.candidates?.[0]?.name}（${need[0]?.candidates?.[0]?.why}）`);
+
+      const before5 = await facts();
+      const refused = await post2('/api/ingest/run', { yaml: vYaml, decisions: [] });
+      check('⑤ ★★ 名字没拍板就提交 → 一行都不写（宁可不入库，也不把两家公司的钱并到一处）',
+        refused.ok === false && refused.inserted === 0 && (await facts()) === before5 &&
+          (refused.needsDecision ?? []).length === 1,
+        `ok=${refused.ok} inserted=${refused.inserted} 事实行=${await facts()}`);
+
+      // 前端拍板后回传的正是这个形状
+      const decs = (need as any[]).map((d) => ({
+        kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id,
+      }));
+      done = await post2('/api/ingest/run', { yaml: vYaml, decisions: decs });
+      check('⑤ ★★ 拍板后落库成功：写入 8 行，事实表正好多 8 行',
+        done.ok === true && done.inserted === 8 && (await facts()) === before5 + 8,
+        `inserted=${done.inserted} 事实行=${await facts()}`);
+      check('⑤ ★ 归档成功（archived 字段 —— 铁律 12 那个静默失效的回归防线）',
+        done.archived === true, `archived=${done.archived}`);
+      if (done.ok) {
+        const owner = await db.query<{ name: string }>(
+          `SELECT DISTINCT c.name AS name FROM fact_finance f JOIN dim_company c ON c.id = f.company_id
+           WHERE f.batch_id = '${done.batchId}' ORDER BY 1`,
+        );
+        const names = owner.map((o) => o.name);
+        check('⑤ 钱分文不差地记在已有的两家名下（没有为「华南本部」另建一家）',
+          names.length === 2 && names.includes('华东子公司') && names.includes('华南子公司') &&
+            !names.includes('华南本部'),
+          names.join('、'));
+        const alias = await db.query<{ alias: string; target_id: string }>(
+          `SELECT alias, target_id FROM dim_alias WHERE kind = 'company' AND normalized = '华南本部'`,
+        );
+        check('⑤ 人拍板的结果被记住（写进 dim_alias）—— 下个月同写法自动命中，不再问',
+          alias.length === 1 && alias[0]!.alias === '华南本部',
+          alias[0] ? `→ ${alias[0].target_id}` : '没写进 dim_alias');
+        const batch = await db.query<{ source_file: string; status: string }>(
+          `SELECT source_file, status FROM import_batch WHERE batch_id = '${done.batchId}'`,
+        );
+        check('⑤ 批次留痕：记的源文件是**上传的那一份**，状态 committed（可追溯，N4）',
+          batch.length === 1 && batch[0]!.source_file === vupFile && batch[0]!.status === 'committed',
+          batch[0] ? `${batch[0].source_file} ${batch[0].status}` : '没有批次行');
+      }
+    } finally {
+      fs.rmSync(V, { force: true });
+    }
+
+    // —— ⑥ 定稿：先校验再落盘（拒绝把跑不了的规格写进仓库）——
+    const ingBefore = fs.readdirSync('ingest').sort().join(',');
+    const saveBad = await fetch(b2 + '/api/ingest/save', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml: brokenYaml }),
+    });
+    check('⑥ 跑不了的规格被拒绝落盘（ingest/ 一个新文件都不多）',
+      saveBad.status === 400 && fs.readdirSync('ingest').sort().join(',') === ingBefore,
+      `HTTP ${saveBad.status}`);
+    const tmpSpec = 'ingest/e2e-临时接入规格.yaml';
+    try {
+      const saveOk = await post2('/api/ingest/save', {
+        yaml: baseYaml.replace(/^id\s*:.*$/m, 'id: e2e-临时接入规格'),
+      });
+      check('⑥ 合法规格落盘，文件名以 YAML 里的 id 为准',
+        saveOk.id === 'e2e-临时接入规格' && saveOk.file === tmpSpec && fs.existsSync(tmpSpec),
+        `${saveOk.file}`);
+    } finally {
+      fs.rmSync(tmpSpec, { force: true });
+    }
+
+    // —— ⑦ 页面这一侧：至少钉住"向导真的被发下去了" ——
+    //    接口全绿抓不到 UI（AGENTS.md §6.2），这一条挡不住所有前端 bug，
+    //    但能挡住这类改动最常见的失手：文件没放进去、id 打错、HTML 忘了改。
+    const page = await (await fetch(b2 + '/')).text();
+    check('⑦ 首页含接入向导的控件（源文件区 / 规格编辑器 / 干跑 / 待确认 / 落库）',
+      ['igDrop', 'igYaml', 'igDryRun', 'igDecisions', 'igRun'].every((id) => page.includes(`id="${id}"`)));
+    const appjs = await (await fetch(b2 + '/static/app.js')).text();
+    check('⑦ app.js 调的是**新路径**的那五条路由（不是又绕回旧路径）',
+      ['/api/ingest/upload', '/api/ingest/lint', '/api/ingest/dry-run', '/api/ingest/run', '/api/ingest/save']
+        .every((p) => appjs.includes(p)));
+  } finally {
+    stop();
+  }
 }
 
 // ============ 汇总 ============
