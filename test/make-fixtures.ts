@@ -213,3 +213,40 @@ sheets:
 const factRows = INGEST_ROWS.length * 2; // 4 行数据 × 2 个接入的值列
 console.log(`✅ 接入源: ${INGEST_SRC}  (${INGEST_ROWS.length} 行数据 → ${factRows} 条事实 + 1 行「合计」被 drop)`);
 console.log(`✅ 接入规格: ${INGEST_SPEC}`);
+
+// ============ 4. 长表的接入规格（"新路径能表达长表"的夹具）============
+// ★ 为什么要它：要删掉旧长表路径（src/import/longtable.ts），先得让新路径能**表达**长表。
+//   长表和宽表在接入规格里的写法完全不同：宽表的期数整块同值（keys 列每行重复），
+//   而长表**每一行有自己的期数**，四个坐标全在列里：
+//       行键 = B 公司 / C 指标 / D 口径，期数 = A 列（keys），值列 = E 金额。
+//   这一段同时也是 e2e 第 26 阶段「新旧接入路径对拍」的输入（见 test/e2e.ts）。
+const LONG_SPEC = 'test/fixtures/集团导出长表.yaml';
+fs.writeFileSync(
+  LONG_SPEC,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **长表的测试夹具，不是生产规格**。
+# 四个坐标全在列里：期数在 A 列（逐行不同），公司/指标/口径在 B/C/D，金额在 E。
+# 与宽表（月度经营接入.yaml）的差别就在期数：这边每行一个期，那边整块同一个期。
+id: 集团导出长表-夹具
+source: ${LONG}
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 财务快报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+        values:
+          columns: [E]
+`,
+);
+console.log(`✅ 长表接入规格: ${LONG_SPEC}  (与旧长表路径同一份源，供对拍)`);

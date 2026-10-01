@@ -2346,6 +2346,87 @@ sheets:
   }
 }
 
+// ============ 26. 新旧接入路径对拍（退场的前提）============
+log('\n════════ 26. 新旧接入路径对拍（同一份长表，两条路逐行相同）════════');
+{
+  // ★ 为什么要有这一段：要删掉旧长表路径（`src/import/longtable.ts`），先得证明新路径
+  //   **至少一样能打** —— 而且要证明在**值**这一层一样，不是"形状看起来差不多"。
+  //   期望值取自**旧路**（独立算法，AGENTS.md §6.1 的纪律），不是新路自己跑一遍的输出。
+  //
+  //   它同时钉住这批"新路径必须补上才配取代旧路"的能力（全是长表逼出来的）：
+  //     ① 期数认**完整日期**（`2026-01-01`，集团导出最常见的写法）；
+  //     ② 期数**可以逐行不同**（长表一行一条事实；旧规则"一个 block 只能属于一个期"把它整块拦下）；
+  //     ③ 行键要**含期数**（否则长表被误报成"80 组行键重复"）；
+  //     ④ 期数列里是**日期格/数字格**时要**响亮报错**，不许静默看不见
+  //        （旧路对日期格是静默写出 4617 年 —— 见 docs/需求与架构.md §11.6）。
+  const { readLongTable } = await import('../src/import/longtable.ts');
+  const { parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { parsePeriodText } = await import('../src/spec/template.ts');
+
+  // —— ⓪ 期数写法：新路必须是旧路的超集，但**不许**退回按序列号猜年份 ——
+  const forms: Array<[string, string | null]> = [
+    ['2026-06', '2026-6'], ['2026/6', '2026-6'], ['2026.6', '2026-6'], ['2026年6月', '2026-6'], ['202606', '2026-6'],
+    ['2026-06-01', '2026-6'], ['2026/6/1', '2026-6'], ['2026年6月30日', '2026-6'],
+    ['2026-06-01T00:00:00Z', '2026-6'], ['2026-06-01 08:00', '2026-6'],
+    ['46173', null], ['2026-13', null], ['2026-06-01-01', null], ['', null],
+  ];
+  const badForms = forms.filter(([text, want]) => {
+    const p = parsePeriodText(text);
+    return (p === null ? null : `${p.year}-${p.month}`) !== want;
+  });
+  check('★ 期数写法是旧路的超集：含完整日期与时间，且**拒绝** Excel 序列号（旧路把它读成 4617 年）',
+    badForms.length === 0,
+    badForms.length ? badForms.map(([t, w]) => `${t} 期望 ${w}`).join(' | ') : `比了 ${forms.length} 种写法`);
+
+  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'));
+
+  // —— ① 独立算法：旧路直接读那 960 行，作为期望值 ——
+  const oldRows = await readLongTable(LONG);
+  const want = oldRows.map((r) => `${r.fin_month}|${r.company}|${r.metric}|${r.period_type}|${r.amount}`).sort();
+  check('对拍的期望值取自旧路（960 行）', oldRows.length === 960, `${oldRows.length} 行`);
+
+  // —— ② 干跑：新路把长表读成 960 个完整坐标，且一条 error 都没有 ——
+  const dry = await dryRunIngest(spec, { catalog: await masterCatalog() });
+  const b0 = dry.blocks[0]!;
+  check('★ 新路径能表达长表：960 个坐标一个不缺（期数在行内逐行不同）',
+    dry.ok === true && b0.dataRows === 960 && b0.coordinates.total === 960 && b0.coordinates.incomplete === 0,
+    `ok=${dry.ok} 数据行=${b0.dataRows} 坐标=${b0.coordinates.total} 空缺=${b0.coordinates.incomplete}`);
+  check('★ 期数逐行不同被如实说出来（warn，不是拦下、也不是沉默）',
+    dry.issues.some((i) => i.level === 'warn' && i.code === 'PERIOD_PER_ROW'),
+    dry.issues.map((i) => `${i.level}:${i.code}`).join(',') || '（没有任何 issue）');
+  check('行键含期数：12 个月不互相算重复（否则这里会报 ROWKEY_DUPLICATE_IN_FILE）',
+    !dry.issues.some((i) => i.code === 'ROWKEY_DUPLICATE_IN_FILE'));
+
+  // —— ③ 真落库，再从**库里**读回来对拍（连每一笔金额）——
+  //    ★ 自己造干净起点：这份长表的坐标与前面阶段已落的行撞车，而规格是 reject。
+  await db.execute('DELETE FROM fact_finance');
+  const run = await runIngest(spec, { catalog: await masterCatalog(), autoCreateDims: true });
+  check('新路径把同一份长表完整落库（写入数 = 旧路行数）',
+    run.ok === true && run.inserted === oldRows.length,
+    `ok=${run.ok} inserted=${run.inserted} 旧路 ${oldRows.length}`);
+
+  const got = (await db.query<{ m: string; company: string; metric: string; period_type: string; amount: number }>(
+    `SELECT strftime(f.fin_month, '%Y-%m-%d') AS m, c.name AS company, mt.name AS metric,
+            f.period_type AS period_type, f.amount AS amount
+     FROM fact_finance f
+     JOIN dim_company c ON c.id = f.company_id
+     JOIN dim_metric mt ON mt.id = f.metric_id`,
+  )).map((r) => `${r.m}|${r.company}|${r.metric}|${r.period_type}|${Number(r.amount)}`).sort();
+
+  let firstDiff = -1;
+  for (let i = 0; i < Math.max(got.length, want.length); i++) {
+    if (got[i] !== want[i]) { firstDiff = i; break; }
+  }
+  check('★★ 逐行对拍：新旧两条路落出的事实完全相同（含每一笔金额）',
+    firstDiff === -1,
+    firstDiff === -1
+      ? `${want.length} 行逐行相同`
+      : `第 ${firstDiff} 行：新路「${got[firstDiff]}」vs 旧路「${want[firstDiff]}」`);
+}
+
 // ============ 汇总 ============
 log('\n════════════════════════════════');
 log(`  通过 ${pass} / 失败 ${fail}`);

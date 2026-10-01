@@ -328,6 +328,8 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   const nonNumericSample: number[] = [];
   const unmatchedCount = new Map<string, { kind: 'company' | 'metric'; name: string; rows: number }>();
   const periodSeen: Array<{ value: string; row: number; parsed: { year: number; month: number } | null }> = [];
+  /** 期数列里"有值但读不出文本"的行（日期格/数字格）—— 单独记，事后报成一条明确的错 */
+  const nonTextPeriodRows: number[] = [];
   const periodKeyCol = (block.keys ?? []).find((k) => k.as === 'period')?.col;
 
   let dataRows = 0;
@@ -400,13 +402,25 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     if (periodKeyCol) {
       const raw = textAt(sheet, r, colIndex(periodKeyCol));
       if (raw !== null) periodSeen.push({ value: raw, row: r, parsed: parsePeriodText(raw) });
+      else {
+        // ★ 格里有东西、但 `textAt` 读不出文本 → 多半是**日期格或数字格**
+        //   （xlsx-populate 把日期格给成序列号，见 §11.6）。必须报出来：
+        //   不报的话这一列就是"凭空消失"，而**干跑还会说 ok**（只是 coordinate 空缺，
+        //   要等真落库才以 NO_WRITABLE_ROWS 拒）—— 那种失败形态最难查。
+        const v = sheet.cell(r, colIndex(periodKeyCol)).value();
+        if (v !== undefined && v !== null && String(v).trim() !== '') nonTextPeriodRows.push(r);
+      }
     }
     const periodText = periodKeyCol
       ? (textAt(sheet, r, colIndex(periodKeyCol)) ?? '')
       : (factValues.get('period') ?? '');
 
     // 行键重复
-    const rowKey = labels.map((x) => normalizeName(x)).join('\u0001');
+    // ★ 行键 = rows 里所有列 **+ keys 里的期数**。对长表（一行一条事实、期数在某一列）来说
+    //   期数就是行键的一部分：同一家公司同一指标的 12 个月**不是重复**。
+    //   漏掉它，长表会被报成"80 组行键重复"（实测）。
+    //   宽表不受影响：那种块里期数整列同值，加进去等于没加。
+    const rowKey = [...labels, periodText].map((x) => normalizeName(x)).join('\u0001');
     const hit = seenRowKeys.get(rowKey);
     if (hit) hit.rows.push(r);
     else seenRowKeys.set(rowKey, { label: keyName || label || labels.filter(Boolean).join('/'), rows: [r] });
@@ -489,6 +503,16 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
         : '空的名会建出无名主数据；请在源里补齐或排掉这些行。');
   }
 
+  // ★ 期数列"有值但读不出文本"：报告而不是静默。见 readBlockShape 里的那段注释。
+  //   接的是旧路径的一个**静默算错**判例（§11.6）：它用 `String(序列号)` 匹配出 4617 年。
+  if (nonTextPeriodRows.length > 0) {
+    err('PERIOD_CELL_NOT_TEXT', where,
+      `期数列 ${periodKeyCol} 有 ${nonTextPeriodRows.length} 个格子不是文本（第 ${nonTextPeriodRows.slice(0, 5).join('、')}${nonTextPeriodRows.length > 5 ? ' …' : ''} 行）—— 看着像日期格或数字格，接入层读不到它们，这一步会一路走到"没有一个坐标凑得齐"。`,
+      '接入层只从**文本**里读期数（数字在类型层面没有出口，见 template.ts 的 textAt）。' +
+        ' 请在源里把这一列设成文本（或导出时选"文本"格式）。' +
+        ' 支持真实的日期格是另一件事，尚未做 —— 而**不要**退回按序列号猜年份：那正是旧长表路径静默写出 4617 年的原因。');
+  }
+
   let period: IngestBlockShape['period'] = null;
   if (periodSeen.length > 0) {
     const distinct = [...new Set(periodSeen.map((p) => p.value))];
@@ -496,11 +520,17 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     if (unparsed.length > 0) {
       err('PERIOD_UNPARSEABLE', where,
         `期数解析不出来的写法：${[...new Set(unparsed.map((u) => u.value))].slice(0, 5).map((v) => `「${v}」`).join('、')}（第 ${unparsed.slice(0, 5).map((u) => u.row).join('、')} 行等）。`,
-        '识别的写法：2026-06 / 2026/6 / 2026年6月 / 202606。认不出就报错 —— 旧实现把认不出的期数原样塞进 SQL，直到落库那一刻才炸成 500。');
+        '识别的写法：2026-06 / 2026/6 / 2026年6月 / 202606，以及**完整日期** 2026-06-01 / 2026/6/1 / 2026年6月30日（含带时间的）。' +
+          ' 认不出就报错 —— 旧实现把认不出的期数原样塞进 SQL，直到落库那一刻才炸成 500。');
     } else if (distinct.length > 1) {
-      err('PERIOD_INCONSISTENT', where,
-        `期数列在同一块里出现了 ${distinct.length} 个不同的期：${distinct.slice(0, 5).map((v) => `「${v}」`).join('、')}。`,
-        '一个 block 只能属于一个期。多期请拆成多个 block（期数不是"第一个赢"的字段）。');
+      // ★ 期数逐行不同**不是**错误：长表（一行一条事实、期数在某一列）本来就是这样，
+      //   而坐标取的是**每一行自己**的期数（见上面 periodText 的取法），所以不存在"第一个赢"。
+      //   旧规则（一个 block 只能属于一个期）是为宽表写的，它会把长表整块拦下 ——
+      //   而那正是"新路径取代旧路径"必须能表达的形状。降级成 warn，并把"会发生什么"说清。
+      warn('PERIOD_PER_ROW', where,
+        `这一块的期数逐行不同（${distinct.length} 个期：${distinct.slice(0, 3).map((v) => `「${v}」`).join('、')}${distinct.length > 3 ? ' …' : ''}）—— 按**每行各自的期数**落库。`,
+        '长表（一行一条事实、期数在某一列）就是这样，合法。' +
+          ' 但如果这一列本该整块同一个期（宽表模板常见：每行都重复写着当期），那说明 keys.col 指错了列 —— 对着 shape 核一遍。');
     } else {
       const p = periodSeen[0].parsed!;
       period = { year: p.year, month: p.month, evidence: `表头/期数列 ${periodKeyCol} 整块为同一期，取第 ${periodSeen[0].row} 行` };

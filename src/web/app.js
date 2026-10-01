@@ -51,6 +51,7 @@ let igSource = null;      // 刚上传的源文件 { file, name, size }
 let igPlan = null;        // 最近一次干跑结果（或落库被拦下的结果）
 let igDecisions = {};     // key = `${kind}|${raw}` → { kind, raw, action, targetId }
 let igSpecs = [];         // ingest/ 下已定稿的规格（带文本，供载入编辑器）
+let igLintCodes = new Set();  // lint 阶段已知的 issue code（用来挑出"读过文件才知道的提醒"）
 
 const igYaml = () => $('igYaml').value;
 const igDkey = (kind, raw) => `${kind}|${raw}`;
@@ -195,6 +196,9 @@ async function runIgLint() {
   }
   const errs = d.errors || [];
   const warns = d.warnings || [];
+  // 记住"光看规格就知道的那批 code"：干跑结果里**新出现**的提醒才是"读过文件才知道的"，
+  // 那些必须也摆到人眼前（引擎说了、人看不见 = 等于没说）。
+  igLintCodes = new Set([...errs, ...warns].map((i) => i.code));
   if (d.willBeRejected) {
     igStatus(`${errs.length} 处要先改`, 'err');
     box.innerHTML = `<div class="issue err"><span class="lv">不能跑</span>
@@ -246,7 +250,15 @@ $('igDryRun').addEventListener('click', async () => {
 });
 
 function igBlockHtml(b) {
-  const vals = b.valueColumns.map((v) => `${v.col}${v.header ? `（${v.header}）` : ''} → ${v.periodType || '⚠ 没有口径'}`);
+  // ★ 口径从哪儿来有两种合法形态：
+  //   ① 由**行键的一列**给（长表：D 列写着 本年累计/单月）→ 值列上当然没有口径；
+  //   ② 由**值列**给（宽表：D 列是本年累计、E 列是单月，按位置/表头映射）。
+  //   ①的情况下值列没有 periodType 是**正常**的 —— 别报"⚠ 没有口径"（那是假警报）。
+  const ptCols = b.rows.filter((r) => r.dim === 'period_type').map((r) => r.col);
+  const vals = b.valueColumns.map((v) => {
+    const head = `${v.col}${v.header ? `（${v.header}）` : ''}`;
+    return ptCols.length ? head : `${head} → ${v.periodType || '⚠ 没有口径'}`;
+  });
   const skips = b.skipped.map((s) => `${s.col}（${s.why}）`);
   const period = b.period ? `${b.period.year}-${String(b.period.month).padStart(2, '0')}（${b.period.evidence}）` : '—';
   return `<div class="spec-item" style="display:block">
@@ -259,6 +271,7 @@ function igBlockHtml(b) {
     <table class="mini" style="margin-top:8px">
       <tr><th>行键</th><td>${b.rows.map((r) => `${r.col} → ${esc(r.dim)}`).join('、')}</td></tr>
       <tr><th>值列</th><td>${vals.map((v) => esc(v)).join('、') || '—'}</td></tr>
+      ${ptCols.length ? `<tr><th>口径</th><td>由行键给（${ptCols.join('/')} 列）</td></tr>` : ''}
       ${b.skipped.length ? `<tr><th>跳过</th><td>${skips.map((s) => esc(s)).join('、')}</td></tr>` : ''}
       <tr><th>期数</th><td>${esc(period)}</td></tr>
       ${b.dropped.length ? `<tr><th>丢掉的行</th><td>${
@@ -289,6 +302,17 @@ function igPlanLists(res) {
 function renderIgPlan(res) {
   $('igPlanCard').classList.remove('hidden');
   const errs = res.errors || [];
+  // ★ 只有**读过文件**才知道的提醒（lint 阶段看不见的那批）—— 必须摆出来。
+  //   例：`PERIOD_PER_ROW`（期数逐行不同，按每行各自落库）、`SOURCE_LOOKS_EMPTY`（这是一份空模板）。
+  //   少了它，人看到的只是"期数 —"，而引擎其实把话说清楚了。
+  const fileWarns = ((res.shape && res.shape.issues) || [])
+    .filter((i) => i.level === 'warn' && !igLintCodes.has(i.code));
+  const warnsHtml = fileWarns.length
+    ? `<h3 class="sec">只有读过文件才知道的提醒（${fileWarns.length}）</h3>` +
+      fileWarns.map((i) => `<div class="issue warn"><span class="lv">提醒</span>
+        <span><code>${esc(i.code)}</code>：${esc(i.message)}${
+        i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('')
+    : '';
 
   if (res.refused || errs.length) {
     $('igPlanStatus').textContent = '跑不了';
@@ -296,7 +320,7 @@ function renderIgPlan(res) {
     $('igPlan').innerHTML = (res.note ? `<p class="hint">${esc(res.note)}</p>` : '') +
       errs.map((i) => `<div class="issue err"><span class="lv">错误</span>
         <span><code>${esc(i.code)}</code> @ <code>${esc(i.at)}</code>：${esc(i.message)}${
-        i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('');
+        i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('') + warnsHtml;
     $('igDecisions').innerHTML = '';
     $('igRun').disabled = true;
     $('igRun').textContent = '确认无误，落库';
@@ -319,7 +343,8 @@ function renderIgPlan(res) {
     </div>
     ${res.note ? `<p class="hint">${esc(res.note)}</p>` : ''}
     ${blocks.map(igBlockHtml).join('')}
-    ${igPlanLists(res)}`;
+    ${igPlanLists(res)}
+    ${warnsHtml}`;
 
   renderIgDecisions(need);
   igSyncRun();
