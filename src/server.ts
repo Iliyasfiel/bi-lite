@@ -202,7 +202,7 @@ const routes: Record<string, Handler> = {
     let archived = true;
     try {
       const { archiveParquet } = await import('./import/longtable.ts');
-      await archiveParquet(batchId);
+      await archiveParquet(batchId, result.inserted);
     } catch (e) {
       // 归档失败不影响主链路（查询不依赖 Parquet），但绝不静默 —— 见 §4.4
       archived = false;

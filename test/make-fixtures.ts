@@ -250,3 +250,63 @@ sheets:
 `,
 );
 console.log(`✅ 长表接入规格: ${LONG_SPEC}  (与旧长表路径同一份源，供对拍)`);
+
+// ============ 5. 主数据对齐的场景源（e2e 第 15 阶段用）============
+// 每个场景 = 一份 xlsx + 一份规格。长表形状（一行一条事实，四个坐标全在列里）。
+//
+// ★ 为什么规格用 `onConflict: replace`：这些场景刻意落在**种子数据已有的坐标**上
+//   （2026-01..06 × 营业收入 × 本年累计），而旧路（longtable）的语义就是 upsert。
+//   新路默认是 `reject` —— 用默认值会先撞库拒绝，把"主数据对齐"验成"撞库拒绝"，
+//   场景就偏了。顺带这也头一次把 `onConflict: replace` 这条分支纳入门禁。
+//
+// ★ 为什么不用同一份源：每个场景要**独立成批**（Tier 1 自动归并 → Tier 2 交人拍板 →
+//   人拍板后落库 → 下月自动命中），批次不能混。
+const ALIGN_SCENARIOS: Array<{ id: string; rows: Array<[company: string, month: string, amount: number]> }> = [
+  { id: '接入-对齐1', rows: [['（集团公司）', '2026-01', 100], ['（集团公司）', '2026-02', 200]] },
+  { id: '接入-对齐2', rows: [['华东分公司', '2026-03', 300], ['西北子公司', '2026-03', 400]] },
+  { id: '接入-对齐3', rows: [['华东分公司', '2026-04', 500]] },
+  { id: '接入-对齐4', rows: [['华南分公司', '2026-05', 1]] },
+  { id: '接入-对齐5', rows: [['华北分公司', '2026-06', 1]] },
+];
+
+for (const s of ALIGN_SCENARIOS) {
+  const src = `test/fixtures/${s.id}.xlsx`;
+  const wbA = new ExcelJS.Workbook();
+  const wsA = wbA.addWorksheet('财务快报');
+  wsA.addRow(['财务期', '公司名称', '指标名称', '口径', '金额']);
+  for (const [company, month, amount] of s.rows) {
+    wsA.addRow([`${month}-01`, company, '营业收入', '本年累计', amount]);
+  }
+  for (let c = 1; c <= 5; c++) wsA.getColumn(c).width = 16;
+  await wbA.xlsx.writeFile(src);
+
+  fs.writeFileSync(
+    `test/fixtures/${s.id}.yaml`,
+    `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— 主数据对齐的场景夹具。
+# onConflict: replace 是刻意的：这些坐标在种子数据里已有值，场景要验的是"归并/拍板"，
+# 不是"撞库拒绝"（旧长表路径的语义本来就是 upsert）。
+id: ${s.id}-夹具
+source: ${src}
+onConflict: replace
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 财务快报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+        values:
+          columns: [E]
+`,
+  );
+}
+console.log(`✅ 主数据对齐场景源: ${ALIGN_SCENARIOS.length} 组（${ALIGN_SCENARIOS.map((s) => s.id).join(', ')}）`);

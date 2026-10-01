@@ -105,7 +105,30 @@ function landableSource(source: string | undefined): string | null {
   }
 }
 
-export async function runIngest(spec: IngestSpec, opts: IngestRunOptions): Promise<IngestRunResult> {
+/**
+ * 落库的**串行队列**：DuckDB 的事务是挂在**连接**上的状态，而下面这段有 `BEGIN`/`COMMIT`。
+ * 两个落库并发进来（两个标签页、连点两次、将来某个批量任务），后一个的 `BEGIN` 会撞进
+ * 前一个还没提交的事务里 —— **实测**：`cannot start a transaction within a transaction`，
+ * 而且因为共享一条连接，前者的 `ROLLBACK` 会把后者连坐成 `Current transaction is aborted`：
+ * 五个并发请求**全灭**，错误信息还是 DuckDB 的内部黑话。
+ * （数据没坏 —— 回滚是原子的、批次一行不多，但用户动作一个都没成。）
+ * 所以同一进程内一次只跑一个落库，其余的排队。
+ *
+ * ★ 干跑（`planOnly`）**不进队列**：它一次库都不写，排队只会把只读操作也白白串行化。
+ * ★ 队列自己不能被一次失败卡死 —— "一个 rejected 的 promise 污染整条链"是这里最容易踩的坑。
+ */
+let ingestQueue: Promise<unknown> = Promise.resolve();
+
+export function runIngest(spec: IngestSpec, opts: IngestRunOptions): Promise<IngestRunResult> {
+  if (opts.planOnly) return runIngestInner(spec, opts);
+  const run = () => runIngestInner(spec, opts);
+  // `then(run, run)`：前一个无论成功还是失败，都接着跑下一个
+  const next = ingestQueue.then(run, run);
+  ingestQueue = next.catch(() => undefined);
+  return next;
+}
+
+async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise<IngestRunResult> {
   const rows: IngestFactRow[] = [];
   const onEmptyMeasure = spec.onEmptyMeasure ?? 'skip';
 
@@ -495,8 +518,11 @@ export async function runIngest(spec: IngestSpec, opts: IngestRunOptions): Promi
     mkdirSync(dir, { recursive: true });
     await exportParquet(
       `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)}) TO '${dir}/part.parquet' (FORMAT parquet)`,
+      // ★ 写完读回来数一遍：归档曾经"静默写出空文件"而 archived 还报 true（§4 备忘 13）。
+      { path: `${dir}/part.parquet`, rows: inserted },
     );
   } catch (e) {
+    // 归档失败**不影响落库**（查询不依赖 Parquet），但绝不静默 —— 回传 archived=false 并留痕
     archived = false;
     const msg = `归档写入失败（数据已落库，不影响查询）：${(e as Error).message}`;
     await execute(`UPDATE import_batch SET note = ${lit(msg)} WHERE batch_id = ${lit(batchId)}`);

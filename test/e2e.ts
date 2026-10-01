@@ -849,6 +849,9 @@ let mcpSkipReason = '';
 //   实测教训：改 lint 规则后 E2E 少了 2 项断言（generate_spec 那三条），
 //   打印的却是"通过 190 / 失败 0"，差点当成回归通过。
 let mcpFinished = false;
+/** 给 MCP 子进程用的库副本（见下面那段"单写者约束"的注释）。声明在 try 之外，清理时才看得见 */
+const MCP_DIR = 'data/e2e';
+const MCP_DB = `${MCP_DIR}/mcp.duckdb`;
 try {
   const { Client } = await import(SDK_DIR + 'index.mjs');
   const { StdioClientTransport } = await import(SDK_DIR + 'stdio.mjs');
@@ -858,11 +861,22 @@ try {
     { name: 'bi-lite-e2e', version: '0.0.1' },
     { capabilities: {}, versionNegotiation: { mode: 'auto' } },
   );
+  // ★ 单写者约束：MCP 子进程要开库，而主库被**本进程**握着（DuckDB 单写者，AGENTS.md §4 备忘 5）。
+  //   所以给子进程跑一份**库的副本**：先 CHECKPOINT（把 WAL 落平，之后字节拷贝就是一致快照），
+  //   再拷一份，用 `BILITE_DB` 指给子进程。
+  //   为什么不"让子进程开主库"：那是两个写者同时改一个文件 —— 而它正是 §4 备忘 13 里
+  //   "让子进程开主库"是**两个写者同时改一个文件** —— 而它正是 §4 备忘 13 里
+  //   "归档静默写成空文件"的成因（实测：第二个进程一进来，主进程后续的归档全读到过期视图）。
+  await db.execute('CHECKPOINT');
+  fs.mkdirSync(MCP_DIR, { recursive: true });
+  fs.copyFileSync('data/bi.duckdb', MCP_DB);
+
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
       args: ['src/mcp/server.ts'],
       cwd: process.cwd(),
+      env: { ...process.env, BILITE_DB: MCP_DB },
       stderr: 'ignore', // 服务端日志走 stderr，别污染测试输出
     }),
   );
@@ -1284,6 +1298,8 @@ sheets:
 } catch (e) {
   mcpSkipReason = (e as Error).message;
 }
+// 子进程用的那份库副本用完就清掉（它只是为了让 MCP 子进程独占一个库）
+fs.rmSync(MCP_DIR, { recursive: true, force: true });
 
 if (!mcpOk) {
   check('MCP 阶段可运行', false, mcpSkipReason);
@@ -1514,6 +1530,10 @@ sheets:
 log('\n════════ 15. 主数据对齐（R1）════════');
 {
   const R = await import('../src/import/resolve.ts');
+  const { parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
 
   // --- 规范化只去格式噪音，不改语义 ---
   check('全角转半角 + 去空白', R.normalizeName('　集团公司　') === '集团公司');
@@ -1531,17 +1551,24 @@ log('\n════════ 15. 主数据对齐（R1）═══════
   const HZ = await db.query<{ id: string }>(`SELECT id FROM dim_company WHERE name = '华东子公司'`);
   check('已有 4 家公司主数据', beforeCompanies === 4, `${beforeCompanies}`);
 
-  /** 造一行：同一家公司、同一个指标、同一个口径，只是月份不同 —— 用于试提交 */
-  const row = (company: string, month: string, amount: number): LongRow => ({
-    fin_month: `${month}-01`,
-    company,
-    metric: '营业收入',
-    period_type: '本年累计',
-    amount,
-  });
+  /**
+   * 跑一个「主数据对齐」场景：源是夹具里的一张小长表，走**新接入路径**。
+   *
+   * ★ 以前这里是手工造行、调旧路的 `commit(batchId, rows)`。新路径只吃**文件**，
+   *   所以场景源改由 `npm run fixtures` 生成（见 make-fixtures 第 5 段）。
+   *   规格里 `onConflict: replace` 对应旧路的 upsert 语义 —— 这些坐标在种子数据里已有值，
+   *   场景要验的是"归并 / 拍板"，不是"撞库拒绝"。
+   */
+  const runScenario = async (
+    name: string,
+    opts: { decisions?: Array<{ kind: 'company' | 'metric'; raw: string; action: 'merge' | 'create'; targetId?: string; note?: string }>; strict?: boolean } = {},
+  ) => {
+    const spec = parseIngestSpec(fs.readFileSync(`test/fixtures/${name}.yaml`, 'utf8'));
+    return runIngest(spec, { catalog: await masterCatalog(), autoCreateDims: true, ...opts });
+  };
 
   // --- Tier 1：纯格式差异 → 自动归并，不打扰人 ---
-  const t1 = await commit('b_tier1', [row('（集团公司）', '2026-01', 100), row('（集团公司）', '2026-02', 200)]);
+  const t1 = await runScenario('接入-对齐1');
   check('★ Tier 1 纯格式差异自动归并（不再问人）', t1.needsDecision.length === 0 && t1.inserted === 2, `inserted=${t1.inserted}`);
   check('自动归并留痕（看得见并进了谁）', t1.merged.length === 1 && t1.merged[0].target === '集团公司', JSON.stringify(t1.merged[0] ?? {}));
   check('归并未新建公司主数据', t1.createdCompanies.length === 0);
@@ -1552,7 +1579,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
   check('★ 归并后公司数不变（钱没被拆到两条主数据上）', afterT1 === beforeCompanies, `${afterT1}`);
 
   // --- Tier 2：像已有实体但不确定 → 拒绝写库，交给人拍板 ---
-  const t2 = await commit('b_tier2', [row('华东分公司', '2026-03', 300), row('西北子公司', '2026-03', 400)]);
+  const t2 = await runScenario('接入-对齐2');
   check('★ Tier 2 疑似已有主数据 → 拦下要人确认', t2.needsDecision.length === 1, `${t2.needsDecision.length} 条待确认`);
   check('待确认项带候选与出现行数', t2.needsDecision[0]?.raw === '华东分公司' && t2.needsDecision[0].rows === 1
     && t2.needsDecision[0].candidates.some((c) => c.name === '华东子公司'), JSON.stringify(t2.needsDecision[0]?.candidates ?? []));
@@ -1571,7 +1598,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
     `待确认: ${t2.needsDecision.map((d) => d.raw).join(', ')}`);
 
   // --- 人拍板：把「华东分公司」并入「华东子公司」---
-  const t3 = await commit('b_tier3', [row('华东分公司', '2026-03', 300), row('西北子公司', '2026-03', 400)], {
+  const t3 = await runScenario('接入-对齐2', {
     decisions: [{ kind: 'company', raw: '华东分公司', action: 'merge', targetId: HZ[0].id, note: 'e2e 人工确认' }],
   });
   check('人确认后可提交', t3.needsDecision.length === 0 && t3.inserted === 2, `inserted=${t3.inserted}`);
@@ -1587,8 +1614,8 @@ log('\n════════ 15. 主数据对齐（R1）═══════
        AND period_type = '本年累计'`,
   );
   check('★ 「华东分公司」的钱确实记在「华东子公司」名下',
-    hzRows.length === 1 && Number(hzRows[0].amount) === 300 && hzRows[0].batch_id === 'b_tier3',
-    `${JSON.stringify(hzRows[0] ?? {})}`);
+    hzRows.length === 1 && Number(hzRows[0].amount) === 300 && hzRows[0].batch_id === t3.batchId,
+    `${JSON.stringify(hzRows[0] ?? {})}（本批 ${t3.batchId}）`);
 
   const aliasRows = await db.query<{ normalized: string; target_id: string; alias: string }>(
     `SELECT normalized, target_id, alias FROM dim_alias WHERE kind = 'company' AND normalized = '华东分公司'`,
@@ -1598,7 +1625,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
     JSON.stringify(aliasRows));
 
   // --- 关键：下个月同样的写法，不再问第二遍 ---
-  const t4 = await commit('b_tier4', [row('华东分公司', '2026-04', 500)]);
+  const t4 = await runScenario('接入-对齐3');
   check('★ 人确认过一次后，下月自动命中 Tier 1（一次人工投入换永久自动）',
     t4.needsDecision.length === 0 && t4.inserted === 1 && t4.createdCompanies.length === 0,
     `inserted=${t4.inserted} 待确认=${t4.needsDecision.length}`);
@@ -1606,7 +1633,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
   // --- 别名指向诚实性：不存在的目标必须报错，不能造出指向虚空的别名 ---
   let badTarget = '';
   try {
-    await commit('b_bad', [row('华南分公司', '2026-05', 1)], {
+    await runScenario('接入-对齐4', {
       decisions: [{ kind: 'company', raw: '华南分公司', action: 'merge', targetId: 'c_不存在' }],
     });
   } catch (e) {
@@ -1615,21 +1642,21 @@ log('\n════════ 15. 主数据对齐（R1）═══════
   check('★ 并入不存在的目标 → 报错（否则会造出指向虚空的自动别名）', /目标主数据不存在/.test(badTarget), badTarget);
 
   // --- strict 模式：抛错而不是回结论 ---
-  const strictRows = [row('华北分公司', '2026-06', 1)];
   let strictMsg = '';
   try {
-    await commit('b_strict', strictRows, { strict: true });
+    await runScenario('接入-对齐5', { strict: true });
   } catch (e) {
     strictMsg = (e as Error).message;
   }
   check('strict 模式遇歧义直接抛错', /需要人工确认后才能提交/.test(strictMsg), strictMsg.slice(0, 60));
 
-  // --- 未识别清单要按出现行数排序（人先看覆盖数据最多的那个）---
-  const staged3 = await stage(LONG, '财务快报');
-  check('stage 输出 unresolved 候选清单', Array.isArray(staged3.unresolved.companies) && Array.isArray(staged3.unresolved.metrics));
+  // --- 未识别清单（人先看覆盖数据最多的那个）---
+  const dry3 = await dryRunIngest(longSpec, { catalog: await masterCatalog() });
+  check('干跑输出未识别清单（替代旧路的 stage().unresolved）',
+    Array.isArray(dry3.blocks[0]!.unmatched));
   check('★ 重复导入相同名字不再报未识别（已全部建维 + 别名命中）',
-    staged3.unknownCompanies.length === 0 && staged3.unknownMetrics.length === 0,
-    `公司 ${staged3.unknownCompanies.length} / 指标 ${staged3.unknownMetrics.length}`);
+    dry3.blocks[0]!.unmatched.length === 0,
+    `未识别 ${dry3.blocks[0]!.unmatched.map((u) => u.name).join(', ') || '（无）'}`);
 }
 
 // ============ 16. 着陆层：源文件原样留存（可重放的依据）============
@@ -2368,6 +2395,45 @@ sheets:
     check('⑦ app.js 调的是**新路径**的那五条路由（不是又绕回旧路径）',
       ['/api/ingest/upload', '/api/ingest/lint', '/api/ingest/dry-run', '/api/ingest/run', '/api/ingest/save']
         .every((p) => appjs.includes(p)));
+
+    // —— ⑧ 并发落库：旧路那条"连点两次不该整批挂"的回归防线，迁到新路径 ——
+    //    ★ 实测过：不串行化的话五个并发**全灭**（DuckDB 的事务挂在连接上，
+    //      后一个的 BEGIN 撞进前一个未提交的事务 → `cannot start a transaction within a transaction`，
+    //      前者的 ROLLBACK 还会把后者连坐成 `transaction is aborted`）。
+    //      所以 runIngest 内部排队；这条断言守住"排队这件事还在"。
+    const alignYaml = fs.readFileSync('test/fixtures/接入-对齐1.yaml', 'utf8');
+    const beforeConc = Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM import_batch'))[0]!.n);
+    const conc = await Promise.all(
+      [1, 2, 3, 4, 5].map(() => post2('/api/ingest/run', { yaml: alignYaml, decisions: [] })),
+    );
+    const concIds = conc.map((r: any) => r.batchId).filter(Boolean) as string[];
+    check('⑧ ★ 5 个并发落库全部成功、批次 id 两两不同（连点两次不该整批失败）',
+      conc.every((r: any) => r.ok === true) && concIds.length === 5 && new Set(concIds).size === 5,
+      `${conc.filter((r: any) => r.ok).length}/5 成功；id 去重后 ${new Set(concIds).size} 个`);
+    check('⑧ 并发后没留下半成品批次（全部 committed）',
+      Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM import_batch'))[0]!.n) === beforeConc + 5 &&
+        Number((await db.query<{ n: number }>(
+          `SELECT count(*) AS n FROM import_batch WHERE batch_id IN (${concIds.map((i) => `'${i}'`).join(',')}) AND status = 'committed'`,
+        ))[0]!.n) === 5,
+      `${beforeConc} → ${Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM import_batch'))[0]!.n)}`);
+
+    // —— ⑨ 归档要**真的能读回**（不只是 archived:true）——
+    //    旧路那条断言是为"Parquet 归档静默失效多轮"立的（裸 catch{} 吞了 COPY 失败）。
+    //    新路径也必须证明归档文件本身有效，而不是只信那个 boolean。
+    let archN = -1;
+    if (done?.batchId) {
+      const { DuckDBInstance } = await import('@duckdb/node-api');
+      const verify = await DuckDBInstance.create();
+      const vc = await verify.connect();
+      const vr = await vc.runAndReadAll(
+        `SELECT count(*) AS n FROM read_parquet('data/parquet/fact_finance/batch=${done.batchId}/part.parquet')`,
+      );
+      archN = Number((vr.getRowObjectsJson() as any[])[0].n);
+      vc.closeSync();
+      verify.closeSync();
+    }
+    check('⑨ ★ 新路径的归档文件可被 DuckDB 读回，行数 = 本批写入数',
+      archN === (done?.inserted ?? -2), `parquet ${archN} 行 / 本批 ${done?.inserted ?? '—'} 行`);
   } finally {
     stop();
   }

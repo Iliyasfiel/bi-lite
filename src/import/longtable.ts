@@ -501,12 +501,15 @@ function entityId(kind: DimKind, raw: string): string {
  * `enable_external_access=false`（见 src/db/index.ts），`COPY ... TO` 会被直接拒绝。
  * 归档实例是 READ_ONLY 的，因此不可能反过来改动主库。
  */
-export async function archiveParquet(batchId: string) {
+export async function archiveParquet(batchId: string, expectRows?: number) {
   const dir = `data/parquet/fact_finance/batch=${batchId}`;
   fs.mkdirSync(dir, { recursive: true });
+  const path = `${dir}/part.parquet`;
   await exportParquet(
     `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)})
-     TO '${dir}/part.parquet' (FORMAT parquet)`,
+     TO '${path}' (FORMAT parquet)`,
+    // 与接入层同款：写完读回来数一遍，空归档不许安静过关（见 db/index.ts 的注释）
+    expectRows === undefined ? undefined : { path, rows: expectRows },
   );
 }
 
