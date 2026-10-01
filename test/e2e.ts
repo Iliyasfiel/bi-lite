@@ -177,27 +177,43 @@ fs.rmSync('data/parquet', { recursive: true, force: true });
 await db.open('data/bi.duckdb');
 check('DuckDB 打开 + 建表', true);
 
-// ============ 2. 导入：STAGED ============
-log('\n════════ 2. 导入（STAGED 校验）════════');
-const staged = await stage(LONG, '财务快报');
-log(`  batch=${staged.batchId} status=${staged.status} rows=${staged.rowCount}`);
-log(`  未识别公司 ${staged.unknownCompanies.length} 个: ${staged.unknownCompanies.join(', ')}`);
-log(`  未识别指标 ${staged.unknownMetrics.length} 个: ${staged.unknownMetrics.join(', ')}`);
-check('识别出全部 4 家公司为未识别（首次导入）', staged.unknownCompanies.length === 4);
-check('识别出全部 5 个指标为未识别', staged.unknownMetrics.length === 5);
-check('唯一性无重复', !staged.issues.some((i) => i.level === 'error' && i.message.includes('重复坐标')));
-check('无 error 级问题', staged.status === 'staged', `issues=${staged.issues.length}`);
-log(`  类型推断采样 ${staged.sample.length} 行（max-inferred-lines）`);
+// ============ 2. 接入规格：干跑（形状与判定，一次库都不写）============
+log('\n════════ 2. 接入规格（干跑）════════');
+// ★ 种子数据改由**新接入路径**灌（原来是旧长表路径的 `stage()` / `commit()`）。
+//   这是"退场"的前置：第 3 片要删掉旧路，而后面每个阶段都靠这 960 行活着。
+//   用法对应关系：干跑 ↔ 旧路的 STAGED 校验（都不写库）；`runIngest` ↔ `commit`。
+//   ⚠️ 新路径的关卡 0 会**先着陆**（raw_file/raw_cell），所以到这里 raw 库里已经有这份长表了 ——
+//      第 16 阶段那几条 `raw_file` 计数断言因此改成"相对增量"。
+const { parseIngestSpec } = await import('../src/ingest/types.ts');
+const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
+const { runIngest } = await import('../src/ingest/run.ts');
+const { masterCatalog } = await import('../src/ingest/master.ts');
 
-// ============ 3. 提交 ============
-log('\n════════ 3. 提交（COMMIT）════════');
-const rows: LongRow[] = await readLongTable(LONG, '财务快报');
+const longSpec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'));
+const dry0 = await dryRunIngest(longSpec, { catalog: await masterCatalog() });
+const shape0 = dry0.blocks[0]!;
+const unCompany = shape0.unmatched.filter((u) => u.kind === 'company');
+const unMetric = shape0.unmatched.filter((u) => u.kind === 'metric');
+log(`  形状：${shape0.dataRows} 行数据 × ${shape0.valueColumns.length} 个值列 = ${shape0.coordinates.total} 个坐标`);
+log(`  未识别公司 ${unCompany.length} 个: ${unCompany.map((u) => u.name).join(', ')}`);
+log(`  未识别指标 ${unMetric.length} 个: ${unMetric.map((u) => u.name).join(', ')}`);
+check('识别出全部 4 家公司为未识别（首次导入）', unCompany.length === 4, `${unCompany.length}`);
+check('识别出全部 5 个指标为未识别', unMetric.length === 5, `${unMetric.length}`);
+check('无 error 级问题（形状对得上）', dry0.ok === true, `issues=${dry0.issues.length}`);
+check('形状里没有重复坐标（唯一性）',
+  shape0.coordinates.duplicates.length === 0 && !dry0.issues.some((i) => i.code === 'ROWKEY_DUPLICATE_IN_FILE'),
+  `重复坐标 ${shape0.coordinates.duplicates.length} 处`);
+
+// ============ 3. 落库 ============
+log('\n════════ 3. 落库 ════════');
 const t0 = Date.now();
-const res = await commit(staged.batchId, rows);
+const res = await runIngest(longSpec, { catalog: await masterCatalog(), autoCreateDims: true });
 const importMs = Date.now() - t0;
 log(`  写入 ${res.inserted} 行，用时 ${importMs}ms`);
 log(`  自动创建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个`);
 check('写入行数 = 960', res.inserted === 960, `${res.inserted}`);
+check('新建了 4 家公司 / 5 个指标', res.createdCompanies.length === 4 && res.createdMetrics.length === 5,
+  `${res.createdCompanies.length}/${res.createdMetrics.length}`);
 
 const cnt = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
 check('事实表行数正确', Number(cnt[0].n) === 960, `${cnt[0].n}`);
@@ -1631,26 +1647,37 @@ log('\n════════ 16. 着陆层 raw（幂等与保真）═══�
   };
 
   // —— 首次着陆 ——
+  // ★ 计数一律用**相对增量**：种子数据（第 2/3 阶段）现在也走新接入路径，
+  //   而它的关卡 0 会先着陆 —— 于是到这里 raw_file 里已经有长表了。
+  //   写死 "=== 1" 就等于把"前面有没有别的阶段先着陆过"这件事编进断言（很脆）。
+  const countRawFiles = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM raw_file'))[0]!.n);
+  const rawFiles0 = await countRawFiles();
   const first = await landRawFile(TPLFIX);
-  check('★ 着陆一份源文件：raw_file 记一行、raw_cell 记 N 格',
-    first.reused === false && first.cellsWritten > 0 && (await countCells(first.fileHash)) === first.cellsWritten,
+  check('★ 着陆一份源文件：raw_cell 记 N 格，且与库里逐格对得上',
+    first.reused === false && first.cellsWritten > 0 &&
+      (await countCells(first.fileHash)) === first.cellsWritten,
     `written=${first.cellsWritten} sheets=${first.sheets.length}`);
-  check('raw_file 的行数 = 着陆过的文件数',
-    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM raw_file'))[0]!.n) === 1);
+  check('raw_file 的行数 = 着陆过的文件数（相对增量）',
+    (await countRawFiles()) === rawFiles0 + 1, `${rawFiles0} → ${await countRawFiles()}`);
 
   // —— 幂等：同一份文件再跑一次，一格都不该被重写 ——
   const second = await landRawFile(TPLFIX);
   check('★ 同一份文件跑两次 → raw_cell 行数不变（幂等）',
     second.reused === true && second.cellsWritten === 0 &&
-      (await countCells(first.fileHash)) === first.cellsWritten,
+      (await countCells(first.fileHash)) === first.cellsWritten &&
+      (await countRawFiles()) === rawFiles0 + 1,
     `reused=${second.reused} written=${second.cellsWritten}`);
   check('★ 幂等走的是 file_hash，不是文件名', second.fileHash === first.fileHash);
 
   // —— 换一份文件：互不覆盖 ——
-  const other = await landRawFile(LONGFIX);
+  //    ⚠️ 这里**不能**再用 `LONGFIX`：那份长表已经被种子数据着陆过了，
+  //       它会走"复用"分支（cellsWritten=0），这条断言就不再是"换个文件各自成批"。
+  //       改用一个此刻还没着陆过的源（接入路径的夹具）—— 它后面被第 17 阶段再着陆时是复用，无损。
+  const other = await landRawFile('test/fixtures/月度经营接入源.xlsx');
   check('不同文件各自成批，互不覆盖',
-    other.fileHash !== first.fileHash &&
-      Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM raw_file'))[0]!.n) === 2 &&
+    other.reused === false && other.fileHash !== first.fileHash && other.cellsWritten > 0 &&
+      (await countRawFiles()) === rawFiles0 + 2 &&
       (await countCells(first.fileHash)) === first.cellsWritten,
     `另一份 ${other.cellsWritten} 格`);
 
