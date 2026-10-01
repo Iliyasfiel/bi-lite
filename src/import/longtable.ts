@@ -11,6 +11,11 @@ import fs from 'node:fs';
 import { execute, exportParquet } from '../db/index.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { buildResolver, registerAlias, normalizeName, describeUnresolved, type UnresolvedName, type DimKind } from './resolve.ts';
+// DimDecision 已搬到接入层（src/ingest/types.ts）—— 旧长表导入只是它的第一个调用方。
+// ★ 必须 import 进来再 export：只写 export ... from 不会把名字带进本地作用域，
+//   而本文件内部还在用它（commit() 的 decided 表）→ 会变成 ReferenceError。
+import type { DimDecision } from '../ingest/types.ts';
+export type { DimDecision };
 
 export interface LongRow {
   fin_month: string;    // YYYY-MM-DD
@@ -261,18 +266,6 @@ export async function stage(filePath: string, sheetName?: string): Promise<Stage
     issues,
     sample: rows.slice(0, MAX_INFERRED_LINES),
   };
-}
-
-/** 人工对一个未识别名称的处置决定（来自 Web 确认界面或 CLI） */
-export interface DimDecision {
-  kind: DimKind;
-  /** 导入文件里的原始写法 */
-  raw: string;
-  /** merge = 并入已有主数据（会写进 dim_alias）；create = 确实是个新实体 */
-  action: 'merge' | 'create';
-  /** action='merge' 时必填：并入哪条 */
-  targetId?: string;
-  note?: string;
 }
 
 export interface CommitOptions {

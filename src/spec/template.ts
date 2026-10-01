@@ -10,14 +10,47 @@ import XLSXPopulate from 'xlsx-populate';
 import type { Workbook, Sheet } from 'xlsx-populate';
 import { parseRef, toRef, readNumberFormat } from '../render/excel.ts';
 
-/** 标签扫描上限（防止一个畸形模板把整张表灌进上下文） */
-export const TEXT_SCAN_LIMIT = 40;
+/**
+ * 「可读工作簿」的**最小结构** —— 只列读取侧真正用到的那几个方法。
+ *
+ * ★ 为什么要这组接口，而不是在签名里写死 `Sheet` / `Workbook`：
+ *   接入层需要能**从 `raw_cell` 读**（而不是每次都去开 xlsx），这要求一个
+ *   "长得像工作簿"的适配器（`src/land/read.ts`）。若签名写死具体类，
+ *   适配器就只能靠 `as` 骗过类型 —— 那种"类型撒谎"的适配器最容易在下一次改动时静默错位。
+ *   `xlsx-populate` 的 `Sheet` / `Workbook` **结构上满足**这组接口，故既有调用点一行都不用改。
+ */
+export interface ReadableCell {
+  value(): unknown;
+  formula?(): string | null;
+}
+
+export interface ReadableSheet {
+  name(): string;
+  cell(row: number, col: number): ReadableCell;
+}
+
+export interface ReadableWorkbook {
+  sheets(): ReadableSheet[];
+  sheet(name: string): ReadableSheet | undefined;
+}
+
+/**
+ * 扫描的安全上限（防止一个畸形模板把推断变成 O(n²)）。
+ *
+ * ★ 关键不是"有上限"，而是**撞到上限必须上报**。
+ *   实测教训：这里原本是固定的 40，而一份真实财务报表模板有 130 行指标 ——
+ *   后 90 行被无声吞掉，唯一的信号是一句「模板预置的行标签比注册表少 90 项」，
+ *   把读取侧的截断说成了模板的漏写。人于是去改模板，而模板本来是对的。
+ *   上限是防线，静默才是 bug：readRegion 撞上限时返回 clip，由推断器变成 error。
+ */
+export const MAX_SCAN_ROWS = 2000;
+export const MAX_SCAN_COLS = 256;
 
 /**
  * 只取**文本**单元格。模板里若残留数字（脏模板），一律返回 null ——
  * 这是 "模板必须为空表"（AGENTS.md 铁律 3 注）在读取侧的对应防线。
  */
-export function textAt(sheet: Sheet, row: number, col: number): string | null {
+export function textAt(sheet: ReadableSheet, row: number, col: number): string | null {
   if (row < 1 || col < 1) return null;
   try {
     const v = sheet.cell(row, col).value();
@@ -107,12 +140,12 @@ export async function readTemplateSchema(template: string): Promise<TemplateSche
     const labelsLeft: string[] = [];
     if (sheet) {
       // 表头在锚点上方一行、行标签在锚点左方一列 —— 本项目的模板约定
-      for (let c = parsed.col, n = 0; n < TEXT_SCAN_LIMIT; n++, c++) {
+      for (let c = parsed.col, n = 0; n < MAX_SCAN_COLS; n++, c++) {
         const t = textAt(sheet, parsed.row - 1, c);
         if (t === null) break;
         headerAbove.push(t);
       }
-      for (let r = parsed.row, n = 0; n < TEXT_SCAN_LIMIT; n++, r++) {
+      for (let r = parsed.row, n = 0; n < MAX_SCAN_ROWS; n++, r++) {
         const t = textAt(sheet, r, parsed.col - 1);
         if (t === null) break;
         labelsLeft.push(t);
@@ -151,6 +184,16 @@ export interface Region {
   rows: RegionRow[];
   /** 模板数据区第一个数据格的数字格式（非 General 时才值得写进 spec） */
   format: string | null;
+  /**
+   * 撞到安全上限的轴（空数组 = 读到了自然边界）。
+   * ★ 非空意味着"下面/右边还有内容没读" —— 调用方必须变成 error，不得静默继续。
+   */
+  clip: Array<{ axis: 'rows' | 'cols'; limit: number }>;
+  /**
+   * 数据区里「有值但不是文本」的格子坐标（脏模板信号）。
+   * 只给坐标、不给值 —— 铁律 1 在读取层就由 textAt 的返回类型保证。
+   */
+  strayDataCells: string[];
 }
 
 /**
@@ -165,7 +208,9 @@ export function readRegion(wb: Workbook, sheetName: string, row: number, col: nu
   if (!sheet) throw new Error(`模板中没有 sheet: ${sheetName}`);
 
   const colLabels: string[] = [];
-  for (let c = col, n = 0; n < TEXT_SCAN_LIMIT; n++, c++) {
+  let colClip = false;
+  for (let c = col, n = 0; ; n++, c++) {
+    if (n >= MAX_SCAN_COLS) { colClip = true; break; }
     const t = textAt(sheet, row - 1, c);
     if (t === null) break;
     colLabels.push(t);
@@ -173,7 +218,10 @@ export function readRegion(wb: Workbook, sheetName: string, row: number, col: nu
   const width = Math.max(colLabels.length, 1);
 
   const rows: RegionRow[] = [];
-  for (let r = row, n = 0; n < TEXT_SCAN_LIMIT; n++, r++) {
+  const strayDataCells: string[] = [];
+  let rowClip = false;
+  for (let r = row, n = 0; ; n++, r++) {
+    if (n >= MAX_SCAN_ROWS) { rowClip = true; break; }
     const label = textAt(sheet, r, col - 1);
     const formulas: string[] = [];
     let hasData = false;
@@ -181,7 +229,12 @@ export function readRegion(wb: Workbook, sheetName: string, row: number, col: nu
       const f = formulaAt(sheet, r, c);
       if (f) formulas.push(f);
       const v = sheet.cell(r, c).value();
-      if (v !== null && v !== undefined && v !== '') hasData = true;
+      if (v !== null && v !== undefined && v !== '') {
+        hasData = true;
+        // 模板应当是空表：有值却不是文本 → 残留了数字/日期，渲染时会被覆盖，
+        // 更糟的是它可能被当成本期实际数看。只记坐标（铁律 1），且不堆长列表。
+        if (typeof v !== 'string' && strayDataCells.length < 20) strayDataCells.push(toRef(r, c));
+      }
     }
     // 标签、公式、数据三者皆无 → 数据区到此为止
     if (label === null && formulas.length === 0 && !hasData) break;
@@ -196,6 +249,10 @@ export function readRegion(wb: Workbook, sheetName: string, row: number, col: nu
     format = null;
   }
 
+  const clip: Region['clip'] = [];
+  if (rowClip) clip.push({ axis: 'rows', limit: MAX_SCAN_ROWS });
+  if (colClip) clip.push({ axis: 'cols', limit: MAX_SCAN_COLS });
+
   return {
     sheet: sheetName,
     anchor: { ref: toRef(row, col), row, col },
@@ -203,7 +260,108 @@ export function readRegion(wb: Workbook, sheetName: string, row: number, col: nu
     rowLabels: rows.map((r) => r.label).filter((l): l is string => l !== null),
     rows,
     format,
+    clip,
+    strayDataCells,
   };
+}
+
+/**
+ * 模板里**写着的期数**（如 B 列「期数」= 2026-06）。
+ *
+ * 报送模板几乎都会把"这张表是哪一期"印在表头上，而它正是 spec 里 params 的来源。
+ * 不读它的后果实测过：推断器把 year/month 硬编码成 2026/6，模板写 2026-05 也照填 6 月。
+ *
+ * 只认两种确定性布局，认不出就返回 null（不猜）：
+ *   ① 一整列期数（表头「期数/期间/会计期间/报告期/年月」），列内取值一致
+ *   ② 分开的「年份」列 + 「月份」列
+ */
+export interface PeriodHint {
+  year: number;
+  month: number;
+  /** 证据：表头格坐标 + 取值格坐标（只给坐标，不给值 —— 铁律 1） */
+  evidence: string;
+}
+
+const PERIOD_HEADER = /^(期数|期间|会计期间|报告期|所属期|年月|期间数)$/;
+const YEAR_HEADER = /^(年份|年度|年)$/;
+const MONTH_HEADER = /^(月份|月)$/;
+
+/** `2026-06` / `2026/6` / `2026年6月` / `202606` → {year, month}；认不出返回 null */
+export function parsePeriodText(s: string): { year: number; month: number } | null {
+  const t = s.trim();
+  const m = /^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*月?$/.exec(t) ?? /^(\d{4})(\d{2})$/.exec(t);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  if (!(year >= 1900 && year <= 2200) || !(month >= 1 && month <= 12)) return null;
+  return { year, month };
+}
+
+/**
+ * 从表头行（锚点上一行）的**左侧上下文列**里读期数。
+ * 只看 col-2 往左（col-1 是行标签列本身），取值须落在数据区的行范围内且保持一致。
+ */
+export function readPeriodHint(
+  wb: ReadableWorkbook,
+  sheetName: string,
+  row: number,
+  col: number,
+  rowCount: number,
+): PeriodHint | null {
+  const sheet = wb.sheet(sheetName);
+  if (!sheet || col - 2 < 1 || rowCount < 1) return null;
+
+  const headerAt = (c: number) => textAt(sheet, row - 1, c) ?? '';
+  const valuesIn = (c: number): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < rowCount; i++) {
+      const t = textAt(sheet, row + i, c);
+      if (t !== null) out.push(t);
+    }
+    return out;
+  };
+  const uniform = (vs: string[]) => (vs.length > 0 && vs.every((v) => v === vs[0]) ? vs[0] : null);
+
+  let periodCol = -1;
+  let yearCol = -1;
+  let monthCol = -1;
+  for (let c = 1; c <= col - 2; c++) {
+    const h = headerAt(c);
+    if (periodCol < 0 && PERIOD_HEADER.test(h)) periodCol = c;
+    else if (yearCol < 0 && YEAR_HEADER.test(h)) yearCol = c;
+    else if (monthCol < 0 && MONTH_HEADER.test(h)) monthCol = c;
+  }
+
+  // ① 一整列期数
+  if (periodCol > 0) {
+    const v = uniform(valuesIn(periodCol));
+    const p = v === null ? null : parsePeriodText(v);
+    if (p) {
+      return {
+        ...p,
+        evidence: `表头 ${toRef(row - 1, periodCol)}「${headerAt(periodCol)}」整列为同一期，取 ${toRef(row, periodCol)}`,
+      };
+    }
+  }
+
+  // ② 年份列 + 月份列
+  if (yearCol > 0 && monthCol > 0) {
+    const yv = uniform(valuesIn(yearCol));
+    const mv = uniform(valuesIn(monthCol));
+    const year = yv === null ? NaN : Number(yv.trim());
+    // 「月份」写 "6" 或 "06" 或 "2026-06" 都要认
+    const mvParsed = mv === null ? null : parsePeriodText(mv);
+    const month = mvParsed ? mvParsed.month : mv === null ? NaN : Number(mv.trim());
+    if (year >= 1900 && year <= 2200 && month >= 1 && month <= 12) {
+      return {
+        year,
+        month,
+        evidence: `表头 ${toRef(row - 1, yearCol)}「${headerAt(yearCol)}」+ ${toRef(row - 1, monthCol)}「${headerAt(monthCol)}」给出年份与月份`,
+      };
+    }
+  }
+
+  return null;
 }
 
 /** 已知的轴名（"指标"/"公司"/"口径"/"月份"/"年份"）—— 用于识别表头角格 */
@@ -231,7 +389,7 @@ export function findHeader(ws: Sheet, hint: HeaderHint): { row: number; col: num
       const left = c === 1 ? null : textAt(ws, r, c - 1);
       if (!(c === 1 || left === null || hint.axisNames.has(left))) continue;
       let n = 0;
-      while (n < TEXT_SCAN_LIMIT && hint.values.has(textAt(ws, r, c + n) ?? '')) n++;
+      while (n < MAX_SCAN_COLS && hint.values.has(textAt(ws, r, c + n) ?? '')) n++;
       if (n === 0) continue;
       // 取取值最多的；同样多时取更靠上的（表头通常在数据区上方）
       if (!best || n > best.n) best = { row: r, col: c, n };

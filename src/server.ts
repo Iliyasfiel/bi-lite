@@ -23,6 +23,9 @@ import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
 import { renderTemplate, type RenderBlock } from './render/excel.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
 import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
+import { diagnoseIngest, parseIngestSpec, type IngestSpec } from './ingest/types.ts';
+import { runIngest } from './ingest/run.ts';
+import { masterCatalog } from './ingest/master.ts';
 
 const require = createRequire(import.meta.url);
 const PORT = Number(process.env.PORT ?? 4319);
@@ -31,6 +34,8 @@ const UPLOAD_DIR = 'data/uploads';
 const OUTPUT_DIR = 'output';
 /** 用户上传的待推断模板（临时）；`templates/` 下人工维护的模板才是正式版本 */
 const TEMPLATE_UPLOAD_DIR = 'templates/uploads';
+/** 已定稿的接入规格（源 Excel → 星型表的映射 YAML） */
+const INGEST_DIR = 'ingest';
 
 // ---------------- 工具 ----------------
 
@@ -87,6 +92,28 @@ function listSpecs() {
 // ---------------- 路由 ----------------
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
+
+/** 取接入规格文本：优先内联 YAML，其次文件；都没有就是一次明确的 400 */
+function loadIngestText(body: { yaml?: string; specFile?: string }): { text: string; from: string } | { error: string } {
+  if (body.yaml) return { text: body.yaml, from: '(内联 YAML)' };
+  if (body.specFile) {
+    if (!fs.existsSync(body.specFile)) return { error: `接入规格文件不存在: ${body.specFile}` };
+    return { text: fs.readFileSync(body.specFile, 'utf8'), from: body.specFile };
+  }
+  return { error: '需要 yaml（接入规格文本）或 specFile（路径）' };
+}
+
+/** 接入规格的静态诊断（与 MCP 侧 lint_ingest 同一套判据：diagnoseIngest） */
+async function diagIngest(text: string) {
+  const cat = await masterCatalog();
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  return {
+    cat,
+    d,
+    errors: d.issues.filter((i) => i.level === 'error'),
+    warnings: d.issues.filter((i) => i.level === 'warn'),
+  };
+}
 
 const routes: Record<string, Handler> = {
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
@@ -328,6 +355,70 @@ const routes: Record<string, Handler> = {
     const dest = path.join('specs', `${base}.yaml`);
     fs.writeFileSync(dest, yaml);
     json(res, 200, { file: dest, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length });
+  },
+
+  // ---------------- 接入规格：源 Excel → 星型表 ----------------
+  // YAML 由 agent（或人）产出，引擎只负责**确定性执行**与**确定性拒绝**。
+  // 这里的三条纪律：诊断 200 + willBeRejected 表达"能不能跑"；干跑不写库；
+  // 有歧义的名字整批拒绝、一行都不写（合并两家公司的钱会静默相加，没人会来查）。
+
+  /** 已定稿的接入规格（ingest/ 下） */
+  'GET /api/ingest/specs': async (_req, res) => {
+    const files = fs.existsSync(INGEST_DIR) ? fs.readdirSync(INGEST_DIR).filter((f) => /\.ya?ml$/.test(f)).sort() : [];
+    json(res, 200, files.map((f) => ({ file: path.join(INGEST_DIR, f), id: f.replace(/\.ya?ml$/, '') })));
+  },
+
+  'POST /api/ingest/lint': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { d, errors, warnings } = await diagIngest(t.text);
+    json(res, 200, {
+      from: t.from,
+      id: d.spec?.id ?? null,
+      source: d.spec?.source ?? null,
+      ok: !d.willBeRejected,
+      willBeRejected: d.willBeRejected,
+      parseError: d.parseError,
+      errors,
+      warnings,
+    });
+  },
+
+  'POST /api/ingest/dry-run': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { cat, d, errors } = await diagIngest(t.text);
+    if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
+    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, planOnly: true, decisions: body.decisions }));
+  },
+
+  'POST /api/ingest/run': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { cat, d, errors } = await diagIngest(t.text);
+    if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
+    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, decisions: body.decisions }));
+  },
+
+  /** 定稿接入规格。与 /api/specs/save 同一纪律：**先校验再落盘**（拒绝把跑不了的规格写进仓库） */
+  'POST /api/ingest/save': async (req, res) => {
+    const { yaml } = await readJson<{ yaml?: string }>(req);
+    if (!yaml || typeof yaml !== 'string') return json(res, 400, { error: '缺少 yaml' });
+    let spec: IngestSpec;
+    try {
+      spec = parseIngestSpec(yaml);
+    } catch (e) {
+      return json(res, 400, { error: (e as Error).message });
+    }
+    const base = safeName(spec.id ?? '');
+    if (!base) return json(res, 400, { error: '非法 id（YAML 里的 id 不能为空且不能全是特殊字符）' });
+    fs.mkdirSync(INGEST_DIR, { recursive: true });
+    const dest = path.join(INGEST_DIR, `${base}.yaml`);
+    fs.writeFileSync(dest, yaml);
+    json(res, 200, { file: dest, id: spec.id, source: spec.source });
   },
 
   /** 报表预览：出坐标计划（不含金额）+ 矩阵（含数值，给浏览器） */

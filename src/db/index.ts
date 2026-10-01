@@ -34,6 +34,15 @@ export async function open(dbPath = 'data/bi.duckdb') {
   for (const stmt of DDL.split(';').map((s) => s.trim()).filter(Boolean)) {
     await writeConn.run(stmt);
   }
+
+  // ★ 列契约随**结构创建**一起登记。
+  //   架构 §7.2 把 `_meta_columns` 安排在"生成器 apply 时"写 —— 这里没有生成器，
+  //   等价的时刻就是**建表这一刻**（`open()`）。
+  //   为什么不能只靠接入层（`runIngest`）：那样**首次导入之前 catalog 是空的**，
+  //   agent 在那段时间看不到任何结构，而结构其实已经在了。接入层那次登记照旧保留 ——
+  //   它让"数据与元数据同一事务"，这里这次保证"结构一存在，契约就在"。
+  //   动态 import 是为了避开 db ↔ meta 的静态循环（meta/columns.ts 要用本模块的 execute/query）。
+  await (await import('../meta/columns.ts')).registerMeta();
 }
 
 export function writer(): DuckDBConnection {
@@ -56,6 +65,19 @@ export async function query<T = Record<string, unknown>>(sql: string): Promise<T
 
 export async function execute(sql: string): Promise<void> {
   await writer().run(sql);
+}
+
+/**
+ * 用**写连接**跑一条查询。
+ *
+ * ★ 为什么需要它：DuckDB 的读连接看不到**本事务尚未提交**的写。
+ *   事务里"数一数自己刚写了多少行"（`runIngest` 校验事实装载没有少写）时，
+ *   走 `query()` 会得到 0 —— 守卫于是**误报**，而误报的守卫比没有守卫更糟：人会开始不信它。
+ *   凡是要读**自己刚写的**，都必须走这里。
+ */
+export async function queryWriter<T = Record<string, unknown>>(sql: string): Promise<T[]> {
+  const res = await writer().runAndReadAll(sql);
+  return res.getRowObjectsJson() as T[];
 }
 
 export function close() {

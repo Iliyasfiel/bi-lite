@@ -168,12 +168,17 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
       });
     }
     if (new Set(order.map(String)).size !== order.length) {
+      const dup = order.map(String).filter((x, i, a) => a.indexOf(x) !== i);
       out.push({
-        level: 'warn',
+        level: 'error',
         code: 'ORDER_DUPLICATE',
         at: `${at}.${axis}.order`,
-        message: `${axis}.order 里有重复项。`,
-        hint: '重复的标签会互相覆盖到同一个格子，只保留一条。',
+        message: `${axis}.order 里有重复项（${[...new Set(dup)].slice(0, 3).join('、')}）。`,
+        // ★ warn 改 error 的理由：重复标签不是"风格问题"，是**会静默出错**的问题 ——
+        //   两个同名行写到同一个坐标，后写的盖前写的，读者只看到一行，账面少一格。
+        //   实测用户模板第 89/90 行同名「经营活动产生的现金流量净额」。
+        //   判据只有一份（铁律 17），所以这里必须是 error，让 parseSpec 直接拒绝。
+        hint: '重复的标签会互相覆盖到同一个格子（只写进去一条，另一条静默消失）。请在模板里改成不同的名字，或从 order 里删掉多余项。',
       });
     }
   }
