@@ -2450,6 +2450,101 @@ log('\n════════ 26. 长表接入对拍（与冻结的期望值�
       : `第 ${firstDiff} 行：新路「${got[firstDiff]}」vs 旧路「${want[firstDiff]}」`);
 }
 
+// ============ 27. 期数的日期格（keys[].type: date）============
+log("\n════════ 27. 期数的日期格（Excel 序列号 → 日期；引擎不猜）════════");
+{
+  const { dryRunIngest, excelSerialToDate } = await import('../src/ingest/dryrun.ts');
+  const { parseIngestSpec, diagnoseIngest } = await import('../src/ingest/types.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { landRawFile, findRawFile } = await import('../src/land/raw.ts');
+  const { rawWorkbook } = await import('../src/land/read.ts');
+  const cat = await masterCatalog();
+
+  // —— ① 序列号换算：与**实测**基准对齐 ——
+  const s1 = excelSerialToDate(46174), s2 = excelSerialToDate(25569), s3 = excelSerialToDate(61);
+  check('★ 序列号 → 日期与实测基准一致（46174 = 2026-06-01 · 25569 = 1970-01-01 · 61 = 1900-03-01）',
+    s1?.year === 2026 && s1.month === 6 && s1.day === 1
+      && s2?.year === 1970 && s2.month === 1 && s2.day === 1
+      && s3?.year === 1900 && s3.month === 3 && s3.day === 1,
+    `${JSON.stringify(s1)} ${JSON.stringify(s2)} ${JSON.stringify(s3)}`);
+
+  // —— ② 可疑序列号一律拒绝（不猜）——
+  //    60 是 Excel 在 1900 系统里凭空算进的 1900-02-29（那天不存在）；
+  //    1..59 与 ≥61 的换算基准差一天 —— 差一天在这里就等于**差一个月**，所以不猜。
+  const refused = [60, 1, 0, -5, 200000, Number.NaN];   // 200000 ≈ 2447 年，超出 1900–2200
+  check('★ 可疑序列号一律拒绝（0 / 负数 / 1900-02-29 那个不存在的日子 / 超出 1900–2200）',
+    refused.every((x) => excelSerialToDate(x) === null),
+    refused.map((x) => `${x}→${JSON.stringify(excelSerialToDate(x))}`).join(' '));
+
+  const dateYaml = fs.readFileSync('test/fixtures/接入-日期格.yaml', 'utf8');
+  const DATE_SRC = 'test/fixtures/接入-日期格.xlsx';
+
+  // —— ③ 声明了 type: date：干跑（**还没着陆**，读的是 xlsx）读出三个不同的期 ——
+  const dryDate = await dryRunIngest(parseIngestSpec(dateYaml), { catalog: cat });
+  check('★ 声明 type: date 后日期格的期数被读出（3 行 3 坐标 + "期数逐行不同"，且没有 PERIOD_CELL_NOT_TEXT）',
+    dryDate.ok === true && dryDate.blocks[0]!.dataRows === 3
+      && dryDate.blocks[0]!.coordinates.total === 3
+      && dryDate.issues.some((i) => i.code === 'PERIOD_PER_ROW')
+      && !dryDate.issues.some((i) => i.code === 'PERIOD_CELL_NOT_TEXT'),
+    `ok=${dryDate.ok} 行=${dryDate.blocks[0]!.dataRows} 坐标=${dryDate.blocks[0]!.coordinates.total} 码=${dryDate.issues.map((i) => i.code).join(',')}`);
+
+  // —— ④ 不声明就不猜 ——
+  const dryNoType = await dryRunIngest(parseIngestSpec(dateYaml.replace(/^(\s+)type: date$/m, '')), { catalog: cat });
+  const noTypeIssue = dryNoType.issues.find((i) => i.code === 'PERIOD_CELL_NOT_TEXT');
+  check('★ 不声明 type 时**不猜**：报 PERIOD_CELL_NOT_TEXT，并给出"改成文本 / 声明 type: date"两条路',
+    dryNoType.ok === false && !!noTypeIssue && /type: date/.test(noTypeIssue.hint ?? ''),
+    `ok=${dryNoType.ok} 码=${dryNoType.issues.map((i) => i.code).join(',')}`);
+
+  // —— ⑤ 1904 日期系统：干跑与着陆都必须**响亮拒绝** ——
+  //    ★ 不拒的后果是静默差 4 年：同一天在 1900 系统是 46174、1904 系统是 44712（实测）。
+  let dry1904 = '';
+  try { await dryRunIngest(parseIngestSpec(dateYaml.replace('接入-日期格.xlsx', '接入-日期格1904.xlsx')), { catalog: cat }); }
+  catch (e) { dry1904 = (e as Error).message; }
+  check('★ 1904 日期系统的工作簿：干跑响亮拒绝（宁可拒绝，也不要静默差 4 年）', /1904/.test(dry1904), dry1904.slice(0, 60));
+
+  let land1904 = '';
+  try { await landRawFile('test/fixtures/接入-日期格1904.xlsx'); }
+  catch (e) { land1904 = (e as Error).message; }
+  check('★ 1904 的工作簿也不许**着陆**（否则会留下一份"重放得出另一个答案"的 raw）',
+    /1904/.test(land1904), land1904.slice(0, 60));
+
+  // —— ⑥ 真落库（值从 **raw** 来），期数仍然对 ——
+  await db.execute(`DELETE FROM fact_finance WHERE company_id IN (SELECT id FROM dim_company WHERE name = '华东子公司')`);
+  const dateRun = await runIngest(parseIngestSpec(dateYaml), { catalog: cat, autoCreateDims: true });
+  const months = (await db.query<{ m: string }>(
+    `SELECT DISTINCT strftime(f.fin_month, '%Y-%m-%d') AS m FROM fact_finance f
+     JOIN dim_company c ON c.id = f.company_id
+     WHERE c.name = '华东子公司' AND f.period_type = '本年累计' ORDER BY m`)).map((r) => r.m);
+  check('★ 落库后的期数就是日期格读出来的那三个（2026-06-01 / 07-01 / 08-01）',
+    dateRun.ok === true && months.join(',') === '2026-06-01,2026-07-01,2026-08-01',
+    `ok=${dateRun.ok} inserted=${dateRun.inserted} 期数=${months.join(',')}`);
+
+  // —— ⑦ raw 保持忠实：存的是**序列号**，"这是日期"完全由声明承担 ——
+  const hash = await findRawFile(DATE_SRC);
+  const rawSerial = await db.query<{ value_kind: string; raw_value: string }>(
+    `SELECT value_kind, raw_value FROM raw_cell
+     WHERE file_hash = '${hash}' AND sheet = '月报' AND row_no = 2 AND col_no = 1`);
+  check('★ raw 里存的仍是序列号（kind=number / 46174）—— "它是日期"由 spec 的声明承担，重放因此一致',
+    rawSerial.length === 1 && rawSerial[0]!.value_kind === 'number' && rawSerial[0]!.raw_value === '46174',
+    JSON.stringify(rawSerial[0] ?? {}));
+
+  // —— ⑧ 重放：值改成从 **raw** 读（与落库同一条路），期数一模一样 ——
+  const dryFromRaw = await dryRunIngest(parseIngestSpec(dateYaml), { catalog: cat, openBook: () => rawWorkbook(hash) });
+  check('★ 重放（值从 raw 读）得到同一份期数：3 行 3 坐标 + PERIOD_PER_ROW，且没有 PERIOD_CELL_NOT_TEXT',
+    dryFromRaw.ok === true && dryFromRaw.blocks[0]!.dataRows === 3
+      && dryFromRaw.blocks[0]!.coordinates.total === 3
+      && dryFromRaw.issues.some((i) => i.code === 'PERIOD_PER_ROW')
+      && !dryFromRaw.issues.some((i) => i.code === 'PERIOD_CELL_NOT_TEXT'),
+    `ok=${dryFromRaw.ok} 码=${dryFromRaw.issues.map((i) => i.code).join(',')}`);
+
+  // —— ⑨ 声明写错的词：解析期就拦下（不许静默退回"按文本读"）——
+  const badType = diagnoseIngest(dateYaml.replace(/^(\s+)type: date$/m, '$1type: nope'));
+  check('★ keys[].type 写错 → KEYS_TYPE_BAD（不是静默退回默认读法）',
+    badType.willBeRejected === true && badType.issues.some((i) => i.code === 'KEYS_TYPE_BAD'),
+    badType.issues.map((i) => i.code).join(','));
+}
+
 // ============ 汇总 ============
 log('\n════════════════════════════════');
 log(`  通过 ${pass} / 失败 ${fail}`);

@@ -310,3 +310,70 @@ sheets:
   );
 }
 console.log(`✅ 主数据对齐场景源: ${ALIGN_SCENARIOS.length} 组（${ALIGN_SCENARIOS.map((s) => s.id).join(', ')}）`);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 期数的**日期格**夹具（`keys[].type: date`）
+//
+// ★ 为什么需要它：真实集团导出的期数列很可能是 **Excel 日期格** —— 那种格的值是
+//   **序列号**（数字），不是文本。xlsx-populate 给的就是数字（实测 2026-06-01 = 46174），
+//   所以"只认文本"的读法会让整列期数凭空消失（干跑还报 ok，最难查的那类失败）。
+// ★ 为什么还要造一份 **1904 日期系统**：它的序列号整体差 1462 天（同一天 46174 vs 44712，实测）
+//   —— 拿 1900 基准去读会**静默差 4 年**。所以引擎明确拒绝这种工作簿，
+//   而这份夹具存在的唯一目的就是**证明那个拒绝真的会发生**。
+const DATE_ROWS: Array<[period: string, amount: number]> = [
+  ['2026-06-01', 100],
+  ['2026-07-01', 200],
+  ['2026-08-01', 300],
+];
+for (const [id, date1904] of [['接入-日期格', false], ['接入-日期格1904', true]] as const) {
+  const src = `test/fixtures/${id}.xlsx`;
+  const wbD = new ExcelJS.Workbook();
+  if (date1904) wbD.properties = { ...wbD.properties, date1904: true };
+  const wsD = wbD.addWorksheet('月报');
+  wsD.addRow(['期数', '单位', '指标', '口径', '本年累计']);
+  let row = 2;
+  for (const [period, amount] of DATE_ROWS) {
+    const [y, m, d] = period.split('-').map(Number);
+    const cell = wsD.getCell(row, 1);
+    cell.value = new Date(Date.UTC(y!, m! - 1, d!));
+    cell.numFmt = 'yyyy-mm-dd';   // ★ 关键就是这个格式：有它，Excel 才把序列号当日期显示
+    wsD.getCell(row, 2).value = '华东子公司';
+    wsD.getCell(row, 3).value = '营业收入';
+    wsD.getCell(row, 4).value = '本年累计';
+    wsD.getCell(row, 5).value = amount;
+    row++;
+  }
+  for (let c = 1; c <= 5; c++) wsD.getColumn(c).width = 16;
+  await wbD.xlsx.writeFile(src);
+
+  fs.writeFileSync(
+    `test/fixtures/${id}.yaml`,
+    `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— 期数的日期格夹具。
+# ★ keys[].type: date 是这份夹具的重点：A 列是 **Excel 日期格**（值是序列号，不是文本）。
+#   声明了它，引擎才按日期解读；不声明就报 PERIOD_CELL_NOT_TEXT —— 引擎**不猜**。
+id: ${id}-夹具
+source: ${src}
+onConflict: replace
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+            type: date
+        values:
+          columns: [E]
+`,
+  );
+}
+console.log('✅ 期数日期格夹具: 2 组（1900 系统 / 1904 系统）');

@@ -8,6 +8,8 @@
  */
 import XLSXPopulate from 'xlsx-populate';
 import type { Workbook, Sheet } from 'xlsx-populate';
+import JSZip from 'jszip';
+import { readFile } from 'node:fs/promises';
 import { parseRef, toRef, readNumberFormat } from '../render/excel.ts';
 
 /**
@@ -417,6 +419,15 @@ export function findHeader(ws: Sheet, hint: HeaderHint): { row: number; col: num
 }
 
 /** 打开模板并返回 workbook（供推断与 schema 读取共用） */
+// ★ 这一句必须在 openTemplate() **之后**调用（那时文件已确认是合法 xlsx）。
+// 读 xlsx 文件的日期系统 —— 只做这一件事，不解读任何格。
+export async function usesDate1904(absPath: string): Promise<boolean> {
+  const zip = await JSZip.loadAsync(await readFile(absPath));
+  const xml = await zip.file('xl/workbook.xml')?.async('string');
+  // 实测：exceljs 写 properties.date1904 = true 会得到 <workbookPr date1904="1" ...>
+  return !!xml && /<workbookPr[^>]*\bdate1904="(1|true)"/i.test(xml);
+}
+
 export async function openTemplate(template: string): Promise<Workbook> {
   try {
     return await XLSXPopulate.fromFileAsync(template);

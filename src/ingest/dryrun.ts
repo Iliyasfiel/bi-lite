@@ -16,7 +16,10 @@
  */
 import fs from 'node:fs';
 import type { Sheet } from 'xlsx-populate';
-import { textAt, openTemplate, parsePeriodText, type ReadableWorkbook } from '../spec/template.ts';
+import {
+  textAt, openTemplate, parsePeriodText, usesDate1904,
+  type ReadableWorkbook, type ReadableSheet,
+} from '../spec/template.ts';
 import { parseRef } from '../render/excel.ts';
 import { normalizeName } from './normalize.ts';
 import {
@@ -155,6 +158,66 @@ function isEmptyValue(v: unknown): boolean {
   return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
 }
 
+/**
+ * 打开源文件时的第一道关：**1904 日期系统**的工作簿一律拒绝。
+ *
+ * ★ 为什么必须拒绝（而不是"尽力而为"）：序列号本身不说明它是哪天 ——
+ *   同一个 2026-06-01 在 1900 系统里是 **46174**、在 1904 系统里是 **44712**（实测，差 1462 天）。
+ *   拿 1900 的基准去读 1904 的工作簿，期数会**整体差 4 年**，而数字看着完全正常。
+ *   xlsx-populate **不给**这个标志（实测 `date1904` / `_workbookNode.attributes.date1904` 都是 undefined），
+ *   所以只能自己去 `xl/workbook.xml` 里看（`usesDate1904()`）。
+ * ★ 为什么放在"打开源文件"这一层，而不是 `openTemplate()` 里：报表模板也可能用 1904，
+ *   而渲染只往格子里写金额、与日期系统无关 —— 在那里拒会误伤一类合法输入。
+ */
+async function openSourceForIngest(absPath: string): Promise<ReadableWorkbook> {
+  const wb = await openTemplate(absPath);
+  if (await usesDate1904(absPath)) {
+    throw new Error(
+      '这份源文件用的是 **1904 日期系统**（Excel for Mac 的老传统），引擎暂不支持：'
+      + '同一个日期在两套系统里的序列号差 1462 天，拿 1900 的基准去读会**整体差 4 年**，'
+      + '而数字看着完全正常。请在 Excel 里改成 1900 系统'
+      + '（选项 → 高级 → 取消勾选"使用 1904 日期系统"）另存一份，或把期数列改成文本。',
+    );
+  }
+  return wb;
+}
+
+/**
+ * Excel 日期序列号 → 年月日。**只支持 1900 系统**；换不出来返回 null（由调用方响亮报错）。
+ *
+ * 实测基准：1900 系统里 25569 = 1970-01-01、2026-06-01 = 46174；1904 系统里同一天 = 44712。
+ * ⚠️ Excel 在 1900 系统里**凭空算进了 1900-02-29**（序列号 60），所以 1..59 与 ≥61 的
+ *   换算基准差一天。这里**直接拒绝 < 61 的序列号**（1900 年 1–2 月的期数没有现实意义），
+ *   而不是去补那一天 —— 在"读到哪个月"这件事上，差一天就会变成差一个月。
+ */
+export function excelSerialToDate(serial: number): { year: number; month: number; day: number } | null {
+  if (!Number.isFinite(serial)) return null;
+  const days = Math.floor(serial);
+  if (days < 61) return null;
+  const d = new Date((days - 25569) * 86400000);   // 全程 UTC：避免本地时区把日期挪一天
+  if (Number.isNaN(d.getTime())) return null;
+  const year = d.getUTCFullYear();
+  if (year < 1900 || year > 2200) return null;     // 与 parsePeriodText 的年范围一致
+  return { year, month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+/**
+ * 期数列的**一格**：默认只认文本；声明了 `type: date` 时，把数字格按日期序列号解读。
+ *
+ * ★ 两条路共用这一个函数 —— 首灌开着 xlsx（数字格是序列号）、重放读着 raw（存下来的也是那个序列号），
+ *   所以"声明同一个读法"在两条路上得到同一份期数。这正是"不靠读 numFmt 自动判断"的原因。
+ */
+function periodCellText(sheet: ReadableSheet, row: number, col: number, asDate: boolean): string | null {
+  const t = textAt(sheet, row, col);
+  if (t !== null) return t;                       // 文本（含 2026-06 与完整日期）照旧
+  if (!asDate) return null;                       // 没声明就不猜
+  const v = sheet.cell(row, col).value();
+  if (typeof v !== 'number') return null;
+  const d = excelSerialToDate(v);
+  if (!d) return null;
+  return `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+}
+
 export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions): Promise<IngestShape> {
   const ctx: IngestLintContext = { periodTypes: opts.catalog.periodTypes };
   const issues: IngestIssue[] = lintIngest(spec, ctx);
@@ -199,7 +262,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
   }
 
   // ★ 值的来源由调用方决定：默认直接开 xlsx；已着陆过就换成从 raw_cell 读（可重放）
-  const wb = await (opts.openBook ?? openTemplate)(abs);
+  const wb = await (opts.openBook ?? openSourceForIngest)(abs);
   const maxRows = opts.maxRows ?? 20000;
   const companyIndex = new Map(opts.catalog.companies.map((n) => [normalizeName(n), n]));
   const metricIndex = new Map(opts.catalog.metrics.map((n) => [normalizeName(n), n]));
@@ -330,7 +393,11 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   const periodSeen: Array<{ value: string; row: number; parsed: { year: number; month: number } | null }> = [];
   /** 期数列里"有值但读不出文本"的行（日期格/数字格）—— 单独记，事后报成一条明确的错 */
   const nonTextPeriodRows: number[] = [];
-  const periodKeyCol = (block.keys ?? []).find((k) => k.as === 'period')?.col;
+  const periodKey = (block.keys ?? []).find((k) => k.as === 'period');
+  const periodKeyCol = periodKey?.col;
+  // ★ 「这一列是日期格」由 spec 声明（默认 text）。见 Ingest keys[].type 的注释：
+  //   靠读 numFmt 自动判断会在**重放**时失效（raw 里只存了那个数字）。
+  const periodAsDate = periodKey?.type === 'date';
 
   let dataRows = 0;
   let incomplete = 0;
@@ -400,7 +467,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
 
     // 期数
     if (periodKeyCol) {
-      const raw = textAt(sheet, r, colIndex(periodKeyCol));
+      const raw = periodCellText(sheet, r, colIndex(periodKeyCol), periodAsDate);
       if (raw !== null) periodSeen.push({ value: raw, row: r, parsed: parsePeriodText(raw) });
       else {
         // ★ 格里有东西、但 `textAt` 读不出文本 → 多半是**日期格或数字格**
@@ -412,7 +479,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
       }
     }
     const periodText = periodKeyCol
-      ? (textAt(sheet, r, colIndex(periodKeyCol)) ?? '')
+      ? (periodCellText(sheet, r, colIndex(periodKeyCol), periodAsDate) ?? '')
       : (factValues.get('period') ?? '');
 
     // 行键重复
@@ -508,9 +575,12 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   if (nonTextPeriodRows.length > 0) {
     err('PERIOD_CELL_NOT_TEXT', where,
       `期数列 ${periodKeyCol} 有 ${nonTextPeriodRows.length} 个格子不是文本（第 ${nonTextPeriodRows.slice(0, 5).join('、')}${nonTextPeriodRows.length > 5 ? ' …' : ''} 行）—— 看着像日期格或数字格，接入层读不到它们，这一步会一路走到"没有一个坐标凑得齐"。`,
-      '接入层只从**文本**里读期数（数字在类型层面没有出口，见 template.ts 的 textAt）。' +
-        ' 请在源里把这一列设成文本（或导出时选"文本"格式）。' +
-        ' 支持真实的日期格是另一件事，尚未做 —— 而**不要**退回按序列号猜年份：那正是旧长表路径静默写出 4617 年的原因。');
+      periodAsDate
+        ? '这一列已声明成 date（Excel 日期格），但格子里的值换算不出日期 —— 请确认它是真的日期格，而不是文本/别的数字。'
+        : '接入层**不猜**：只从文本里读期数（数字在类型层面没有出口，见 template.ts 的 textAt）。两条路：' +
+          '① 把这一列设成文本（或导出时选"文本"格式）；' +
+          '② **如果它本来就是 Excel 日期格**，在 keys 里声明 type: date —— 引擎才按日期序列号解读。' +
+          '（**不要**按序列号猜年份：那正是旧长表路径把 2026-06 静默写成 4617 年的原因。）');
   }
 
   let period: IngestBlockShape['period'] = null;

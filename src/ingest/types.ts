@@ -129,8 +129,21 @@ export interface IngestBlock {
   rows: RowKeySpec[];
   /** 列方向：哪些列是值、各自是哪个口径 */
   values: ValueColumnsSpec;
-  /** 行内的期数列（如 B 列每行都写着 2026-06） */
-  keys?: Array<{ col: string; as: 'period' }>;
+  /**
+   * 行内的期数列（如 B 列每行都写着 2026-06）。
+   *
+   * ★ `type` 说的是**这一列的格怎么读**，默认 `text`：
+   *   - `text`：按文本读（`2026-06` / `2026/6` / `2026年6月` / `202606` / `2026-06-01`）。
+   *   - `date`：**格是 Excel 日期格**时用它 —— 那种格的值是**序列号**（数字），
+   *     不是文本；声明了 `date` 引擎才把它按日期解读。
+   *
+   * ★ 为什么要人/agent 声明，而不是引擎自己看格式判断：**因为重放**。
+   *   raw 里存的是那个数字（`value_kind=number, raw_value=46174`），
+   *   压根没存"它是日期格"这件事（实测）。若引擎靠读 xlsx 的 `numFmt` 来判断，
+   *   首灌（读 xlsx）与重放（读 raw）就会得出**不同的期数** —— 那正是这套"raw 是唯一依据"
+   *   的设计最不能有的东西。把解读写成声明，两条路读的是同一份事实。
+   */
+  keys?: Array<{ col: string; as: 'period'; type?: 'text' | 'date' }>;
   /** 网格之外的固定键：company / metric / period */
   facts?: Record<string, FactSource>;
   /** 不接入的行 */
@@ -462,6 +475,14 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
         }
         if (!safeCol(k?.col)) {
           err('KEYS_COL_BAD', `${kAt}.col`, `列号不合法：${JSON.stringify(k?.col)}。`);
+        }
+        // ★ type 是"这一列的格怎么读"的**声明**（见 KeysSpec 的注释）。只承认 text / date：
+        //   写成一个引擎不认识的词，必须当场拦下 —— 否则它会静默退回默认读法，
+        //   而"日期格按文本读"的后果是整列期数凭空消失（干跑还报 ok）。
+        if (k?.type !== undefined && k.type !== 'text' && k.type !== 'date') {
+          err('KEYS_TYPE_BAD', `${kAt}.type`,
+            `keys[].type 只支持 text / date，收到 ${JSON.stringify(k.type)}。`,
+            'text = 期数写成文本；date = 这一列是 Excel 日期格（值是序列号）。');
         }
       });
       // --- 值列 ---

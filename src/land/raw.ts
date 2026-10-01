@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execute, query } from '../db/index.ts';
 import { resolveSource } from '../paths.ts';
-import { openTemplate } from '../spec/template.ts';
+import { openTemplate, usesDate1904 } from '../spec/template.ts';
 import type { Sheet } from 'xlsx-populate';
 
 /**
@@ -121,6 +121,17 @@ export async function readRawCells(
   const maxCols = Math.min(Math.max(opts.maxCols ?? RAW_SCAN_COLS, 1), RAW_SCAN_COLS);
 
   const wb = await openTemplate(absPath);
+  // ★ 1904 日期系统的工作簿**不许着陆**。理由不是"读不了"，而是**着陆会造出一个重放陷阱**：
+  //   raw 里存的是序列号（`46174` 这样的数字），而"这是 1900 还是 1904 系统"没地方存 ——
+  //   于是重放时只能按一个基准去读，两套系统差 1462 天（实测），期数会整体差 4 年。
+  //   与其留一份"重放得出另一个答案"的 raw，不如在这里明确拒绝（接入层打开源文件时也会拒）。
+  if (await usesDate1904(absPath)) {
+    throw new Error(
+      `源文件 ${absPath} 用的是 **1904 日期系统**，无法着陆：raw 只存格里的序列号，`
+      + '不存"哪套日期系统"这件事，重放时会把期数读偏 4 年。'
+      + '请在 Excel 里改成 1900 系统（选项 → 高级 → 取消勾选"使用 1904 日期系统"）后重试。',
+    );
+  }
   const cells: RawCellRow[] = [];
   const sheets: RawSheetCount[] = [];
   const clipped: string[] = [];
