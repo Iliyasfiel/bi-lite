@@ -470,14 +470,19 @@ export const COMMANDS: CliCommand[] = [
       });
       jsonTo(io, { from: inv.specFile, planOnly: true, ...r });
       io.err(
-        `bilite ingest dry-run: 本批会写 ${r.inserted} 行` +
-          (r.needsDecision.length
-            ? `；${r.needsDecision.length} 个名字需要人拍板（这些行不会落库）`
-            : '') +
-          '\n',
+        r.errors.length
+          ? `bilite ingest dry-run: ${r.errors.length} 个 error（${r.errors.map((e) => e.code).join('、')}）` +
+              ' —— 现在跑进去也只会一行不落地被拒\n'
+          : `bilite ingest dry-run: 本批会写 ${r.inserted} 行` +
+              (r.needsDecision.length
+                ? `；${r.needsDecision.length} 个名字需要人拍板（这些行不会落库）`
+                : '') +
+              '\n',
       );
-      // needsDecision 是待办不是失败（铁律 16），所以这里仍是 0
-      return EXIT.OK;
+      // ★ 退出码的分界就在这一行：`needsDecision` 是**待办**不是失败（铁律 16），所以退 0；
+      //   但 `error` 不是待办 —— 脚本只看退出码，把"这份源根本读不了"报成成功
+      //   正是本仓库最讨厌的那种安静失败（铁律 12）。
+      return r.errors.length > 0 ? EXIT.FAILED : EXIT.OK;
     },
   },
   {

@@ -2096,14 +2096,36 @@ log('\n════════ 22. catalog（列契约与三层导出）══�
     badTopic.includes('现有：'), badTopic.slice(0, 40));
 
   // —— CLI 那一侧：数据走 stdout、摘要走 stderr ——
+  //   ★ 跑的是**真命令**（进程内 `main`），不是只过解析层 —— CLI 是三个入口里唯一给脚本用的那个，
+  //     薄壳把 flag 名、退出码、JSON 字段写错，只有真跑一遍才会红（`catalog show` 此前是零覆盖）。
   const { main } = await import('../src/cli.ts');
-  const o: string[] = []; const e: string[] = [];
-  const code = await main(['catalog', 'dump'], { out: (t) => void o.push(t), err: (t) => void e.push(t) });
-  const fromCli = JSON.parse(o.join('')) as { drift: string[]; objects: unknown[] };
+  const cli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  const dump = await cli(['catalog', 'dump']);
+  const fromCli = JSON.parse(dump.out) as { drift: string[]; objects: unknown[] };
   check('CLI `catalog dump` 跑通（退出码 0 表示契约没漂移，stdout 是合法 JSON）',
-    code === 0 && fromCli.drift.length === 0 && fromCli.objects.length === META.length,
-    `code=${code} 对象=${fromCli.objects.length}`);
-  check('CLI 的摘要走 stderr', e.join('').includes('catalog dump'), e.join('').trim());
+    dump.code === 0 && fromCli.drift.length === 0 && fromCli.objects.length === META.length,
+    `code=${dump.code} 对象=${fromCli.objects.length}`);
+  check('CLI 的摘要走 stderr', dump.err.includes('catalog dump'), dump.err.trim());
+
+  // —— CLI `catalog show`：按需下钻那一侧也真跑一次，且与库层是**同一份结论** ——
+  const show = await cli(['catalog', 'show', 'fact_finance']);
+  const one = JSON.parse(show.out) as { name: string; grain: string; columns: unknown[] };
+  check('★ CLI `catalog show` 跑通：stdout 就是那一张表（不是整库），结论与库层一致',
+    show.code === 0 && one.name === 'fact_finance' && one.grain === ff.grain &&
+      one.columns.length === ff.columns.length,
+    `code=${show.code} ${one.name} ${one.columns.length} 列`);
+  check('CLI `catalog show` 零金额、摘要走 stderr',
+    findAmountLike(one).length === 0 && show.err.includes('catalog show'),
+    `${findAmountLike(one).length} 处金额 | ${show.err.trim()}`);
+  const showBad = await cli(['catalog', 'show', '不存在的表']);
+  check('★ CLI `catalog show` 面对不存在的对象：退 1、stdout 一个字节都不写，stderr 是人话（列出有哪些）',
+    showBad.code === 1 && showBad.out.length === 0 && showBad.err.includes('现有：'),
+    `code=${showBad.code} ${showBad.err.trim().slice(0, 40)}`);
 }
 
 // ============ 23. CLI `validate`：一份命令，两份判据 ============
@@ -2277,6 +2299,24 @@ sheets:
     const upEvil = await up2('../../etc/evil.xlsx', buf);
     check('③ ★ 文件名里的路径成分被剥掉（safeName），落点仍在 data/uploads/',
       upEvil.file.startsWith('data/uploads/') && !upEvil.file.includes('..'), upEvil.file);
+
+    // —— ③' 上传件**只增不减**是设计，不是欠账（清理是人工动作，判据写在 AGENTS.md §7）——
+    //    ★ 这里挡的是"顺手加一个自动清理"：生产接入规格的 `source:` 可以直接指向
+    //      `data/uploads/` 下的文件，删掉它那条规格立刻变成死路径、**而且没有任何提示**
+    //      —— 正是 docs/开发计划.md §12.1 那个真问题的形态。
+    //    ★ 判据不是"文件在不在"（干净克隆里根本没有 uploads/），而是"有没有代码去删它"，
+    //      所以它在任何机器上都成立。
+    const removesUploads = (text: string) =>
+      /rmSync|unlinkSync|fs\.rm\s*\(/.test(text) && /uploads/.test(text);
+    const offenders = fs
+      .readdirSync('src', { recursive: true })
+      .filter((p) => p.endsWith('.ts'))
+      .map((p) => `src/${p}`)
+      .filter((f) => removesUploads(fs.readFileSync(f, 'utf8')));
+    check('★ 没有任何代码会自动删 data/uploads/ 里的上传件（只增不减是设计；要删得先满足 §7 那两条判据）',
+      offenders.length === 0, offenders.join('、'));
+    check('★ 上面那条守卫真的会抓漂移：喂一段"删上传件"的写法它必须命中',
+      removesUploads(`fs.unlinkSync(path.join('data/uploads', name))`));
 
     // —— ④ 干跑：形状说清楚，且**一次库都不写** ——
     const yaml = baseYaml.replace(/^source\s*:.*$/m, `source: ${upl.file}`);
@@ -2646,11 +2686,108 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
     badType.issues.map((i) => i.code).join(','));
 }
 
+// ============ 28. CLI `ingest dry-run` / `ingest run`：薄壳真的跑通一遍 ============
+log('\n════════ 28. CLI ingest dry-run / run（真读源、真落库）════════');
+{
+  // ★ 补的是一个**覆盖缺口**：这两个命令此前只过了解析层（`parseCliArgs` 认得它们）——
+  //   引擎侧哪怕把 `planOnly` 传反、把"被拒"映射成退出码 0，也没有一条断言会红。
+  //   而 CLI 恰恰是三个入口里**唯一给脚本**的那个：脚本只看退出码，
+  //   "安静地报成功却没写库"正是本仓库最讨厌的失败形态（铁律 12）。
+  //   ★ 用夹具而不是生产规格 —— 干净克隆里也得跑得动（第 19 阶段那条教训）。
+  const { main } = await import('../src/cli.ts');
+  const cli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+  const facts = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const SPEC = 'test/fixtures/集团导出长表.yaml';
+
+  // —— ① 干跑：真读源文件、只回形状；一次库都不写 ——
+  const before = await facts();
+  const dry = await cli(['ingest', 'dry-run', SPEC]);
+  const dryJson = JSON.parse(dry.out) as {
+    planOnly: boolean; ok: boolean; inserted: number;
+    shape: { blocks: Array<{ coordinates: { total: number } }> };
+  };
+  check('★ CLI `ingest dry-run` 真跑通（退出码 0 + planOnly 标记），且一次库都不写',
+    dry.code === 0 && dryJson.planOnly === true && dryJson.ok === true && (await facts()) === before,
+    `code=${dry.code} ok=${dryJson.ok} 事实行 ${before} → ${await facts()}`);
+  check('干跑读到的是真实形状（960 个坐标），返回里没有任何金额',
+    dryJson.shape.blocks[0]!.coordinates.total === 960 && findAmountLike(dryJson).length === 0,
+    `坐标=${dryJson.shape.blocks[0]!.coordinates.total} 金额=${findAmountLike(dryJson).length} 处`);
+  check('干跑：数据走 stdout、摘要在 stderr（脚本能直接 `> report.json` 接管道）',
+    dry.out.trim().startsWith('{') && !dry.out.includes('bilite ingest dry-run') &&
+      dry.err.includes('bilite ingest dry-run'));
+
+  // —— ② 结构诊断不过的规格 → 退 1 且标 `refused`：这一步**连源文件都不读** ——
+  const BAD = 'test/fixtures/.e2e-cli-坏规格.yaml';
+  fs.writeFileSync(BAD, fs.readFileSync(SPEC, 'utf8').replace('anchor: E2', 'anchor: 不是坐标'));
+  try {
+    const refused = await cli(['ingest', 'dry-run', BAD]);
+    const rj = JSON.parse(refused.out) as { refused?: boolean; errors: Array<{ code: string }> };
+    check('★ 结构诊断不过的规格：CLI 退 1、标 `refused`，且一步都没读源文件',
+      refused.code === 1 && rj.refused === true && (rj.errors ?? []).length > 0,
+      `code=${refused.code} refused=${rj.refused} 码=${(rj.errors ?? []).map((x) => x.code).join(',')}`);
+  } finally {
+    fs.rmSync(BAD, { force: true });
+  }
+
+  // —— ②' 静态诊断过了、但源**读不到**（白名单外）：也要退 1 ——
+  //    ★ 这条是写这段断言时**当场撞出来的真缺陷**：干跑原先无论有没有 error 都退 0，
+  //      于是 `export BILITE_DB=... ; bilite ingest dry-run x.yaml || echo 失败` 这种脚本
+  //      会把"这份源根本读不了"当成成功。现在 error 一律退 1（`needsDecision` 才退 0）。
+  const OUTSIDE = 'test/fixtures/.e2e-cli-白名单外.yaml';
+  fs.writeFileSync(OUTSIDE, fs.readFileSync(SPEC, 'utf8').replace(/^source:.*$/m, 'source: /etc/passwd'));
+  try {
+    const outside = await cli(['ingest', 'dry-run', OUTSIDE]);
+    const oj = JSON.parse(outside.out) as { errors: Array<{ code: string }> };
+    check('★ 源在白名单外：CLI 干跑退 1 并报 SOURCE_OUTSIDE_ROOTS（"读不了"不是成功）',
+      outside.code === 1 && oj.errors.some((x) => x.code === 'SOURCE_OUTSIDE_ROOTS'),
+      `code=${outside.code} 码=${oj.errors.map((x) => x.code).join(',')}`);
+  } finally {
+    fs.rmSync(OUTSIDE, { force: true });
+  }
+
+  // —— ③ 真落库：自己造一个干净起点（这份长表的坐标在前面的阶段里已经存在，规格是 reject）——
+  await db.execute('DELETE FROM fact_finance');
+  const at0 = await facts();
+  const run = await cli(['ingest', 'run', SPEC]);
+  const rj = JSON.parse(run.out) as {
+    ok: boolean; inserted: number; batchId: string | null; archived: boolean; errors: unknown[];
+  };
+  check('★ CLI `ingest run` 真落了库：退出码 0、批次有 id、Parquet 归档成功',
+    run.code === 0 && rj.ok === true && rj.batchId !== null && rj.archived === true,
+    `code=${run.code} 批次=${rj.batchId} 归档=${rj.archived}`);
+  // ★ 判据来自**独立算法**（直接 SQL 数一遍），不是信返回值里的 inserted（AGENTS.md §6.1）
+  const at1 = await facts();
+  check('★★ 落库行数以直接 SQL 为准：库内 0 → 960，与自报的 inserted 一致',
+    at0 === 0 && at1 - at0 === 960 && rj.inserted === 960, `库内 ${at0} → ${at1}，自报 ${rj.inserted}`);
+  check('CLI `ingest run` 的返回值里没有金额（只回路径与计数）',
+    findAmountLike(rj).length === 0, `${findAmountLike(rj).length} 处`);
+
+  // —— ④ 同一份再落一次：规格是 reject → 整批拒绝、退 1，不静默覆盖 ——
+  const again = await cli(['ingest', 'run', SPEC]);
+  const aj = JSON.parse(again.out) as { errors: Array<{ code: string }> };
+  check('★ 重复落库：CLI 退 1 并报 CONFLICT_WITH_EXISTING（"被拒"这件事映射到了退出码，脚本看得见）',
+    again.code === 1 && aj.errors.some((x) => x.code === 'CONFLICT_WITH_EXISTING'),
+    `code=${again.code} 码=${aj.errors.map((x) => x.code).join(',') || '(无)'}`);
+  check('被拒的那一次一行都没写（库内行数不变）', (await facts()) === at1, `${at1} → ${await facts()}`);
+
+  // —— ⑤ 1904 日期系统的工作簿：引擎在**着陆之前**响亮拒绝 → CLI 退 1 且把原因写在 stderr ——
+  const d1904 = await cli(['ingest', 'run', 'test/fixtures/接入-日期格1904.yaml']);
+  check('★ 引擎的响亮拒绝映射成退出码 1（不是"安静的 ok"），stderr 给出原因',
+    d1904.code === 1 && /1904/.test(d1904.err), d1904.err.trim().slice(0, 60));
+}
+
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
-//     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 那两处一直没人管**：
-//     2026-10-02 我在这条断言里加进 README 时，它还写着 247 与「231 项断言，15 个阶段」。
-//     根因就是"没人管"—— 所以交给门禁：改了断言却忘同步，红的是 e2e，并告出五处各是多少。
+//     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 一直是没人管的那份**：
+//     2026-10-02 我在这条断言里加进 README 时，它还写着 247 与「231 项断言，15 个阶段」；
+//     2026-10-02 晚些时候补 README 那两处过时说法时，又发现"技术选型"表格里还留着那个 231
+//     —— 所以它现在**也在这张表里**（六处），不再靠人记得翻。
+//     根因就是"没人管"—— 所以交给门禁：改了断言却忘同步，红的是 e2e，并告出六处各是多少。
 {
   const actual = pass + fail + 1; // +1 = 这一条本身（先算进来，否则每次都比实际少 1）
   const spots: Array<[file: string, re: RegExp, label: string]> = [
@@ -2659,12 +2796,13 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
     ['docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/, '需求与架构 §11.1'],
     ['README.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/, 'README 快速开始'],
     ['README.md', /唯一门禁，(\d+) 项断言/, 'README 命令表'],
+    ['README.md', /自研 harness[^\n]*?(\d+) 项断言/, 'README 技术选型'],
   ];
   const got = spots.map(([f, re, label]) => {
     const m = re.exec(fs.readFileSync(f, 'utf8'));
     return `${label}=${m ? Number(m[1]) : '（没匹配到）'}`;
   });
-  check('★ 五处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
+  check('★ 六处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
     got.every((s) => s.endsWith(`=${actual}`)), `实际 ${actual}；${got.join('、')}`);
 }
 
