@@ -2059,10 +2059,14 @@ log('\n════════ 21. CLI render / query（受众与物料隔离�
 
   // —— ★ docs/开发计划.md §7.5：CLI 的取数命令**不许出现在 agent 侧物料里** ——
   //    「agent 的官方工作流里不能存在一条指向它的路」——这句话只有变成断言才算数。
+  //    ★ 两份 agent 侧物料都扫：操作手册（SKILL.md）与接线的配置 prompt（AGENT-PROMPT.md）。
   const skill = fs.readFileSync('skills/bi-lite-ingest/SKILL.md', 'utf8');
-  const leaked = ['bilite query', 'bilite render', 'bilite ingest run'].filter((s) => skill.includes(s));
-  check('★ agent 手册里不出现 CLI 的取数/落库命令（那是人的入口）',
-    leaked.length === 0, leaked.length ? leaked.join('、') : 'SKILL.md 干净');
+  const agentPrompt = fs.readFileSync('skills/bi-lite-ingest/AGENT-PROMPT.md', 'utf8');
+  const leaked = ['bilite query', 'bilite render', 'bilite ingest run'].filter(
+    (s) => skill.includes(s) || agentPrompt.includes(s),
+  );
+  check('★ agent 侧物料（手册 + 配置 prompt）里都不出现 CLI 的取数/落库命令（那是人的入口）',
+    leaked.length === 0, leaked.length ? leaked.join('、') : '两份都干净');
 }
 
 // ============ 22. catalog：把「库里现在有什么」交给 agent ============
@@ -2202,6 +2206,7 @@ log('\n════════ 24. skill export 与手册对拍 ═════
   const { skillFactsFrom, skillProblems, skillPrompt } = await import('../src/skill/export.ts');
   const { TOOLS } = await import('../src/mcp/tools.ts');
   const skillText = fs.readFileSync('skills/bi-lite-ingest/SKILL.md', 'utf8');
+  const promptText = fs.readFileSync('skills/bi-lite-ingest/AGENT-PROMPT.md', 'utf8');
   const names = TOOLS.map((t) => t.name);
 
   // —— ★ 对拍：手写的 SKILL.md 有没有落后于实现 ——
@@ -2209,6 +2214,14 @@ log('\n════════ 24. skill export 与手册对拍 ═════
   const drift = skillProblems(skillText, names);
   check('★ 手册与实现没漂：每个 MCP 工具都在手册里出现，且自报条数与实现一致',
     drift.length === 0, drift.slice(0, 2).join(' | '));
+
+  // —— ★ 配置 prompt 走**同一份判据**（第二份手写物料同样会漂）——
+  const promptDrift = skillProblems(promptText, names);
+  check('★ 配置 prompt（AGENT-PROMPT.md）与实现没漂：同一个 skillProblems() 判据',
+    promptDrift.length === 0, promptDrift.slice(0, 2).join(' | ') || '干净');
+  // —— 而且它必须真的**能接线**：写了 MCP 配置的落点（server.ts + stdio）——
+  check('★ 配置 prompt 里真的给出了接入方式（stdio + src/mcp/server.ts）',
+    /src\/mcp\/server\.ts/.test(promptText) && /stdio/i.test(promptText) && /"mcpServers"/.test(promptText));
 
   // —— 但"守卫存在"不等于"守卫有用"：喂它两种漂移，都得抓出来 ——
   check('★ 守卫抓得住「加了工具却没写进手册」',
