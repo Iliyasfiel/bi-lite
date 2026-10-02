@@ -491,8 +491,10 @@ export const COMMANDS: CliCommand[] = [
       //   于是 lint 在服务端正持有库锁时也能跑（§7.2 的"被占用就报错"对它不适用）。
       const { diagnoseIngest } = await import('./ingest/types.ts');
       const { staticCatalog } = await import('./semantic/query.ts');
+      // ★ 目标表也是判据的一部分：声明的投影**不碰库**，所以 lint 照旧零 DB 访问
+      const { declaredFactsOf } = await import('./gen/parse.ts');
       const text = readSpecFile(inv.specFile);
-      const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id) });
+      const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
       const errors = d.issues.filter((i) => i.level === 'error');
       const warns = d.issues.filter((i) => i.level === 'warn');
       jsonTo(io, {
@@ -528,7 +530,10 @@ export const COMMANDS: CliCommand[] = [
       const text = readSpecFile(inv.specFile);
       await openDb();
       const cat = await masterCatalog();
-      const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
+      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
+      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+      const d = diagnoseIngest(text, lintCtx);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -540,7 +545,7 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest dry-run: 静态诊断没通过，未读源文件\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text);
+      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         planOnly: true,
@@ -577,7 +582,10 @@ export const COMMANDS: CliCommand[] = [
       const text = readSpecFile(inv.specFile);
       await openDb();
       const cat = await masterCatalog();
-      const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
+      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
+      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+      const d = diagnoseIngest(text, lintCtx);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -589,7 +597,7 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest run: 静态诊断没通过，一行都没写\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text);
+      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         decisions: parseDecisions(await loadDecisions(inv.decisionsPath)),
@@ -878,7 +886,8 @@ export const COMMANDS: CliCommand[] = [
       if (looksIngest) {
         const { diagnoseIngest } = await import('./ingest/types.ts');
         const { staticCatalog } = await import('./semantic/query.ts');
-        const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id) });
+        const { declaredFactsOf } = await import('./gen/parse.ts');
+        const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
         const c = count(d.issues);
         jsonTo(io, {
           kind: 'ingest',

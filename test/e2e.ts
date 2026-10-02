@@ -211,9 +211,15 @@ check('DuckDB 打开 + 建表', true);
     'test/fixtures/接入-对齐5.yaml',
     'test/fixtures/接入-日期格.yaml',
     'test/fixtures/接入-日期格1904.yaml',
+    'test/fixtures/接入-业务线.yaml',
   ];
+  // ★ 诊断要带上**声明**：接入规格的 target 也是判据的一部分（铁律 18）。
+  //   注入的是 models/ 的投影，**不碰库** —— 这一段跑在开库之前。
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
   const bad = fixtureSpecs.filter(
-    (y) => !fs.existsSync(y) || !fs.existsSync(parseFixture(fs.readFileSync(y, 'utf8')).source),
+    (y) =>
+      !fs.existsSync(y) ||
+      !fs.existsSync(parseFixture(fs.readFileSync(y, 'utf8'), { facts: declaredFactsOf() }).source),
   );
   check('★ e2e 用的夹具规格都自包含（规格与它的源都在 —— 不借 data/ 里的私有数据）',
     bad.length === 0, bad.length ? `缺：${bad.join('、')}` : `${fixtureSpecs.length} 份都齐`);
@@ -2960,6 +2966,10 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
     JSON.stringify(irFlat) === JSON.stringify(irSplit),
     `列=${irFlat.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}`).join(',')}`);
 
+  // ★ 断言里的数字取自**声明本身**（不是写死的 5/6）：加一张声明表不该让断言红 ——
+  //   那正是"表由声明长出来"的意思。
+  const declaredTables = gen.loadModels().tables.length;
+
   // —— ② 业务表真由声明长出来（e2e 的库就是 open() 空库引导建起的）——
   const bizTables = await db.query<{ n: number }>(
     `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
@@ -2969,8 +2979,9 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
   const deps = await db.query<{ depends_on: string }>(
     `SELECT DISTINCT depends_on FROM _model_dep WHERE name = 'fact_finance' ORDER BY 1`,
   );
-  check('★ 5 张业务表由 models/*.yml 生成（不是手写 DDL 建的）',
-    Number(bizTables[0]!.n) === 5 && Number(modelRows[0]!.n) === 5, `业务表 ${bizTables[0]!.n} / _model ${modelRows[0]!.n}`);
+  check(`★ ${declaredTables} 张业务表由 models/*.yml 生成（不是手写 DDL 建的）`,
+    Number(bizTables[0]!.n) === declaredTables && Number(modelRows[0]!.n) === declaredTables,
+    `业务表 ${bizTables[0]!.n} / _model ${modelRows[0]!.n} / 声明 ${declaredTables}`);
   check('★ `_model_dep` 依赖图由 apply 写入：fact_finance → dim_company / dim_metric',
     deps.map((d) => d.depends_on).join(',') === 'dim_company,dim_metric');
 
@@ -3007,15 +3018,15 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
   };
   const p1 = cliInFresh(['plan']);
   const p1j = JSON.parse(p1.out) as { pending: boolean; changes: Array<{ sql?: string }>; appliedHash: string | null };
-  check('★★ `bilite plan` 一个字节都不写：它在空库上算出 5 项建表，而**那个库里业务表一张都没有**',
-    p1.code === 0 && p1j.pending === true && p1j.changes.filter((c) => c.sql).length === 5 &&
+  check('★★ `bilite plan` 一个字节都不写：它在空库上算出全部建表项，而**那个库里业务表一张都没有**',
+    p1.code === 0 && p1j.pending === true && p1j.changes.filter((c) => c.sql).length === declaredTables &&
       p1j.appliedHash === null && (await bizCountInFresh()) === 0,
     `pending=${p1j.pending} 建表=${p1j.changes.filter((c) => c.sql).length} 库里业务表=${await bizCountInFresh()}`);
   check('★ `plan --check` 有未落地的变更 → 退 1（给 CI 用的那面旗）',
     cliInFresh(['plan', '--check']).code === 1 && cliInFresh(['plan']).code === 0);
   const ap1 = cliInFresh(['apply']);
-  check('★ `bilite apply` 把 5 张表落地；再 plan 就为空（幂等收敛）',
-    ap1.code === 0 && (await bizCountInFresh()) === 5 &&
+  check('★ `bilite apply` 把全部声明的表落地；再 plan 就为空（幂等收敛）',
+    ap1.code === 0 && (await bizCountInFresh()) === declaredTables &&
       (JSON.parse(cliInFresh(['plan']).out) as { pending: boolean }).pending === false,
     `apply code=${ap1.code} 库里业务表=${await bizCountInFresh()}`);
 
@@ -3083,6 +3094,120 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
   check('★ 探针清理干净（库里没有无主语义表）', (await metaProblems()).length === 0);
 }
 
+// ============ 31. 运营事实表：目标表由**声明**决定（无口径列也能落库）============
+log('\n════════ 31. 运营事实表 fact_business_line（target 由声明决定）════════');
+{
+  // ★ 这一阶段守的是 `docs/开发计划.md` §6 里那条推后理由的反面：
+  //   「`runIngest` 的目标表硬编码 `fact_finance`，而运营事实表没有口径列 —— 先建表 = 一张永远空的表」。
+  //   现在目标表、必需坐标、行内退化列**全部读声明**（铁律 18），所以：
+  //   ① 声明说清了 fact_business_line 的形状（无口径列 + 行内退化列 business_line）；
+  //   ② 静态诊断与落库用**同一份判据**（少给一次 ctx 就会"工具说没问题、落库却被拒"）；
+  //   ③ 数落进目标表，**默认表一行不动**；
+  //   ④ 重放（删行 → 从 raw 重建）逐行一致，含退化列；
+  //   ⑤ 撞库预检对运营事实表同样生效（主键里含 business_line —— 工业/消费 两条不互相撞）。
+  const { diagnoseIngest, parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { main } = await import('../src/cli.ts');
+  const { listArchiveDirs } = await import('../src/db/compact.ts');
+
+  const SPEC = 'test/fixtures/接入-业务线.yaml';
+  const yaml = fs.readFileSync(SPEC, 'utf8');
+  const facts = declaredFactsOf();
+  const ctx = { periodTypes: ['本年累计', '单月'], facts };
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① 声明说清了形状：没有口径列、退化列是 business_line、它进主键 ——
+  const bl = facts.find((f) => f.name === 'fact_business_line')!;
+  check('★ 声明说清 fact_business_line 的形状：**无口径列** + 行内退化列 business_line（且在粒度里）',
+    bl !== undefined && bl.periodTypeColumn === null && bl.degenerateColumns.join(',') === 'business_line' &&
+      bl.primaryKey.join(',') === 'fin_month,company_id,metric_id,business_line',
+    `口径列=${String(bl?.periodTypeColumn)} 退化列=${bl?.degenerateColumns.join(',')} 主键=${bl?.primaryKey.join(',')}`);
+
+  // —— ② 同一份判据：规格放行 ——
+  const ok = diagnoseIngest(yaml, ctx);
+  check('★ 业务线规格放行（判据只有一份：静态诊断与落库共用 lintIngest）',
+    ok.willBeRejected === false, ok.issues.map((i) => i.code).join(',') || '无 issue');
+
+  // —— ③④⑤ 三条"写错了会怎样"（每条都必须在解析期响）——
+  const noDecl = diagnoseIngest(yaml.replace('target: fact_business_line', 'target: fact_nope'), ctx);
+  check('★ target 指向没声明的表 → TARGET_NOT_DECLARED（不静默写进默认表）',
+    noDecl.issues.some((i) => i.code === 'TARGET_NOT_DECLARED'), noDecl.issues.map((i) => i.code).join(','));
+  const withPt = diagnoseIngest(yaml.replace('          columns: [E]', '          columns: [E]\n          periodTypes: [单月]'), ctx);
+  check('★ 给**没有口径列**的目标声明值列口径 → TARGET_NO_PERIOD_TYPE（运营指标没有财务那套口径体系）',
+    withPt.issues.some((i) => i.code === 'TARGET_NO_PERIOD_TYPE'), withPt.issues.map((i) => i.code).join(','));
+  const noLine = diagnoseIngest(yaml.replace('          - col: D\n            as: business_line\n', ''), ctx);
+  check('★ 行内退化列没有来源 → COORD_MISSING（它不是可选的：它进了事实表的主键）',
+    noLine.issues.some((i) => i.code === 'COORD_MISSING' && i.message.includes('business_line')),
+    noLine.issues.map((i) => i.code).join(','));
+
+  // —— ⑥ CLI 真跑：干跑 → 落库；数据只进目标表 ——
+  const ffCount = async () => Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const blRows = async () =>
+    db.query<{ m: string; company: string; metric: string; line: string; amount: number }>(
+      `SELECT strftime(b.fin_month, '%Y-%m-%d') AS m, c.name AS company, mt.name AS metric,
+              b.business_line AS line, b.amount AS amount
+       FROM fact_business_line b
+       JOIN dim_company c ON c.id = b.company_id
+       JOIN dim_metric mt ON mt.id = b.metric_id
+       ORDER BY 1, 2, 3, 4`,
+    );
+  const before = await blRows();
+  const ffBefore = await ffCount();
+  check('前置：这张运营事实表此刻是空的（下面那条"只进目标表"才说明问题）', before.length === 0);
+
+  const dry = await runCli(['ingest', 'dry-run', SPEC]);
+  const dj = JSON.parse(dry.out) as { ok: boolean; shape: { blocks: Array<{ dataRows: number; coordinates: { total: number; incomplete: number } }> } };
+  check('★ CLI 干跑：形状是 4 行 / 4 坐标 / 0 空缺（没有口径列也说得清形状）',
+    dry.code === 0 && dj.ok === true && dj.shape.blocks[0]!.dataRows === 4 &&
+      dj.shape.blocks[0]!.coordinates.total === 4 && dj.shape.blocks[0]!.coordinates.incomplete === 0,
+    `ok=${dj.ok} 行=${dj.shape.blocks[0]!.dataRows} 坐标=${dj.shape.blocks[0]!.coordinates.total}`);
+
+  const first = await runCli(['ingest', 'run', SPEC]);
+  const fj = JSON.parse(first.out) as { ok: boolean; inserted: number; archived: boolean };
+  const after = await blRows();
+  check('★★ 数据落进 **fact_business_line**，而默认表 fact_finance 一行没动',
+    first.code === 0 && fj.ok === true && fj.inserted === 4 && after.length === 4 && (await ffCount()) === ffBefore,
+    `inserted=${fj.inserted} 目标表=${after.length} 行 / fact_finance ${ffBefore} → ${await ffCount()}`);
+  check('★ 行内退化列按原样写进事实表（工业 / 消费），且金额来自值列',
+    after.map((r) => `${r.company}|${r.metric}|${r.line}|${Number(r.amount)}`).join(' ; ') ===
+      '华东子公司|签约额|工业|1200.5 ; 华东子公司|签约额|消费|800.25 ; 华南子公司|交付台数|工业|12 ; 华南子公司|签约额|工业|640.75',
+    after.map((r) => `${r.metric}/${r.line}`).join(' '));
+  check('★ 归档目录按**目标表**命名（不再写死 fact_finance）',
+    fj.archived === true && listArchiveDirs('fact_business_line').length === 1 &&
+      fs.existsSync(`${listArchiveDirs('fact_business_line')[0]!.file}`),
+    `目录=${listArchiveDirs('fact_business_line').map((d) => d.name).join(',')}`);
+
+  // —— ⑦ 重放：删掉行 → 用同一份 raw 重建 → 逐行（含退化列）相同 ——
+  await db.execute('DELETE FROM fact_business_line');
+  const replay = await runCli(['ingest', 'run', SPEC]);
+  check('★★ 重放：清空后用同一份 raw 重建，事实行逐行相同（含 business_line）',
+    replay.code === 0 && JSON.stringify(await blRows()) === JSON.stringify(after),
+    `重放后 ${(await blRows()).length} 行`);
+
+  // —— ⑧ 撞库：主键含 business_line —— 再跑一次必须整批拒绝 ——
+  const again = await runCli(['ingest', 'run', SPEC]);
+  const aj = JSON.parse(again.out) as { errors: Array<{ code: string }> };
+  check('★ 撞库预检对运营事实表同样生效：重复落库整批拒绝（主键里含 business_line）',
+    again.code === 1 && aj.errors.some((e) => e.code === 'CONFLICT_WITH_EXISTING'),
+    `code=${again.code} 码=${aj.errors.map((e) => e.code).join(',')}`);
+
+  // —— ⑨ 落库那条路与静态诊断的**判据同一份**：直接调 runIngest 也不该出现"工具放行、落库被拒" ——
+  //    （上面 CLI 已经走了一遍；这里再钉一次"同一个 spec 对象在两条路上都成立"）
+  const spec = parseIngestSpec(yaml, ctx);
+  const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
+  const dry2 = await dryRunIngest(spec, { catalog: await masterCatalog() });
+  check('★ 同一个 spec 在库层也成立（dryRunIngest 不报 target 相关的 error）',
+    !dry2.issues.some((i) => i.level === 'error' && i.code.startsWith('TARGET')),
+    dry2.issues.map((i) => `${i.level}:${i.code}`).join(',') || '无');
+}
+
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。

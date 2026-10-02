@@ -31,7 +31,7 @@ import {
   type UnresolvedName,
 } from './resolve.ts';
 import { dryRunIngest, type IngestFactRow, type IngestShape, type MasterCatalog } from './dryrun.ts';
-import type { DimDecision, IngestIssue, IngestSpec } from './types.ts';
+import { DEFAULT_TARGET, type DimDecision, type IngestIssue, type IngestSpec } from './types.ts';
 
 export interface IngestRunOptions {
   /** 主数据快照（来自 `catalog()`，调用方注入 → 本模块可脱库测试） */
@@ -346,17 +346,54 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   // ---- 阶段 2：判断已全部通过，这才开始写 ----
 
   const onConflict = spec.onConflict ?? 'reject';
+  // ★ 目标表由**声明**决定（铁律 18）：列序、主键、期数列、退化列全部来自它 ——
+  //   接入层不再认识 "fact_finance" 这个名字（运营事实表就是这么才填得进去的）。
+  const target = spec.target ?? DEFAULT_TARGET;
+  const fact = (opts.catalog.facts ?? []).find((f) => f.name === target) ?? null;
+  if (!fact) {
+    return {
+      ...base,
+      errors: [
+        {
+          level: 'error',
+          code: 'TARGET_NOT_DECLARED',
+          at: 'target',
+          message: `target 指向的表 ${target} 没有声明（models/*.yml）。`,
+          hint: '目标表也是声明：先 `bilite plan` / `bilite apply` 把它建出来，或者改回默认的 fact_finance。',
+        },
+      ],
+    };
+  }
+  /**
+   * 一条事实行的**主键元组**（与 `queryHits` 里 SELECT 出来的列序一致）——
+   * 撞库预检拿它跟库里的已有坐标比。
+   */
+  const pkKeyOf = (r: IngestFactRow): string =>
+    fact.primaryKey
+      .map((col) => {
+        if (col === fact.periodColumn) return day(r.period);
+        if (col === fact.periodTypeColumn) return r.periodType ?? '';
+        if (col === fact.companyColumn) return assigned.get(`company|${r.company}`) ?? '';
+        if (col === fact.metricColumn) return assigned.get(`metric|${r.metric}`) ?? '';
+        if (fact.degenerateColumns.includes(col)) return r.deg[col] ?? '';
+        return '';
+      })
+      .join('|');
+
   // 撞库检查（只在 'reject' 下做）：同一坐标已存在 → 拒绝整批，而不是静默覆盖。
   // 旧实现是 `ON CONFLICT DO UPDATE`，"后写赢"这件事没有任何人看得见。
   if (onConflict === 'reject') {
     const periods = [...new Set(rows.map((r) => r.period))];
+    // 期数列拿出来时统一成 `YYYY-MM-DD`（与 pkKeyOf 的 day(period) 对齐）——
+    // 不这么做的话，'2026-06-01' 与 '2026-06' 看起来就是两个坐标，撞库预检会漏。
+    const selectPk = fact.primaryKey
+      .map((c) => (c === fact.periodColumn ? `strftime(${c}, '%Y-%m-%d') AS ${c}` : c))
+      .join(', ');
     const sql =
-      `SELECT strftime(fin_month, '%Y-%m') AS m, company_id, metric_id, period_type FROM fact_finance ` +
-      `WHERE fin_month IN (${periods.map((p) => `${lit(day(p))}::DATE`).join(', ')})`;
-    const hits = await queryHits(sql);
-    const collide = rows.filter((r) =>
-      hits.has(`${r.period}|${assigned.get(`company|${r.company}`)}|${assigned.get(`metric|${r.metric}`)}|${r.periodType}`),
-    );
+      `SELECT ${selectPk} FROM ${target} ` +
+      `WHERE ${fact.periodColumn} IN (${periods.map((p) => `${lit(day(p))}::DATE`).join(', ')})`;
+    const hits = await queryHits(sql, fact.primaryKey);
+    const collide = rows.filter((r) => hits.has(pkKeyOf(r)));
     if (collide.length > 0) {
       // 同一行可能有两个值列撞库，示例只按行去重（人要看的是"哪几行"）
       const sample = [...new Set(collide.map((r) => r.row))].slice(0, 5).map((r) => `第 ${r} 行`).join('、');
@@ -457,22 +494,43 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       return id;
     }
 
+    /**
+     * 一条事实行的某个**声明列**取什么值。
+     *
+     * ★ 列序就是声明的列序（`fact.columns`）—— 三个来源：
+     *   期数/公司/指标/口径/度量/溯源 各自读声明里的角色，行内退化列读 `r.deg`。
+     *   声明里有、而接入层没有来源的列（例如 P3 之后加的外键列）**当场抛**，
+     *   不写 NULL 糊过去 —— "这一行缺一块"必须响亮。
+     */
+    function valueOfColumn(col: string, r: IngestFactRow, batch: string): string {
+      if (col === fact.periodColumn) return `${lit(day(r.period))}::DATE`;
+      if (col === fact.companyColumn) return lit(dimIdOf('company', r.company, r));
+      if (col === fact.metricColumn) return lit(dimIdOf('metric', r.metric, r));
+      if (fact.periodTypeColumn && col === fact.periodTypeColumn) {
+        return r.periodType === null ? 'NULL' : lit(r.periodType);
+      }
+      if (fact.provenanceColumn && col === fact.provenanceColumn) return lit(batch);
+      if (col === fact.measureColumn) return r.amount === null ? 'NULL' : String(r.amount);
+      if (fact.degenerateColumns.includes(col)) return lit(r.deg[col] ?? '');
+      throw new Error(
+        `目标表 ${fact.name} 的列 ${col} 没有来源：接入层填不了它（声明里的列必须有来源，否则这一行会缺一块）。`,
+      );
+    }
+
     for (let i = 0; i < rows.length; i += CHUNK) {
       const chunk = rows.slice(i, i + CHUNK);
       const values = chunk
-        .map((r) => {
-          const cid = dimIdOf('company', r.company, r);
-          const mid = dimIdOf('metric', r.metric, r);
-          const amt = r.amount === null ? 'NULL' : String(r.amount);
-          return `(${lit(day(r.period))}::DATE, ${lit(cid)}, ${lit(mid)}, ${lit(r.periodType)}, ${amt}, ${lit(batchId)})`;
-        })
+        .map((r) => `(${fact.columns.map((c) => valueOfColumn(c.name, r, batchId)).join(', ')})`)
         .join(',\n');
+      // ★ 冲突子句也由**声明**生成：主键 + 度量列（换一张表就换一套，不再是写死的 fact_finance）
+      const pk = fact.primaryKey.join(', ');
       const conflictClause =
         onConflict === 'replace'
-          ? 'ON CONFLICT (fin_month, company_id, metric_id, period_type) DO UPDATE SET amount = EXCLUDED.amount, batch_id = EXCLUDED.batch_id'
-          : 'ON CONFLICT (fin_month, company_id, metric_id, period_type) DO NOTHING';
+          ? `ON CONFLICT (${pk}) DO UPDATE SET ${fact.measureColumn} = EXCLUDED.${fact.measureColumn}` +
+            (fact.provenanceColumn ? `, ${fact.provenanceColumn} = EXCLUDED.${fact.provenanceColumn}` : '')
+          : `ON CONFLICT (${pk}) DO NOTHING`;
       await execute(
-        `INSERT INTO fact_finance (fin_month, company_id, metric_id, period_type, amount, batch_id)
+        `INSERT INTO ${target} (${fact.columns.map((c) => c.name).join(', ')})
          VALUES ${values} ${conflictClause}`,
       );
     }
@@ -484,7 +542,9 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     //   ⚠️ 必须走 `queryWriter`：读连接**看不到本事务尚未提交的写**，会数出 0 → 守卫误报，
     //      而一个会误报的守卫比没有守卫更糟（人会开始不信它）。
     const counted = await queryWriter<{ n: number }>(
-      `SELECT count(*) AS n FROM fact_finance WHERE batch_id = ${lit(batchId)}`,
+      `SELECT count(*) AS n FROM ${target} WHERE ${fact.provenanceColumn ?? fact.periodColumn} = ${
+        fact.provenanceColumn ? lit(batchId) : lit(day(rows[0]!.period))
+      }`,
     );
     inserted = Number(counted[0]?.n ?? 0);
     if (inserted !== rows.length) {
@@ -515,10 +575,12 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   // Parquet 归档：留着溯源（铁律 11 —— 主实例 enable_external_access=false，只能走 exportParquet 的短命只读实例）
   // ★ 放在 COMMIT **之后**：归档要另开实例拿库的锁，事务未提交时拿不到。
   try {
-    const dir = `${PARQUET_ROOT}/fact_finance/batch=${batchId}`;
+    const dir = `${PARQUET_ROOT}/${target}/batch=${batchId}`;
     mkdirSync(dir, { recursive: true });
     await exportParquet(
-      `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)}) TO '${dir}/${PART_FILE}' (FORMAT parquet)`,
+      `COPY (SELECT * FROM ${target} WHERE ${fact.provenanceColumn ?? fact.periodColumn} = ${
+        fact.provenanceColumn ? lit(batchId) : lit(day(rows[0]!.period))
+      }) TO '${dir}/${PART_FILE}' (FORMAT parquet)`,
       // ★ 写完读回来数一遍：归档曾经"静默写出空文件"而 archived 还报 true（§4 备忘 13）。
       { path: `${dir}/${PART_FILE}`, rows: inserted },
     );
@@ -545,8 +607,11 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   };
 }
 
-/** 查"这些期间里已经存在哪些坐标"（只取坐标，不取金额） */
-async function queryHits(sql: string): Promise<Set<string>> {
-  const hits = await query<{ m: string; company_id: string; metric_id: string; period_type: string }>(sql);
-  return new Set(hits.map((r) => `${r.m}|${r.company_id}|${r.metric_id}|${r.period_type}`));
+/**
+ * 查"这些期间里已经存在哪些坐标"（**只取坐标，不取金额**）。
+ * 主键列由调用方按声明传进来 —— 判据不写死任何列名（铁律 18：目标表是声明）。
+ */
+async function queryHits(sql: string, pk: string[]): Promise<Set<string>> {
+  const hits = await query<Record<string, unknown>>(sql);
+  return new Set(hits.map((r) => pk.map((c) => String(r[c] ?? "")).join("|")));
 }

@@ -377,3 +377,59 @@ sheets:
   );
 }
 console.log('✅ 期数日期格夹具: 2 组（1900 系统 / 1904 系统）');
+
+// ============ 业务线接入（运营事实表：目标表由**声明**决定）============
+// ★ 这份夹具存在的理由：`fact_business_line` 曾经"没东西可填" ——
+//   接入层的目标表写死 `fact_finance`，而运营事实表**没有口径列**，
+//   于是它建了也是一张永远空的表（`docs/开发计划.md` §6 的推后理由）。
+//   现在目标表由 `models/fact_business_line.yml` 的声明决定：写进哪张表、必需哪几个坐标、
+//   有没有行内退化列（`business_line`），全部读声明。
+const BL_SRC = 'test/fixtures/业务线接入源.xlsx';
+const BL_SPEC = 'test/fixtures/接入-业务线.yaml';
+
+const wbBl = new ExcelJS.Workbook();
+const bls = wbBl.addWorksheet('月报');
+bls.addRow(['公司', '期数', '指标', '业务线', '金额']);
+const BL_ROWS: Array<[company: string, metric: string, line: string, amount: number]> = [
+  ['华东子公司', '签约额', '工业', 1200.5],
+  ['华东子公司', '签约额', '消费', 800.25],
+  ['华南子公司', '签约额', '工业', 640.75],
+  ['华南子公司', '交付台数', '工业', 12],
+];
+for (const [company, metric, line, amount] of BL_ROWS) bls.addRow([company, '2026-06', metric, line, amount]);
+for (let c = 1; c <= 5; c++) bls.getColumn(c).width = 16;
+await wbBl.xlsx.writeFile(BL_SRC);
+
+fs.writeFileSync(
+  BL_SPEC,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **运营事实表的接入夹具**。
+# ★ 与财务夹具最大的差别：**没有口径列**。运营指标没有"本年累计 / 单月"这套财务口径体系
+#   （铁律 8），所以目标表 fact_business_line 的声明里没有 period_type ——
+#   必需坐标因此只有三个（公司/指标/期数）+ 它自己声明的那一个行内退化列（业务线）。
+#   这两件事都由**声明**决定，不是代码里的字符串。
+id: 业务线接入-夹具
+source: ${BL_SRC}
+target: fact_business_line
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: A
+            dim: company
+          - col: C
+            dim: metric
+        keys:
+          - col: B
+            as: period
+          - col: D
+            as: business_line
+        values:
+          columns: [E]
+`,
+);
+console.log(`✅ 业务线接入源: ${BL_SRC}（${BL_ROWS.length} 行 → ${BL_ROWS.length} 条运营事实）`);
+console.log(`✅ 业务线接入规格: ${BL_SPEC}（target: fact_business_line，无口径列）`);

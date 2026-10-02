@@ -24,6 +24,7 @@ import { parseRef } from '../render/excel.ts';
 import { normalizeName } from './normalize.ts';
 import {
   COORD_CN,
+  DEFAULT_TARGET,
   colIndex,
   colLetter,
   effectiveValueColumns,
@@ -41,6 +42,7 @@ import {
  * ⚠️ 别改成 `export ... from` —— 那样**不会**产生本地绑定，本文件里的调用会变成
  *   未定义引用（写这行时踩过一次，e2e 挂了 9 条）。
  */
+import type { DeclaredFact } from '../gen/ir.ts';
 import { resolveSource, SOURCE_ROOTS } from '../paths.ts';
 export { resolveSource, SOURCE_ROOTS };
 
@@ -49,6 +51,11 @@ export interface MasterCatalog {
   companies: string[];
   metrics: string[];
   periodTypes: string[];
+  /**
+   * **声明过的事实表**（`gen/ir.ts` 的 `declaredFacts`）。
+   * ★ 目标表、必需坐标、行内退化列名全部从这里来 —— 接入层不再认识 `fact_finance` 这个名字。
+   */
+  facts: DeclaredFact[];
 }
 
 /**
@@ -68,7 +75,10 @@ export interface IngestFactRow {
   metric: string;
   /** 归一成 `YYYY-MM`（期数列与 facts.period 都要能落库） */
   period: string;
-  periodType: string;
+  /** 口径。**运营事实表没有口径列时是 null**（由目标表的声明决定） */
+  periodType: string | null;
+  /** 行内携带的**退化列**（如 business_line）—— 列名 → 原样格值 */
+  deg: Record<string, string>;
   amount: number | null;
 }
 
@@ -219,7 +229,9 @@ function periodCellText(sheet: ReadableSheet, row: number, col: number, asDate: 
 }
 
 export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions): Promise<IngestShape> {
-  const ctx: IngestLintContext = { periodTypes: opts.catalog.periodTypes };
+  // ★ 静态诊断与落库**同一份判据**（铁律 17）：目标表的声明也一起注入，
+  //   否则"工具说没问题、落库却被拒"（target 指到没声明的表就是这么露出来的）。
+  const ctx: IngestLintContext = { periodTypes: opts.catalog.periodTypes, facts: opts.catalog.facts };
   const issues: IngestIssue[] = lintIngest(spec, ctx);
   const err = (code: string, at: string, message: string, hint?: string) =>
     issues.push({ level: 'error', code, at, message, hint });
@@ -264,6 +276,14 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
   // ★ 值的来源由调用方决定：默认直接开 xlsx；已着陆过就换成从 raw_cell 读（可重放）
   const wb = await (opts.openBook ?? openSourceForIngest)(abs);
   const maxRows = opts.maxRows ?? 20000;
+  // 目标表的**声明**：写进哪张表、有没有口径列、有哪些行内退化列（铁律 18）
+  const targetName = spec.target ?? DEFAULT_TARGET;
+  const fact = (opts.catalog.facts ?? []).find((f) => f.name === targetName) ?? null;
+  if (fact === null && targetName !== DEFAULT_TARGET) {
+    // 拿不到声明就不猜：默认目标以外的表名一律拒绝（与静态诊断同一份判据）
+    err('TARGET_NOT_DECLARED', 'target', `target 指向的表 ${targetName} 没有声明（models/*.yml）。`);
+    return shape;
+  }
   const companyIndex = new Map(opts.catalog.companies.map((n) => [normalizeName(n), n]));
   const metricIndex = new Map(opts.catalog.metrics.map((n) => [normalizeName(n), n]));
 
@@ -287,6 +307,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
           warn,
           onRow: opts.onRow,
           writeEmptyMeasures: opts.writeEmptyMeasures === true,
+          fact,
         }),
       ),
     );
@@ -316,10 +337,12 @@ interface BlockReadContext {
   warn: (code: string, at: string, message: string, hint?: string) => void;
   onRow: ((row: IngestFactRow) => void) | undefined;
   writeEmptyMeasures: boolean;
+  /** 目标表的声明（null = 调用方没给声明 → 按 fact_finance 的老形状读） */
+  fact: DeclaredFact | null;
 }
 
 function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext): IngestBlockShape {
-  const { source, si, bi, maxRows, companyIndex, metricIndex, err, warn, onRow, writeEmptyMeasures } = ctx;
+  const { source, si, bi, maxRows, companyIndex, metricIndex, err, warn, onRow, writeEmptyMeasures, fact } = ctx;
   const at = `${si}.${bi}`;
   const where = `sheets[${si}].blocks[${bi}]`;
   const anchor = parseRef(block.anchor);
@@ -337,7 +360,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     if ((s.columns ?? []).some((c) => badSkip.has(String(c)))) continue;
     for (const c of expandColumns(s.columns)) skipCols.push({ col: c, why: s.why });
   }
-  const measure = block.values.measure ?? 'amount';
+  const measure = block.values.measure ?? fact?.measureColumn ?? 'amount';
 
   // ---- 值列的口径：位置优先，其次表头映射 ----
   const valueColumns = valueCols.map((col, i) => {
@@ -348,7 +371,9 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   });
   const skipped = skipCols.map(({ col, why }) => ({ col, header: textAt(sheet, headerRow, colIndex(col)), why }));
 
-  const needsPeriodTypeFromValues = !dimsOfRows.includes('period_type');
+  // ★ 目标表**没有口径列**时（运营事实表），值列不必说清口径 —— 这个判据由声明决定，
+  //   不是"永远是四个坐标"（铁律 18：目标表也是声明）。
+  const needsPeriodTypeFromValues = !dimsOfRows.includes('period_type') && (fact === null || fact.periodTypeColumn !== null);
   if (needsPeriodTypeFromValues) {
     const unmapped = valueColumns.filter((v) => v.periodType === null);
     if (unmapped.length > 0) {
@@ -395,6 +420,8 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   const nonTextPeriodRows: number[] = [];
   const periodKey = (block.keys ?? []).find((k) => k.as === 'period');
   const periodKeyCol = periodKey?.col;
+  /** 行内携带的**退化列**（如 business_line）：keys[].as 指到目标表声明的退化列上 */
+  const degKeys = (block.keys ?? []).filter((k) => k.as !== 'period');
   // ★ 「这一列是日期格」由 spec 声明（默认 text）。见 Ingest keys[].type 的注释：
   //   靠读 numFmt 自动判断会在**重放**时失效（raw 里只存了那个数字）。
   const periodAsDate = periodKey?.type === 'date';
@@ -482,12 +509,22 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
       ? (periodCellText(sheet, r, colIndex(periodKeyCol), periodAsDate) ?? '')
       : (factValues.get('period') ?? '');
 
+    // ★ 行内退化列（如 business_line）：格值按原样带走。它进了事实表的主键，
+    //   所以空值 = 这一行缺坐标（算 incomplete），不许静默当空串写进去。
+    const deg: Record<string, string> = {};
+    let degMissing = false;
+    for (const k of degKeys) {
+      const v = textAt(sheet, r, colIndex(k.col));
+      if (v === null || v.trim() === '') degMissing = true;
+      else deg[k.as] = v;
+    }
+
     // 行键重复
-    // ★ 行键 = rows 里所有列 **+ keys 里的期数**。对长表（一行一条事实、期数在某一列）来说
+    // ★ 行键 = rows 里所有列 **+ keys 里的期数与退化列**。对长表（一行一条事实、期数在某一列）来说
     //   期数就是行键的一部分：同一家公司同一指标的 12 个月**不是重复**。
     //   漏掉它，长表会被报成"80 组行键重复"（实测）。
     //   宽表不受影响：那种块里期数整列同值，加进去等于没加。
-    const rowKey = [...labels, periodText].map((x) => normalizeName(x)).join('\u0001');
+    const rowKey = [...labels, periodText, ...degKeys.map((k) => deg[k.as] ?? '')].map((x) => normalizeName(x)).join('\u0001');
     const hit = seenRowKeys.get(rowKey);
     if (hit) hit.rows.push(r);
     else seenRowKeys.set(rowKey, { label: keyName || label || labels.filter(Boolean).join('/'), rows: [r] });
@@ -498,9 +535,12 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     for (const vc of valueColumns) {
       coordTotal++;
       const periodType = dimsOfRows.includes('period_type') ? rowDimOf.get('period_type') ?? null : vc.periodType;
-      if (!company || !metric || !periodType || !periodText) incomplete++;
+      const needPt = fact === null || fact.periodTypeColumn !== null;
+      if (!company || !metric || !periodText || (needPt && !periodType) || degMissing) incomplete++;
       else {
-        const key = [company, metric, periodText, periodType].map((x) => normalizeName(x)).join('|');
+        const key = [company, metric, periodText, periodType ?? '', ...degKeys.map((k) => deg[k.as] ?? '')]
+          .map((x) => normalizeName(x))
+          .join('|');
         coordSeen.set(key, (coordSeen.get(key) ?? 0) + 1);
         // ★ 只有执行器（run.ts）会走到这里。金额在这一行里读完就交出去，不落到 shape / issues / 日志里。
         //   空值格默认不回调（空不是 0，也不是一条事实）—— 规格写 onEmptyMeasure: null 才落 NULL。
@@ -516,6 +556,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
             metric,
             period: p ? `${p.year}-${String(p.month).padStart(2, '0')}` : periodText,
             periodType,
+            deg,
             amount: typeof raw === 'number' ? raw : null,
           });
         }

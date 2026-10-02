@@ -1,0 +1,47 @@
+# 业务线事实（运营指标，铁律 8）：与财务事实**分开建表** ——
+# 量纲、频率、口径体系都不同，塞进 fact_finance 就是拿两种东西做加法。
+#
+# ★ 这张表刻意**没有口径列**（`period_type`）：运营指标没有"本年累计 / 单月 / 账面累计"
+#   这套财务口径体系。于是「一次给全的四个必需坐标」在这里只有三个 —— 这由**声明**决定，
+#   不是由代码里写死的字符串决定（接入规格的 `target:` 指到哪张表，就按哪张表的声明校验）。
+#
+# ★ `business_line` 是**行内携带的退化列**（degenerate）：低基数、只用来切片、不值得单独建维。
+#   真正的 `dim_business_line` + `map_org_bl`（公司→业务线的分摊权重）属于 P3 的 map_* 那一层，
+#   不在本轮范围 —— 到那时这张表会多一个 `business_line_id` 外键列。
+kind: fact
+title: 业务线事实（运营指标）
+grain: [fin_month, company_id, metric_id, business_line]
+keys:
+  - name: fin_month
+    type: date
+    key: true
+    notNull: true
+    semantic: period
+  - name: company_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_company
+    notNull: true
+    semantic: org
+  - name: metric_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_metric
+    notNull: true
+    semantic: metric
+  - name: business_line
+    type: varchar
+    key: true
+    notNull: true
+    semantic: business_line
+    comment: 业务线（工业 / 消费 / 服务…），行内携带的退化列
+measures:
+  - name: amount
+    type: decimal(18,2)
+    unit: 元
+    semantic: money
+provenance:
+  - name: batch_id
+    type: varchar

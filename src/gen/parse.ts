@@ -26,7 +26,9 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import {
   ModelError,
+  declaredFacts,
   normalizeSqlType,
+  type DeclaredFact,
   type Ir,
   type IrColumn,
   type IrTable,
@@ -333,8 +335,7 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
 }
 
 /** 确定性路径：读全部声明或抛 */
-export function loadModels(dir = MODELS_DIR): Ir {
-  const d = diagnoseModels(dir);
+export function loadModels(dir = MODELS_DIR): Ir {  const d = diagnoseModels(dir);
   if (!d.ir) {
     throw new ModelError(
       d.issues[0]?.code ?? 'MODEL_BAD',
@@ -343,4 +344,15 @@ export function loadModels(dir = MODELS_DIR): Ir {
     );
   }
   return d.ir;
+}
+
+/**
+ * 声明里的事实表投影（**不碰库**）—— 静态诊断与落库两条路都从这里取，判据只有一份。
+ *
+ * ★ 为什么留在 `gen/` 而不是 `ingest/master.ts`：`master.ts` 会（经由 `semantic/query.ts`）
+ *   拉进 DuckDB，而 `ingest lint` 是**零 DB 访问**的命令 —— 它要么读不到声明，
+ *   要么被迫加载整个库。让这条投影待在只依赖 fs/yaml 的这一层，两条路都干净。
+ */
+export function declaredFactsOf(dir = MODELS_DIR): DeclaredFact[] {
+  return declaredFacts(loadModels(dir));
 }

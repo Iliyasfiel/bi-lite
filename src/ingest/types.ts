@@ -18,6 +18,7 @@
  */
 import { parse as parseYaml } from 'yaml';
 import { DIM_NAMES, isRegisteredDim } from '../spec/dims.ts';
+import type { DeclaredFact } from '../gen/ir.ts';
 import type { DimKind } from './resolve.ts';
 
 // ---------------- 列号工具（Excel 列字母 ↔ 序号） ----------------
@@ -142,8 +143,12 @@ export interface IngestBlock {
    *   压根没存"它是日期格"这件事（实测）。若引擎靠读 xlsx 的 `numFmt` 来判断，
    *   首灌（读 xlsx）与重放（读 raw）就会得出**不同的期数** —— 那正是这套"raw 是唯一依据"
    *   的设计最不能有的东西。把解读写成声明，两条路读的是同一份事实。
+   *
+   * ★ 自 2026-10-02 起 `as` 还接受**目标表声明的行内退化列名**（如 `as: business_line`）：
+   *   那一格的文本按原样写进事实表的同名列。它不是维（没有主数据归并），是"这一行的属性"。
+   *   能写哪些名字由声明决定（`models/<表>.yml` 里 role: degenerate 的列）—— 写错即拒绝。
    */
-  keys?: Array<{ col: string; as: 'period'; type?: 'text' | 'date' }>;
+  keys?: Array<{ col: string; as: 'period' | string; type?: 'text' | 'date' }>;
   /** 网格之外的固定键：company / metric / period */
   facts?: Record<string, FactSource>;
   /** 不接入的行 */
@@ -160,6 +165,16 @@ export interface IngestSpec {
   title?: string;
   /** 源 Excel 路径（相对仓库根；必须在允许的根目录内） */
   source: string;
+  /**
+   * **写进哪张事实表**。默认 `fact_finance`。
+   *
+   * ★ 目标表必须是**声明过的** fact 表（`models/*.yml`，铁律 18）—— 不是代码里的字符串。
+   *   指到哪张表，就按哪张表的声明校验坐标与列：运营事实表（`fact_business_line`）没有口径列，
+   *   于是它只要求三个坐标（公司/指标/期数）+ 它自己声明的行内退化列。
+   * ★ 写错/写了个没声明的表名 → 解析即拒绝（`TARGET_NOT_DECLARED`）——
+   *   静默写进另一张表的后果是"数字看着正常，只是落在了别处"。
+   */
+  target?: string;
   /**
    * 同一个坐标 (公司,指标,期数,口径) 在源里出现两次时：
    * `reject`（默认）整批拒绝并列出冲突；`replace` 后写覆盖、并把被覆盖的记进批次记录。
@@ -203,6 +218,18 @@ export interface IngestLintContext {
    *   写在代码里必然与库里的实际取值漂移（旧实现就是这么漂的）。
    */
   periodTypes?: string[];
+  /**
+   * **声明过的事实表**（`gen/ir.ts` 的 `declaredFacts(loadModels())`）。
+   *
+   * 现状：
+   * - 给了 → 按 `spec.target` 指的那张表的**声明**校验（必需坐标、`keys[].as` 的合法名字、
+   *   有没有口径列）；指到没声明的表 → `TARGET_NOT_DECLARED`。
+   * - 没给 → 只认默认目标 `fact_finance`（老调用点保持原样；静态诊断请务必注入它）。
+   *
+   * ★ 为什么从调用方注入（而不是这里 import `loadModels`）：与 `periodTypes` 同一条理由 ——
+   *   判据要能被测试喂一份**假的**声明进来，证明它真的会抓（e2e 就是这么干的）。
+   */
+  facts?: DeclaredFact[];
 }
 
 /**
@@ -271,6 +298,25 @@ export function parseDecisions(raw: unknown): DimDecision[] | undefined {
  */
 export const REQUIRED_COORDS = ['company', 'metric', 'period', 'period_type'] as const;
 export type RequiredCoord = (typeof REQUIRED_COORDS)[number];
+
+/** 默认目标表 —— 与声明的默认一致（`IngestSpec.target` 不写时就是它） */
+export const DEFAULT_TARGET = 'fact_finance';
+
+/**
+ * 一次给全的**必需坐标** —— 由目标表的**声明**决定，不是写死的四个。
+ *
+ * ★ 这是"目标表变成声明"的落点：财务事实有口径列（"本年累计/单月/…"），
+ *   运营事实（`fact_business_line`）没有 —— 于是后者只要求三个坐标 + 它自己声明的行内退化列。
+ * ★ `fact` 为 null（调用方没注入声明）时退回老行为（四个坐标 = `fact_finance` 的形状），
+ *   这样既有的调用点不会被这次改动波及。
+ */
+export function requiredCoordsOf(fact: DeclaredFact | null): string[] {
+  if (!fact) return [...REQUIRED_COORDS];
+  const out = ['company', 'metric', 'period'];
+  if (fact.periodTypeColumn) out.push('period_type');
+  out.push(...fact.degenerateColumns);
+  return out;
+}
 
 /**
  * 坐标 → 中文名。★ 只用于**文案**（issue / 报错），不参与任何判据。
@@ -368,9 +414,9 @@ export function effectiveValueColumns(v: ValueColumnsSpec): {
  * 某个 block 里每个必需坐标被**绑定了几次**、分别绑在哪。
  * 用于「一次都不许少」与「一次都不许多」两条判据 —— 它们是同一个函数的两面。
  */
-export function bindingsOf(block: IngestBlock): Map<RequiredCoord, string[]> {
-  const map = new Map<RequiredCoord, string[]>();
-  const add = (coord: RequiredCoord, where: string) => {
+export function bindingsOf(block: IngestBlock): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  const add = (coord: string, where: string) => {
     const arr = map.get(coord) ?? [];
     arr.push(where);
     map.set(coord, arr);
@@ -382,6 +428,8 @@ export function bindingsOf(block: IngestBlock): Map<RequiredCoord, string[]> {
   }
   for (const k of block.keys ?? []) {
     if (k.as === 'period') add('period', `keys[col=${k.col}].as`);
+    // ★ 行内退化列（如 business_line）也是一个坐标 —— 它进了事实表的主键，就得有来源
+    else if (typeof k.as === 'string' && k.as) add(String(k.as), `keys[col=${k.col}].as`);
   }
   for (const [dim, src] of Object.entries(block.facts ?? {})) {
     if (dim === 'company' || dim === 'metric' || dim === 'period_type' || dim === 'period') {
@@ -403,6 +451,24 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
     out.push({ level: 'error', code, at, message, hint });
   const warn = (code: string, at: string, message: string, hint?: string) =>
     out.push({ level: 'warn', code, at, message, hint });
+
+  // ---- 目标表：写进哪张表由**声明**决定（铁律 18）----
+  const targetName =
+    typeof spec?.target === 'string' && spec.target.trim() !== '' ? spec.target.trim() : DEFAULT_TARGET;
+  let fact: DeclaredFact | null = null;
+  if (ctx.facts) {
+    fact = ctx.facts.find((f) => f.name === targetName) ?? null;
+    if (!fact) {
+      err('TARGET_NOT_DECLARED', 'target',
+        `target 指向的表 ${JSON.stringify(targetName)} 没有任何声明（models/*.yml 里没有它）。`,
+        `已声明的事实表：${ctx.facts.map((f) => f.name).join(' / ') || '（一张都没有）'}。目标表也是声明，不是代码里的字符串 —— 写错就会把数静默写进别处。`);
+    }
+  } else if (targetName !== DEFAULT_TARGET) {
+    err('TARGET_NOT_DECLARED', 'target',
+      `target 指向 ${JSON.stringify(targetName)}，但这次诊断没有拿到事实表的声明。`,
+      '静态诊断请把 facts 注入进来（`master.ts` 的 staticFacts()）—— 不然只能认默认的 fact_finance。');
+  }
+  const requiredCoords = requiredCoordsOf(fact);
 
   if (!spec || typeof spec !== 'object') {
     err('NO_SPEC', '(根)', '接入规格不是一个对象。');
@@ -466,12 +532,19 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
           else seenDim.add(r.dim);
         });
       }
-      // --- 期数列 ---
+      // --- 期数列 / 行内退化列 ---
       (block?.keys ?? []).forEach((k, ki) => {
         const kAt = `${at}.keys[${ki}]`;
-        if (k?.as !== 'period') {
-          err('KEYS_AS_BAD', `${kAt}.as`, `keys 只支持 as: period，收到 ${JSON.stringify(k?.as)}。`,
-            '行内的其它列要么声明成 rows[].dim（当坐标），要么就不接入 —— 没有第三种。');
+        const asPeriod = k?.as === 'period';
+        const asDegenerate =
+          typeof k?.as === 'string' && k.as !== '' &&
+          (fact ? fact.degenerateColumns.includes(k.as) : false);
+        if (!asPeriod && !asDegenerate) {
+          err('KEYS_AS_BAD', `${kAt}.as`,
+            `keys 只支持 as: period，或**目标表声明过的行内退化列**（收到 ${JSON.stringify(k?.as)}）。`,
+            fact && fact.degenerateColumns.length > 0
+              ? `${fact.name} 声明的行内退化列：${fact.degenerateColumns.join(' / ')}。行内的其它列要么声明成 rows[].dim（当坐标），要么就不接入 —— 没有第三种。`
+              : '行内的其它列要么声明成 rows[].dim（当坐标），要么就不接入 —— 没有第三种。');
         }
         if (!safeCol(k?.col)) {
           err('KEYS_COL_BAD', `${kAt}.col`, `列号不合法：${JSON.stringify(k?.col)}。`);
@@ -578,19 +651,26 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
       if (block?.drop && !(block.drop.labels?.length ?? 0) && !(block.drop.prefixes?.length ?? 0)) {
         warn('DROP_EMPTY', `${at}.drop`, 'drop 里既没有 labels 也没有 prefixes —— 等于没写。');
       }
-      // --- 必需坐标：一次都不许少、一次都不许多 ---
+      // --- 必需坐标：一次都不许少、一次都不许多（**清单由目标表的声明决定**）---
       const bindings = bindingsOf(block ?? ({} as IngestBlock));
-      for (const coord of REQUIRED_COORDS) {
+      // 目标表没有口径列，而规格却声明了值列口径 → 那是"按财务事实的写法写运营事实"，
+      // 静默忽略的话这几个表头映射会变成没人看的摆设（写的人以为它在起作用）。
+      if (fact && !fact.periodTypeColumn && (v.periodTypes?.length || Object.keys(v.periodTypeFromHeader ?? {}).length > 0)) {
+        err('TARGET_NO_PERIOD_TYPE', `${at}.values`,
+          `${fact.name} 没有口径列（period_type），但规格声明了值列口径。`,
+          '运营事实表没有"本年累计 / 单月"这套口径体系（铁律 8）：删掉 values.periodTypes / periodTypeFromHeader，值列就按行落数。');
+      }
+      for (const coord of requiredCoords) {
         const where = bindings.get(coord) ?? [];
         if (where.length === 0) {
           err('COORD_MISSING', at,
-            `「${COORD_CN[coord]}」没有任何来源（${coord}）。`,
+            `「${COORD_CN[coord] ?? coord}」没有任何来源（${coord}）。`,
             coord === 'company'
               ? '公司名通常就在网格里：整列都是公司名的（全集团一张表）用 rows: [{ col: "A", dim: "company" }]。真的是网格之外的固定键（一个文件一家公司）才用 facts.company: { literal: "..." }，名字写在某个固定格子里用 { cell: "A2" }。找不到就必须拒绝，绝不静默新建或归并。'
-              : `请用 ${coord === 'period' ? 'keys: [{col, as: period}] 或 facts.period' : coord === 'period_type' ? 'values.periodTypes / periodTypeFromHeader' : `rows[].dim: ${coord} 或 facts.${coord}`} 绑定它。`);
+              : `请用 ${coord === 'period' ? 'keys: [{col, as: period}] 或 facts.period' : coord === 'period_type' ? 'values.periodTypes / periodTypeFromHeader' : fact && !REQUIRED_COORDS.includes(coord as RequiredCoord) ? `keys: [{col, as: ${coord}}]（${fact.name} 声明的行内退化列）` : `rows[].dim: ${coord} 或 facts.${coord}`} 绑定它。`);
         } else if (where.length > 1) {
           err('COORD_DUPLICATE', at,
-            `「${COORD_CN[coord]}」被绑定了 ${where.length} 次：${where.join('、')}。`,
+            `「${COORD_CN[coord] ?? coord}」被绑定了 ${where.length} 次：${where.join('、')}。`,
             '同一个坐标只能有一个来源：两个来源意味着有一处会被静默忽略。');
         }
       }
