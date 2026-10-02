@@ -1,0 +1,33 @@
+# 运营事实（合同）独立成表：共享 dim_company / dim_period，
+# 但**不要塞进 fact_finance** —— 量纲、频率、口径体系都不同（铁律 8）
+kind: fact
+title: 合同事实（运营指标）
+grain: [fin_month, company_id, metric_id]
+keys:
+  - name: fin_month
+    type: date
+    key: true
+    notNull: true
+    semantic: period
+  - name: company_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_company
+    notNull: true
+    semantic: org
+  - name: metric_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_metric
+    notNull: true
+    semantic: metric
+measures:
+  - name: amount
+    type: decimal(18,2)
+    unit: 元
+    semantic: money
+provenance:
+  - name: batch_id
+    type: varchar

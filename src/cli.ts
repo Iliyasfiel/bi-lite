@@ -79,6 +79,8 @@ export type Invocation =
       minFiles: number | null;
       dryRun: boolean;
     }
+  | { kind: 'plan'; modelsDir: string | null; check: boolean }
+  | { kind: 'apply'; modelsDir: string | null }
   | { kind: 'validate'; specFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
@@ -109,6 +111,8 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'query') return parseQueryArgs(tokens.slice(1));
   if (first === 'catalog') return parseCatalogArgs(tokens.slice(1));
   if (first === 'compact') return parseCompactArgs(tokens.slice(1));
+  if (first === 'plan') return parseGenArgs('plan', tokens.slice(1));
+  if (first === 'apply') return parseGenArgs('apply', tokens.slice(1));
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
@@ -298,6 +302,27 @@ function parseCompactArgs(tokens: readonly string[]): Invocation {
 }
 
 /**
+ * `plan` / `apply` —— 生成器侧的两条命令（P2）。
+ *
+ * ★ 为什么必须是**两条**命令（而不是一条带 `--yes`）：先见 diff 再决定落地，
+ *   是这个生成器存在的理由（`docs/开发计划.md` §3 P2 的验收）。`plan` 一个字节都不写。
+ * ★ 默认目录不在这里写死：缺 `--models` 时交给 `gen/parse.ts` 的 `MODELS_DIR`
+ *   （默认值只允许有一份 —— 同 `compact` 的 `--max-bytes`）。
+ */
+function parseGenArgs(cmd: 'plan' | 'apply', tokens: readonly string[]): Invocation {
+  const hint = `bilite ${cmd} --help`;
+  if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: cmd };
+  const args = scanArgs(tokens, ['--models'], cmd === 'plan' ? ['--check'] : [], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`${cmd} 不接受位置参数（收到 ${args.positionals[0]}）—— 模型目录用 --models 给`, hint);
+  }
+  const modelsDir = args.values['--models']?.[0] ?? null;
+  if (cmd === 'apply') return { kind: 'apply', modelsDir };
+  return { kind: 'plan', modelsDir, check: '--check' in args.values };
+}
+
+/**
  * `validate <yaml>` —— §8.2 的第 ④ 条接口：**可执行、带修复建议**的校验。
  *
  * ★ 它**不写新判据**。判据仍是那两份（接入规格 `diagnoseIngest` / 报表规格 `diagnoseSpec`），
@@ -387,9 +412,9 @@ function isIngestSub(s: string): s is IngestSub {
  */
 let dbOpened = false;
 
-async function openDb() {
+async function openDb(opts?: { models?: 'ensure' | 'skip' }) {
   const db = await import('./db/index.ts');
-  await db.open();
+  await db.open(undefined, opts);
   dbOpened = true;
   return db;
 }
@@ -425,6 +450,8 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'catalog-dump',
   'catalog-show',
   'compact',
+  'plan',
+  'apply',
   'validate',
   'skill-export',
 ];
@@ -750,6 +777,78 @@ export const COMMANDS: CliCommand[] = [
       );
       // 0 行残骸不是"合并成功"该有的样子 —— 让脚本能看见（铁律 12：不许安静）
       return suspects.length > 0 ? EXIT.FAILED : EXIT.OK;
+    },
+  },
+  {
+    invocation: 'plan',
+    name: 'plan',
+    summary: '把 models/*.yml 的声明与库结构对一遍，出人可读的变更清单 —— 一个字节都不写',
+    usage: 'bilite plan [--models <目录>] [--check]',
+    async run(inv, io) {
+      if (inv.kind !== 'plan') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
+      const { planModels, summarizePlan } = await import('./gen/plan.ts');
+      const dir = inv.modelsDir ?? MODELS_DIR;
+
+      const d = diagnoseModels(dir);
+      if (!d.ir) {
+        jsonTo(io, { models: dir, ok: false, issues: d.issues });
+        io.err('bilite plan: 声明本身有问题，先改声明\n');
+        return EXIT.FAILED;
+      }
+      // ★ 生成器自己的命令**不让 open() 碰声明**：plan 要看到一个没被动过的库
+      //   （否则空库引导会在 open() 里把变更落掉，plan 永远说"无变更"，这条命令就废了）
+      await openDb({ models: 'skip' });
+      const plan = await planModels(d.ir);
+      jsonTo(io, {
+        models: dir,
+        ok: true,
+        pending: plan.pending,
+        tables: plan.tables,
+        irHash: plan.irHash,
+        appliedHash: plan.appliedHash,
+        structuralCount: plan.structural.length,
+        changes: plan.changes,
+        blocking: plan.blocking,
+        note: 'plan 是只读的：它连一条 DDL 都没执行。要落地用 bilite apply。',
+      });
+      io.err(`bilite plan: ${summarizePlan(plan)}\n`);
+      // --check 给 CI 用：有未落地的变更就退 1（不给它时，plan 只是"给你看一眼"，不算失败）
+      if (inv.check && plan.pending) return EXIT.FAILED;
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'apply',
+    name: 'apply',
+    summary: '按 models/*.yml 落地变更（建表 / 加列 / 刷新契约）—— 删列与改类型永不自动做',
+    usage: 'bilite apply [--models <目录>]',
+    async run(inv, io) {
+      if (inv.kind !== 'apply') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
+      const { applyModels } = await import('./gen/apply.ts');
+      const dir = inv.modelsDir ?? MODELS_DIR;
+
+      const d = diagnoseModels(dir);
+      if (!d.ir) {
+        jsonTo(io, { models: dir, ok: false, issues: d.issues });
+        io.err('bilite apply: 声明本身有问题，一行都没动\n');
+        return EXIT.FAILED;
+      }
+      // 同理：apply 要自己报告落了什么，不能被 open() 抢先做掉
+      await openDb({ models: 'skip' });
+      const r = await applyModels(d.ir);
+      jsonTo(io, {
+        models: dir,
+        ok: r.blocked.length === 0,
+        tables: r.tables,
+        irHash: r.irHash,
+        applied: r.applied.map((c) => ({ kind: c.kind, table: c.table, column: c.column ?? null, detail: c.detail })),
+        blocked: r.blocked,
+        note: r.note,
+      });
+      io.err(`bilite apply: ${r.note}\n`);
+      return r.blocked.length > 0 ? EXIT.FAILED : EXIT.OK;
     },
   },
   {

@@ -109,6 +109,11 @@ log('\n════════ 0.5 CLI（解析层与命令表）════�
     [['compact', '--max-bytes', 'abc'], 'usage-error'],
     [['compact', '--min-files', '1'], 'usage-error'],
     [['compact', 'x'], 'usage-error'],
+    [['plan'], 'plan'],
+    [['plan', '--check'], 'plan'],
+    [['apply', '--models', 'models'], 'apply'],
+    [['plan', 'x'], 'usage-error'],
+    [['apply', '--check'], 'usage-error'],
   ];
   const wrong = cases.filter(([argv, want]) => parseCliArgs(argv).kind !== want);
   check('★ parseCliArgs 是纯函数，命令面全覆盖', wrong.length === 0,
@@ -2900,6 +2905,185 @@ log('\n════════ 29. Parquet 归档 compaction（R8）═══�
   fs.rmSync(EMPTY, { recursive: true, force: true });
 }
 
+// ============ 30. 生成器（P2）：models/*.yml → IR → plan / apply ============
+log('\n════════ 30. 生成器 P2（声明 → IR → plan / apply）════════');
+{
+  // ★ 这一阶段守的是 P2 的**全部验收标准**（`docs/开发计划.md` §3 P2）：
+  //   ① IR 是真抽象 —— 换一种 YAML 写法，IR 以下一行都不该改；
+  //   ② apply 幂等 —— 落完地再 plan，diff 为空；
+  //   ③ 加列 → plan 只报那一列 → apply 后**数据不重写**；
+  //   ④ `_meta_columns` 与真实库结构不漂移（契约是声明的投影，不是第二份真相）；
+  //   ⑤ plan 与 apply 是**两条**命令：plan 一个字节都不写（判据是那个库里真的没有业务表）。
+  const gen = await import('../src/gen/parse.ts');
+  const irMod = await import('../src/gen/ir.ts');
+  const planMod = await import('../src/gen/plan.ts');
+  const applyMod = await import('../src/gen/apply.ts');
+  const { META, metaProblems } = await import('../src/meta/columns.ts');
+  const { main } = await import('../src/cli.ts');
+  const { DuckDBInstance } = await import('@duckdb/node-api');
+  const { execFileSync } = await import('node:child_process');
+  const pathMod = await import('node:path');
+
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① IR 是真抽象：同一张表两种写法 → 逐字段相同的 IR ——
+  const probes: Array<{ name: string; n: number }> = [];
+  const flat = [
+    'kind: fact',
+    'title: 探针表',
+    'grain: [a, b]',
+    'columns:',
+    '  - { name: a, type: date, role: pk, key: true }',
+    '  - { name: b, type: varchar, role: dim_fk, key: true, refs: dim_probe }',
+    '  - { name: n, type: integer, role: measure, unit: 件, semantic: count }',
+    '  - { name: batch_id, type: varchar, role: provenance }',
+  ].join('\n');
+  const split = [
+    'kind: fact',
+    'title: 探针表',
+    'grain: [a, b]',
+    'keys:',
+    '  - { name: a, type: date, key: true }',
+    '  - { name: b, type: varchar, role: dim_fk, key: true, refs: dim_probe }',
+    'measures:',
+    '  - { name: n, type: integer, unit: 件, semantic: count }',
+    'provenance:',
+    '  - { name: batch_id, type: varchar }',
+  ].join('\n');
+  const irFlat = gen.parseModel(flat, 'fact_probe.yml');
+  const irSplit = gen.parseModel(split, 'fact_probe.yml');
+  check('★★ IR 是真抽象：同一张表的两种 YAML 写法（平铺 / 分组）解析出**逐字段相同**的 IR',
+    JSON.stringify(irFlat) === JSON.stringify(irSplit),
+    `列=${irFlat.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}`).join(',')}`);
+
+  // —— ② 业务表真由声明长出来（e2e 的库就是 open() 空库引导建起的）——
+  const bizTables = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
+      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+  );
+  const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
+  const deps = await db.query<{ depends_on: string }>(
+    `SELECT DISTINCT depends_on FROM _model_dep WHERE name = 'fact_finance' ORDER BY 1`,
+  );
+  check('★ 5 张业务表由 models/*.yml 生成（不是手写 DDL 建的）',
+    Number(bizTables[0]!.n) === 5 && Number(modelRows[0]!.n) === 5, `业务表 ${bizTables[0]!.n} / _model ${modelRows[0]!.n}`);
+  check('★ `_model_dep` 依赖图由 apply 写入：fact_finance → dim_company / dim_metric',
+    deps.map((d) => d.depends_on).join(',') === 'dim_company,dim_metric');
+
+  // —— ③ plan 幂等 + 契约同源 ——
+  const plan = await planMod.planModels(gen.loadModels());
+  check('★ plan 幂等：刚落完地的库 diff 为空（这正是"apply 之后再次 plan → 空 diff"）',
+    plan.pending === false && plan.changes.length === 0, `changes=${plan.changes.length}`);
+  check('★★ 列契约是**声明层的投影**（META === metaOf(loadModels())），且与真实库结构零漂移',
+    JSON.stringify(META) === JSON.stringify(irMod.metaOf(gen.loadModels())) && (await metaProblems()).length === 0);
+
+  // —— ④ 子进程：`bilite plan` 在一个**没被动过的库**上必须一个字节都不写 ——
+  //    ★ 判据不是"它自己说只读"，而是**那个库里真的只有基础表**。
+  const FRESH = 'test/output/gen-fresh.duckdb';
+  fs.rmSync(FRESH, { force: true });
+  const bizCountInFresh = async () => {
+    const inst = await DuckDBInstance.create(FRESH, { enable_external_access: 'false', access_mode: 'READ_ONLY' });
+    try {
+      const c = await inst.connect();
+      try {
+        const r = await c.runAndReadAll(
+          `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
+            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+        );
+        return Number((r.getRowObjectsJson() as Array<{ n: unknown }>)[0]!.n);
+      } finally { c.closeSync(); }
+    } finally { inst.closeSync(); }
+  };
+  const cliInFresh = (args: string[]) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), ...args], {
+        env: { ...process.env, BILITE_DB: FRESH }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }) };
+    } catch (e) { return { code: (e as { status?: number }).status ?? -1, out: '' }; }
+  };
+  const p1 = cliInFresh(['plan']);
+  const p1j = JSON.parse(p1.out) as { pending: boolean; changes: Array<{ sql?: string }>; appliedHash: string | null };
+  check('★★ `bilite plan` 一个字节都不写：它在空库上算出 5 项建表，而**那个库里业务表一张都没有**',
+    p1.code === 0 && p1j.pending === true && p1j.changes.filter((c) => c.sql).length === 5 &&
+      p1j.appliedHash === null && (await bizCountInFresh()) === 0,
+    `pending=${p1j.pending} 建表=${p1j.changes.filter((c) => c.sql).length} 库里业务表=${await bizCountInFresh()}`);
+  check('★ `plan --check` 有未落地的变更 → 退 1（给 CI 用的那面旗）',
+    cliInFresh(['plan', '--check']).code === 1 && cliInFresh(['plan']).code === 0);
+  const ap1 = cliInFresh(['apply']);
+  check('★ `bilite apply` 把 5 张表落地；再 plan 就为空（幂等收敛）',
+    ap1.code === 0 && (await bizCountInFresh()) === 5 &&
+      (JSON.parse(cliInFresh(['plan']).out) as { pending: boolean }).pending === false,
+    `apply code=${ap1.code} 库里业务表=${await bizCountInFresh()}`);
+
+  // —— ⑤ 加列：plan 只报那一列；apply 之后**数据不重写** ——
+  //    用一张**探针表**（临时模型目录里声明）而不是动真表：测的是"加列不重写数据"，
+  //    不该顺手把 e2e 的基线库改出一个新列来（那会让后面的断言与环境相关）。
+  const TMP = 'test/output/gen-models';
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.cpSync('models', TMP, { recursive: true });
+  const probeModel = (withMemo: boolean) =>
+    [
+      'kind: fact',
+      'title: 探针表（生成器阶段专用）',
+      'grain: [id]',
+      'keys:',
+      '  - { name: id, type: varchar, key: true }',
+      ...(withMemo ? ['  - { name: memo, type: varchar, comment: 后加的一列 }'] : []),
+      'measures:',
+      '  - { name: n, type: integer, unit: 件, semantic: count }',
+      '',
+    ].join('\n');
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(false));
+  const first = await applyMod.applyModels(gen.loadModels(TMP));
+  check('★ 临时声明目录里加一张新表 → apply 建表（不改 gen/ 里任何代码，这正是生成器的价值）',
+    first.blocked.length === 0 && first.applied.some((c) => c.kind === 'create-table' && c.table === 'fact_probe'));
+  await db.execute(`INSERT INTO fact_probe (id, n) VALUES ('p1', 11), ('p2', 22)`);
+  const before = await db.query<{ n: number; s: number }>('SELECT count(*) AS n, sum(n) AS s FROM fact_probe');
+
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(true));
+  const plan2 = await planMod.planModels(gen.loadModels(TMP));
+  check('★ 加一列 → plan 只报那一列（其余全是"无变更"）',
+    plan2.structural.length === 1 && plan2.structural[0]!.column === 'memo' &&
+      plan2.blocking.length === 0,
+    `结构变更 ${plan2.structural.map((c) => `${c.table}.${c.column}`).join(',')} / 阻塞 ${plan2.blocking.length}`);
+  const second = await applyMod.applyModels(gen.loadModels(TMP));
+  const after = await db.query<{ n: number; s: number }>('SELECT count(*) AS n, sum(n) AS s FROM fact_probe');
+  const memoLive = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'fact_probe' AND column_name = 'memo'`,
+  );
+  check('★★ 加列**不重写数据**：列真的加上了，而行数与值（count / sum）一模一样',
+    second.blocked.length === 0 && Number(memoLive[0]!.n) === 1 &&
+      Number(after[0]!.n) === Number(before[0]!.n) && Number(after[0]!.s) === Number(before[0]!.s),
+    `${before[0]!.n} 行 / sum=${before[0]!.s} → ${after[0]!.n} 行 / sum=${after[0]!.s}`);
+
+  // —— ⑥ 删列：**永不自动做** —— plan 标阻塞，apply 一行不动 ——
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(false));
+  const cliApply = await runCli(['apply', '--models', TMP]);
+  const aj = JSON.parse(cliApply.out) as { blocked: Array<{ kind: string; column: string | null }> };
+  const memoStill = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'fact_probe' AND column_name = 'memo'`,
+  );
+  check('★★ 声明里删掉一列 → 阻塞（生成器永不自动删列），`bilite apply` 退 1 且列还在库里',
+    cliApply.code === 1 && aj.blocked.some((c) => c.kind === 'drop-column' && c.column === 'memo') &&
+      Number(memoStill[0]!.n) === 1 && cliApply.err.includes('一行都没动'),
+    `blocked=${aj.blocked.map((c) => c.kind).join(',')} code=${cliApply.code}`);
+
+  // —— ⑦ 收尾：探针表不能留在 e2e 的基线库里（它会变成下一阶段的"无主语义表"）——
+  await db.execute('DROP TABLE fact_probe');
+  await db.execute(`DELETE FROM _meta_columns WHERE table_name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _meta_objects WHERE object_name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _model WHERE name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _model_dep WHERE name = 'fact_probe'`);
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.rmSync(FRESH, { force: true });
+  check('★ 探针清理干净（库里没有无主语义表）', (await metaProblems()).length === 0);
+}
+
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
 //     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 一直是没人管的那份**：

@@ -146,11 +146,23 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
       答不上来就先别加 —— 路径 2（自然语言 → spec）的全部工程价值都在这里，
       **只要语言允许欠约束，写的人（无论人还是 agent）迟早会写出来，而提示词既挡不住也测不了。**
 
+18. **业务表由声明长出来；结构变更一律要人点一次 `bilite apply`。**
+    - 唯一真相是 `models/*.yml`（IR 见 `src/gen/ir.ts`）。**`_meta_columns` 是它的投影**，
+      不是第二份手写声明 —— 谁在别处再写一份"哪些列是什么角色"，谁就造了第二个真相。
+      判据（e2e 第 30 阶段）：两种等价的 YAML 写法解析出**逐字段相同**的 IR。
+    - **启动时只做两件事**：空库引导（一张声明的表都没有 → 把它建起来）、契约刷新（不是 DDL）。
+      **结构变更（DDL）一律不自动做** —— 否则 `bilite plan` 就永远看不到东西，
+      "先见 diff 再决定落地"这条验收标准就成了摆设。
+    - **删列 / 改类型永不自动做**（`plan` 把它们标成阻塞项）：那是丢数据的事，只能由人决定。
+      有阻塞项时 `apply` **整体不动**（连能做的也不做 —— 半个落地比整体不动更难查）。
+    - 新增一张业务表 = 在 `models/` 里加一份声明 + `bilite plan` / `bilite apply`；
+      **不许回头改 `src/gen/` 里的生成器代码**（P3 的判据：表不该随模板增长而需要改代码）。
+
 ## 3. 常用命令
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，395 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，408 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -159,7 +171,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   （条数以实跑输出为准）：模板指纹 → **CLI 解析层与命令表** → 开库 → 接入规格干跑 → 落库 →
   spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 → 语义层 →
   图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **生成器 P2（两种写法同一份 IR / plan 只读 / apply 幂等 / 加列不重写数据 / 删列被拦）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -278,7 +290,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 src/
   cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §7）
-                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · validate · skill export
+                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · plan|apply · validate · skill export
                    （`scanArgs` 是唯一的参数扫描器）
                    ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`（顶层有没有 source）
                    ★ 解析层 parseCliArgs() 是纯函数 —— 不启动任何东西即可覆盖整个命令面
@@ -286,8 +298,18 @@ src/
                    ★ 命令表自检：注册了却没 handler → 启动即报错（别让它静默空转）
                    ★ 退出码就是结论（脚本只看它）：被拒 / 有 error → 1；`needsDecision` 是待办 → 仍 0
                      （干跑也一样 —— "这份源根本读不了"报成成功是最坏的一种安静；e2e 第 28 阶段钉着）
+                   ★ plan / apply 是**两条**命令：plan 只读（连空库引导都不做，见 db/index.ts 的启动策略）；
+                     apply 落地非阻塞项，有阻塞项就整体不动。两者共用同一份 IR 与同一份 DDL 生成
                    ★ query 的受众**写死 human**（铁律 10）—— 没有 `--audience` 这种开关
                    ⚠️ 不许把 CLI 取数命令写进 agent 侧物料 —— 那等于给 agent 开一条取数路（§7.5，e2e 有断言）
+  gen/             ★ 生成器（P2）：models/*.yml → IR → plan → apply。业务表的 DDL 由它长出来
+    ir.ts          ★ IR 定义（表 / 列 / 主键 / 外键 / 角色）+ metaOf()（列契约的**唯一投影**）+ 指纹
+                   ★ 判据：**换一种 YAML 写法，IR 以下一行都不该改**（e2e 拿两种写法对拍）
+    parse.ts       YAML → IR；两种等价写法（分组 keys/measures · 平铺 columns）；
+                   diagnoseModels() 一次给全所有问题；跨表校验 refs 指向的表必须也被声明
+    ddl.ts         IR → DDL（纯函数：plan 给人看的是它、apply 执行的也是它）
+    plan.ts        IR + 现有库结构 → 人可读变更清单（**只读**）；删列 / 改类型 / NOT NULL 列 → 阻塞项
+    apply.ts       plan → 落库（DDL + 列契约 + _model/_model_dep，**同一事务**）
   paths.ts          ★ 源文件路径白名单（resolveSource）—— **唯一实现**，是安全判据，别复制第二份
   land/             ★ 着陆层：源文件 → raw_file / raw_cell（append-only，**"可重放"的唯一依据**）
     raw.ts         landRawFile()：sha256 幂等（同 hash 一格都不重写）+ 只存有值的格
@@ -306,16 +328,18 @@ src/
                    ⚠️ 诚实边界写在导出物里：规格字段清单与判据 code 全集**反射不到**
                      （strip-only，类型在运行时不存在），所以它替代不了 SKILL.md，只是它的可对拍部分
   meta/            ★ 列契约与 catalog：物理层向语义层 / Agent 自省自己（架构 §7.2、§8.5）
-    columns.ts     META：**唯一一份**列角色声明（pk / dim_fk / measure / degenerate / provenance）
-                   + registerMeta()：由 runIngest 在**同一事务**里登记（数据与元数据同时刻产生）
+    columns.ts     META = **声明层的投影**（metaOf(loadModels())，铁律 18 —— 不再手写第二份）
+                   + registerMeta(meta?)：apply 与接入层**两处**登记同一份投影（后者在落库同一事务里）
                    + metaProblems()：把声明与 information_schema 对拍，四类漂移全报（可注入声明，e2e 据此证明它真会抓）
                    + schemaFingerprint()：ddlHash，agent 靠它判断手里那份 catalog 是不是旧的
     catalog.ts     catalogDump() 三层导出（L1 业务成员 / L2 物理结构 / L3 版本）+ catalogShow() 按需下钻
                    ★ 零金额；**不含** raw_* / _ingest_batch / dim_alias —— 那些是运营侧，混进来会把快照撑成运营日志
   db/
-    schema.ts      DDL（四维表 + 事实表 + 批次表 + raw 着陆表 + _meta_* 契约表）+ PERIOD_TYPES 口径注册表
+    schema.ts      **基础元数据** DDL（运营侧 raw_* / import_batch / dim_alias + 控制面 _meta_* / _model*）
+                   + PERIOD_TYPES 口径注册表。★ **业务表（dim_*/fact_*）的 DDL 不在这里** —— 见 src/gen/
                    ⚠️ 整段 DDL 是**模板字符串**：注释里写反引号会把它提前闭合（报错却指在下一行）
-    index.ts       open() / writer() / reader() / query() / execute() / close()
+    index.ts       open(..., { models: ensure | skip }) / writer() / reader() / query() / execute() / close()
+                   + ensureModels()：启动策略见铁律 18（空库引导 + 契约刷新；**DDL 一律不自动做**，有阻塞项即抛错）
                    + exportParquet()（★ 只读实例写归档 → **归档后重开主实例把库锁拿回来**（`reattach()`）
                      → **写完读回来数一遍**；见铁律 11 与 §4 备忘 13）
                    —— 单进程双连接；query() 已处理 BigInt 与 JSON 解析
@@ -439,10 +463,11 @@ data/              ⚠️ 真实财务数据，永不提交
 | 5. 模板 → spec 自动生成 | ✅ **完成**（`template.ts` + `infer.ts` + `generate_spec` + Web 上传模板出草稿） |
 | R1. 主数据对齐 | ✅ **完成**（`resolve.ts` 两档归并 + `dim_alias` 表 + 两阶段 commit + Web 待确认卡片，铁律 16） |
 | §7.2 路径 2 | ✅ **完成**（`dims.ts` / `expr.ts` / `lint.ts` 挡住欠约束 + `lint_spec` 工具 + Web 边打字边诊断，铁律 17） |
-| CLI 入口 | 🚧 **引擎侧 + 物料侧已落地**（`src/cli.ts` + `bin`：`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show`。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出**。`validate` / `skill export` 也已挂（§7.1 的命令面走完了）—— 见 `docs/开发计划.md` §7） |
+| 生成器（P2） | ✅ **完成**（`models/*.yml` → IR → `bilite plan` / `bilite apply`：业务表的 DDL 由声明长出来、`_meta_columns` 是它的投影；启动时不自动改结构，见铁律 18） |
+| CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §7 |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**395 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**408 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
 （含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
 第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。
@@ -455,9 +480,9 @@ data/              ⚠️ 真实财务数据，永不提交
 - ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
   1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
 - ⏸ ~~已推后（用户 2026-10-01 拍板）~~ → **2026-10-02 用户重新拍板：这四项重新开工**
-  （见 `docs/开发计划.md` §6 与 §17）。① **§10 R8 Parquet compaction 已落**（`src/db/compact.ts` +
-  `bilite compact`，第 29 阶段 8 条断言）；② 生成器 `bilite plan/apply`（P2）、③ `fact_business_line`
-  （依赖 ② 的声明层）、④ SCD2 —— 依次进行中。
+  （见 `docs/开发计划.md` §6 与 §17/§18）。① **§10 R8 Parquet compaction 已落**（第 29 阶段 8 条断言）；
+  ② **生成器 P2 已落**（`models/*.yml` → IR → plan / apply，第 30 阶段 13 条断言；业务表的 DDL 不再手写）；
+  ③ `fact_business_line`（吃 ② 的声明层，只差"目标表变成声明"这一步）、④ SCD2 —— 依次进行中。
 
 **§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
 真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），

@@ -1,0 +1,25 @@
+# 指标维度
+kind: dimension
+title: 指标维度
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    semantic: metric
+  - name: name
+    type: varchar
+    notNull: true
+    semantic: metric
+  - name: category
+    type: varchar
+    comment: 主要指标 / 盈利指标 …（spec 的 filter 用）
+  - name: unit
+    type: varchar
+    comment: 元 / 万元 / %
+  - name: direction
+    type: varchar
+    comment: positive（越大越好）/ negative（成本类）
+provenance:
+  - name: alias
+    type: varchar[]

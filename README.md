@@ -6,7 +6,7 @@
 **两个方向**：Excel →（**接入规格**）→ 本地 DuckDB 星型库 →（**报表规格**）→ 按模板渲染的报送 Excel / 图表。
 **三个入口**：**MCP + skill**（agent 与你对话，把模糊模板敲成规格）、**Web**（浏览器三个页签）、
 **CLI**（`bilite`，给人与脚本：`ingest lint|dry-run|run` · `render` · `query` · `catalog dump|show` ·
-`compact` · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
+`compact` · **`plan` / `apply`** · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
 
 财务数据**不以明文进入 LLM 上下文**——这不是靠过滤，是靠架构：agent 根本没有 SQL 权限，
 它只能产出**规格（spec）**，数值第一次出现是在你自己的浏览器里。
@@ -36,7 +36,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 395 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 408 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -304,7 +304,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 395 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 408 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -316,6 +316,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 ```
 src/
   cli.ts             命令行入口（与 Web / MCP 同构的薄壳；数据走 stdout、日志走 stderr）
+  gen/               ★ 生成器：models/*.yml → IR → plan / apply（业务表的 DDL 由声明长出来）
   paths.ts           ★ 源文件路径白名单（唯一实现 —— 它是安全判据，不许再写一份）
   db/schema.ts       DDL（四维表 + 事实表 + 批次表 + raw 着陆表 + 列契约表）+ 口径注册表
   db/index.ts        open / query / execute / exportParquet（单进程双连接）
@@ -337,6 +338,7 @@ src/
   mcp/server.ts      零依赖 MCP stdio 服务端
   server.ts          零框架本地 Web 服务
   web/               三个页签的前端（原生 JS）
+models/              ★ 业务表（dim_* / fact_*）的**声明** —— 它们不再手写 DDL：`bilite plan` → `bilite apply`
 specs/               口径规格 YAML
 ingest/              接入规格 YAML（源文件路径必须指向 data/ 下的稳定位置）
 templates/           原始报送模板（人工制作，不修改）
@@ -350,7 +352,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，395 项断言
+npm run e2e        # ★ 唯一门禁，408 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -398,7 +400,7 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（17 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（18 条铁律）
 
 ## License
 
