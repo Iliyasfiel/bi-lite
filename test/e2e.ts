@@ -1301,6 +1301,37 @@ sheets:
   const NO_PERIOD = UNCONSTRAINED.replace('dim: period_type', 'dim: company').replace('order: [本年累计]', 'order: [华东子公司]');
   check('★ 口径没钉住也拒绝（量纲维是「指标 + 口径」两个）', diagnoseSpec(NO_PERIOD).willBeRejected);
 
+  // —— 口径名写错一个字：实测会**静默变空** → 所以必须解析期就拦（判例见 src/spec/lint.ts 文件头 ④）——
+  {
+    const { parseSpecLenient } = await import('../src/spec/types.ts');
+    const shippedYaml = fs.readFileSync('specs/月度保送表.yaml', 'utf8');
+    const PT_TYPO = shippedYaml.replace('order: [本年累计,', 'order: [本年度累计,');
+
+    // ① 「没人拦会怎样」：绕过 lint（parseSpecLenient）那份照样能编译执行 —— 那一格是 null
+    const firstCell = async (yamlText: string) => {
+      const s = parseSpecLenient(yamlText).spec!;
+      const b = s.sheets[0]!.blocks[0]!;
+      const r = await runCompiled(await compileBlock(b, s.params ?? {}), (sql) => db.query(sql));
+      return (r.matrix[0] as { values: unknown[] }).values[0];
+    };
+    const goodCell = await firstCell(shippedYaml);
+    const badCell = await firstCell(PT_TYPO);
+    check('★ 口径名写错的真实后果：那一格**静默变成空**（对照原样那份：有数 vs null）',
+      typeof goodCell === 'number' && badCell === null,
+      `原样 ${JSON.stringify(goodCell)} vs 写错 ${JSON.stringify(badCell)}`);
+
+    // ② 所以解析期就要拦
+    const dPt = diagnoseSpec(PT_TYPO);
+    check('★ 口径名不在注册表 → 解析期拒绝（PERIODTYPE_UNKNOWN）',
+      dPt.willBeRejected && dPt.issues.some((i) => i.code === 'PERIODTYPE_UNKNOWN'));
+    check('★ 提示里列出已注册的口径（人能照着改）', /本年累计 \/ 去年同期累计/.test(JSON.stringify(dPt.issues)));
+
+    // ③ 参数化的口径标签不误报 —— 替换前不知道它是什么，这里不猜
+    check('★ 参数化的口径标签（{{...}}）不误报',
+      !diagnoseSpec(PT_TYPO.replace('order: [本年度累计,', 'order: ["{{pt}}",'))
+        .issues.some((i) => i.code === 'PERIODTYPE_UNKNOWN'));
+  }
+
   // 正例①：把指标做成轴 → 合法（集团合计的常用形状）
   const BY_METRIC = UNCONSTRAINED
     .replace('dim: company', 'dim: metric')

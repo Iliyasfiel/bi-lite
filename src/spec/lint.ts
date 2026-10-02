@@ -19,7 +19,14 @@
  *      FROM 里却没有 JOIN dim_company → DuckDB 直接报"列不存在"。
  *      （这条会报错，不算静默；但同样属于"写的时候看不出来"。）
  *
- *   这三条有一个共同点：**spec 语法上完全合法，只有跑出来才知道错。**
+ *   ④ **口径名写错一个字**：`order: [本年度累计, ...]`（真名是「本年累计」）。
+ *     实测（2026-10-01）：`parseSpec` 放行、诊断**一条不报**，而那一格在结果矩阵里
+ *     从 **50115 变成 null** —— 写进报送表就是"这一格空着"，看起来像"这一项本月没有数"。
+ *     接入侧早就有 `PERIODTYPE_UNKNOWN` 拦这类（那边靠注入的已注册口径），报表侧一直没有。
+ *     口径取值来自 `src/db/schema.ts` 的 PERIOD_TYPES（铁律 5：新增口径 = 注册进那里），
+ *     与 `semantic/query.ts` 的 `allowedPeriods` **同源** —— 判据只有一份。
+ *
+ *   这四条有一个共同点：**spec 语法上完全合法，只有跑出来才知道错。**
  *   而 §7.2 路径 2 是「让 agent 从一句自然语言写 spec」—— 如果语言本身允许
  *   欠约束的 spec，那么 agent 每写一次都可能静默算错一次。
  *   所以路径 2 的前置条件不是"提示词写得好"，而是**语言本身把错误挡在解析期**。
@@ -30,6 +37,7 @@
 import type { Spec, Block, SheetSpec } from './types.ts';
 import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
 import { exprRefs, ExprError, parseExpr } from './expr.ts';
+import { PERIOD_TYPES } from '../db/schema.ts';
 
 export type LintLevel = 'error' | 'warn';
 
@@ -45,6 +53,7 @@ export interface LintIssue {
     | 'DIM_UNKNOWN'
     | 'ORDER_EMPTY'
     | 'ORDER_DUPLICATE'
+    | 'PERIODTYPE_UNKNOWN'
     | 'VALUE_MISSING'
     | 'ANCHOR_MISSING'
     | 'SHEET_NO_BLOCK'
@@ -180,6 +189,24 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
         //   判据只有一份（铁律 17），所以这里必须是 error，让 parseSpec 直接拒绝。
         hint: '重复的标签会互相覆盖到同一个格子（只写进去一条，另一条静默消失）。请在模板里改成不同的名字，或从 order 里删掉多余项。',
       });
+    }
+    // ★ 口径名必须是注册过的口径（判例见文件头 ④）。
+    //   只查**字面量**：带 {{参数}} 的标签要等替换之后才知道是什么，这里不猜。
+    if (spec.dim === 'period_type' && order.length) {
+      const registered = new Set(PERIOD_TYPES.map((p) => p.id));
+      const bad = [...new Set(order.map(String).filter((x) => !x.includes('{{') && !registered.has(x)))];
+      if (bad.length) {
+        out.push({
+          level: 'error',
+          code: 'PERIODTYPE_UNKNOWN',
+          at: `${at}.${axis}.order`,
+          message: `口径名不在注册的口径里：${bad.slice(0, 3).join('、')}。`,
+          hint:
+            `已注册的口径：${PERIOD_TYPES.map((p) => p.id).join(' / ')}。`
+            + '写错一个字不会被别的判据拦住 —— 而实测那一格会**静默变成空**（本该有数、结果 null），'
+            + '写进报送表就像"这一项没有数"。要新增口径，注册进 src/db/schema.ts 的 PERIOD_TYPES（铁律 5）。',
+        });
+      }
     }
   }
 
