@@ -103,6 +103,17 @@ log('\n════════ 0.5 CLI（解析层与命令表）════�
     [['ingest', 'lint', 'x.yaml', '--decisions', 'd.json'], 'usage-error'],
     [['ingest', 'lint', 'x.yaml', '--strict'], 'usage-error'],
     [['ingest', 'run', 'x.yaml', '--nope'], 'usage-error'],
+    [['compact'], 'compact'],
+    [['compact', '--dry-run'], 'compact'],
+    [['compact', '--table', 'fact_finance', '--max-bytes', '1024'], 'compact'],
+    [['compact', '--max-bytes', 'abc'], 'usage-error'],
+    [['compact', '--min-files', '1'], 'usage-error'],
+    [['compact', 'x'], 'usage-error'],
+    [['plan'], 'plan'],
+    [['plan', '--check'], 'plan'],
+    [['apply', '--models', 'models'], 'apply'],
+    [['plan', 'x'], 'usage-error'],
+    [['apply', '--check'], 'usage-error'],
   ];
   const wrong = cases.filter(([argv, want]) => parseCliArgs(argv).kind !== want);
   check('★ parseCliArgs 是纯函数，命令面全覆盖', wrong.length === 0,
@@ -154,18 +165,25 @@ log('\n════════ 0.5 CLI（解析层与命令表）════�
   const os = await import('node:os');
   const pathMod = await import('node:path');
   const tmp = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'bilite-cli-'));
-  let helpOut = '';
-  let helpCode = 0;
-  try {
-    helpOut = execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), '--help'], {
-      cwd: tmp, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (e) {
-    helpCode = (e as { status?: number }).status ?? -1;
-  }
-  check('★ 子进程 `bilite --help` 在空目录里跑通', helpCode === 0 && helpOut.includes('用法'),
-    `code=${helpCode}`);
-  check('★ --help 不碰库（空目录里没生出 data/）', !fs.existsSync(pathMod.join(tmp, 'data')));
+  const cliOut = (args: string[]) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), ...args], {
+        cwd: tmp, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }) };
+    } catch (e) {
+      return { code: (e as { status?: number }).status ?? -1, out: '' };
+    }
+  };
+  const help = cliOut(['--help']);
+  // `compact` 合并的是**归档目录**，不是库 —— 所以空目录里它也跑得通，
+  //   而且同样不该生出 data/（它连 open() 都不需要，见 db/compact.ts 头部）。
+  const compact = cliOut(['compact', '--dry-run']);
+  check('★ 子进程 `bilite --help` 在空目录里跑通', help.code === 0 && help.out.includes('用法'),
+    `code=${help.code}`);
+  check('★ `bilite compact --dry-run` 在空归档上跑通：没有候选是**正常结果**，不是失败',
+    compact.code === 0 && (JSON.parse(compact.out) as { results: unknown[] }).results.length === 0,
+    `code=${compact.code}`);
+  check('★ --help 与 compact 都不碰库（空目录里没生出 data/）', !fs.existsSync(pathMod.join(tmp, 'data')));
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
@@ -175,6 +193,48 @@ fs.rmSync('data/bi.duckdb', { force: true });
 fs.rmSync('data/parquet', { recursive: true, force: true });
 await db.open('data/bi.duckdb');
 check('DuckDB 打开 + 建表', true);
+
+// —— 自包含守卫：本测试跑用到的接入规格，**规格与它的源文件都必须真的在** ——
+//    （都在 test/fixtures/ 下，由 `npm run fixtures` 生成；`test/fixtures/` 是 gitignore 的生成物。）
+//    ★ 判例（2026-10-02）：第 19 阶段曾借**生产规格** `ingest/月度经营接入.yaml`，
+//      而它的 source 是 gitignored 的真实数据 —— 作者本机全绿、**干净克隆 364/1**。
+//      公开仓库的验收脚本不该有"作者本机才有那份数据"这种前置条件。
+{
+  const { parseIngestSpec: parseFixture } = await import('../src/ingest/types.ts');
+  const fixtureSpecs = [
+    'test/fixtures/月度经营接入.yaml',
+    'test/fixtures/集团导出长表.yaml',
+    'test/fixtures/接入-对齐1.yaml',
+    'test/fixtures/接入-对齐2.yaml',
+    'test/fixtures/接入-对齐3.yaml',
+    'test/fixtures/接入-对齐4.yaml',
+    'test/fixtures/接入-对齐5.yaml',
+    'test/fixtures/接入-日期格.yaml',
+    'test/fixtures/接入-日期格1904.yaml',
+    'test/fixtures/接入-业务线.yaml',
+  ];
+  // ★ 诊断要带上**声明**：接入规格的 target 也是判据的一部分（铁律 18）。
+  //   注入的是 models/ 的投影，**不碰库** —— 这一段跑在开库之前。
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+  const bad = fixtureSpecs.filter(
+    (y) =>
+      !fs.existsSync(y) ||
+      !fs.existsSync(parseFixture(fs.readFileSync(y, 'utf8'), { facts: declaredFactsOf() }).source),
+  );
+  check('★ e2e 用的夹具规格都自包含（规格与它的源都在 —— 不借 data/ 里的私有数据）',
+    bad.length === 0, bad.length ? `缺：${bad.join('、')}` : `${fixtureSpecs.length} 份都齐`);
+
+  // 再钉一条：本文件里**不许**出现「读 `ingest/` 下的规格去跑」的写法。
+  //   上一条只保证"我列的那几份夹具齐"；这一条挡的是"又有人新借一份生产规格"——
+  //   对 `ingest/` 的使用只许停在 lint / validate / 列表（那几件事都不读源文件）。
+  const selfText = fs.readFileSync('test/e2e.ts', 'utf8');
+  const borrows = /readFileSync\(\s*['"]ingest\//.test(selfText);
+  check('★ e2e 不把生产规格（ingest/ 下的）当运行输入（只许 lint / validate / 列表）',
+    !borrows,
+    borrows
+      ? '本文件里仍有「读 ingest/ 下的规格」的写法 —— 那种规格的源在 data/ 里，干净克隆跑不通'
+      : '对 ingest/ 只用 lint / validate / 列表（那几件事都不读源文件）');
+}
 
 // ============ 2. 接入规格：干跑（形状与判定，一次库都不写）============
 log('\n════════ 2. 接入规格（干跑）════════');
@@ -1858,7 +1918,12 @@ log('\n════════ 19. 装载事务化（不留半个批次）═�
   const { runIngest } = await import('../src/ingest/run.ts');
   const { parseIngestSpec } = await import('../src/ingest/types.ts');
   const { masterCatalog } = await import('../src/ingest/master.ts');
-  const spec = parseIngestSpec(fs.readFileSync('ingest/月度经营接入.yaml', 'utf8'));
+  // ★ 用**夹具规格**，不是 `ingest/月度经营接入.yaml` —— 那份是生产规格，源在 data/ 里、不在库里。
+  //   判例（2026-10-02；第 17 阶段当时改对了，这里漏了）：借生产规格时，**干净克隆里这一阶段根本不抛错** ——
+  //   源文件不存在 → `runIngest` 在关卡 0 就返回 SOURCE_NOT_FOUND，走不到阶段 2 的抛点，
+  //   于是「中途失败确实抛错」在作者本机绿、在干净克隆红（364/1）。
+  //   **测试借生产数据 = 门禁依赖作者本机**，公开仓库不该这样。
+  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8'));
   const counts = async () => {
     const one = async (t: string) =>
       Number((await db.query<{ n: number }>(`SELECT count(*) AS n FROM ${t}`))[0]!.n);
@@ -1994,10 +2059,14 @@ log('\n════════ 21. CLI render / query（受众与物料隔离�
 
   // —— ★ docs/开发计划.md §7.5：CLI 的取数命令**不许出现在 agent 侧物料里** ——
   //    「agent 的官方工作流里不能存在一条指向它的路」——这句话只有变成断言才算数。
+  //    ★ 两份 agent 侧物料都扫：操作手册（SKILL.md）与接线的配置 prompt（AGENT-PROMPT.md）。
   const skill = fs.readFileSync('skills/bi-lite-ingest/SKILL.md', 'utf8');
-  const leaked = ['bilite query', 'bilite render', 'bilite ingest run'].filter((s) => skill.includes(s));
-  check('★ agent 手册里不出现 CLI 的取数/落库命令（那是人的入口）',
-    leaked.length === 0, leaked.length ? leaked.join('、') : 'SKILL.md 干净');
+  const agentPrompt = fs.readFileSync('skills/bi-lite-ingest/AGENT-PROMPT.md', 'utf8');
+  const leaked = ['bilite query', 'bilite render', 'bilite ingest run'].filter(
+    (s) => skill.includes(s) || agentPrompt.includes(s),
+  );
+  check('★ agent 侧物料（手册 + 配置 prompt）里都不出现 CLI 的取数/落库命令（那是人的入口）',
+    leaked.length === 0, leaked.length ? leaked.join('、') : '两份都干净');
 }
 
 // ============ 22. catalog：把「库里现在有什么」交给 agent ============
@@ -2055,14 +2124,36 @@ log('\n════════ 22. catalog（列契约与三层导出）══�
     badTopic.includes('现有：'), badTopic.slice(0, 40));
 
   // —— CLI 那一侧：数据走 stdout、摘要走 stderr ——
+  //   ★ 跑的是**真命令**（进程内 `main`），不是只过解析层 —— CLI 是三个入口里唯一给脚本用的那个，
+  //     薄壳把 flag 名、退出码、JSON 字段写错，只有真跑一遍才会红（`catalog show` 此前是零覆盖）。
   const { main } = await import('../src/cli.ts');
-  const o: string[] = []; const e: string[] = [];
-  const code = await main(['catalog', 'dump'], { out: (t) => void o.push(t), err: (t) => void e.push(t) });
-  const fromCli = JSON.parse(o.join('')) as { drift: string[]; objects: unknown[] };
+  const cli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  const dump = await cli(['catalog', 'dump']);
+  const fromCli = JSON.parse(dump.out) as { drift: string[]; objects: unknown[] };
   check('CLI `catalog dump` 跑通（退出码 0 表示契约没漂移，stdout 是合法 JSON）',
-    code === 0 && fromCli.drift.length === 0 && fromCli.objects.length === META.length,
-    `code=${code} 对象=${fromCli.objects.length}`);
-  check('CLI 的摘要走 stderr', e.join('').includes('catalog dump'), e.join('').trim());
+    dump.code === 0 && fromCli.drift.length === 0 && fromCli.objects.length === META.length,
+    `code=${dump.code} 对象=${fromCli.objects.length}`);
+  check('CLI 的摘要走 stderr', dump.err.includes('catalog dump'), dump.err.trim());
+
+  // —— CLI `catalog show`：按需下钻那一侧也真跑一次，且与库层是**同一份结论** ——
+  const show = await cli(['catalog', 'show', 'fact_finance']);
+  const one = JSON.parse(show.out) as { name: string; grain: string; columns: unknown[] };
+  check('★ CLI `catalog show` 跑通：stdout 就是那一张表（不是整库），结论与库层一致',
+    show.code === 0 && one.name === 'fact_finance' && one.grain === ff.grain &&
+      one.columns.length === ff.columns.length,
+    `code=${show.code} ${one.name} ${one.columns.length} 列`);
+  check('CLI `catalog show` 零金额、摘要走 stderr',
+    findAmountLike(one).length === 0 && show.err.includes('catalog show'),
+    `${findAmountLike(one).length} 处金额 | ${show.err.trim()}`);
+  const showBad = await cli(['catalog', 'show', '不存在的表']);
+  check('★ CLI `catalog show` 面对不存在的对象：退 1、stdout 一个字节都不写，stderr 是人话（列出有哪些）',
+    showBad.code === 1 && showBad.out.length === 0 && showBad.err.includes('现有：'),
+    `code=${showBad.code} ${showBad.err.trim().slice(0, 40)}`);
 }
 
 // ============ 23. CLI `validate`：一份命令，两份判据 ============
@@ -2115,6 +2206,7 @@ log('\n════════ 24. skill export 与手册对拍 ═════
   const { skillFactsFrom, skillProblems, skillPrompt } = await import('../src/skill/export.ts');
   const { TOOLS } = await import('../src/mcp/tools.ts');
   const skillText = fs.readFileSync('skills/bi-lite-ingest/SKILL.md', 'utf8');
+  const promptText = fs.readFileSync('skills/bi-lite-ingest/AGENT-PROMPT.md', 'utf8');
   const names = TOOLS.map((t) => t.name);
 
   // —— ★ 对拍：手写的 SKILL.md 有没有落后于实现 ——
@@ -2122,6 +2214,14 @@ log('\n════════ 24. skill export 与手册对拍 ═════
   const drift = skillProblems(skillText, names);
   check('★ 手册与实现没漂：每个 MCP 工具都在手册里出现，且自报条数与实现一致',
     drift.length === 0, drift.slice(0, 2).join(' | '));
+
+  // —— ★ 配置 prompt 走**同一份判据**（第二份手写物料同样会漂）——
+  const promptDrift = skillProblems(promptText, names);
+  check('★ 配置 prompt（AGENT-PROMPT.md）与实现没漂：同一个 skillProblems() 判据',
+    promptDrift.length === 0, promptDrift.slice(0, 2).join(' | ') || '干净');
+  // —— 而且它必须真的**能接线**：写了 MCP 配置的落点（server.ts + stdio）——
+  check('★ 配置 prompt 里真的给出了接入方式（stdio + src/mcp/server.ts）',
+    /src\/mcp\/server\.ts/.test(promptText) && /stdio/i.test(promptText) && /"mcpServers"/.test(promptText));
 
   // —— 但"守卫存在"不等于"守卫有用"：喂它两种漂移，都得抓出来 ——
   check('★ 守卫抓得住「加了工具却没写进手册」',
@@ -2236,6 +2336,24 @@ sheets:
     const upEvil = await up2('../../etc/evil.xlsx', buf);
     check('③ ★ 文件名里的路径成分被剥掉（safeName），落点仍在 data/uploads/',
       upEvil.file.startsWith('data/uploads/') && !upEvil.file.includes('..'), upEvil.file);
+
+    // —— ③' 上传件**只增不减**是设计，不是欠账（清理是人工动作，判据写在 AGENTS.md §7）——
+    //    ★ 这里挡的是"顺手加一个自动清理"：生产接入规格的 `source:` 可以直接指向
+    //      `data/uploads/` 下的文件，删掉它那条规格立刻变成死路径、**而且没有任何提示**
+    //      —— 正是 docs/开发计划.md §12.1 那个真问题的形态。
+    //    ★ 判据不是"文件在不在"（干净克隆里根本没有 uploads/），而是"有没有代码去删它"，
+    //      所以它在任何机器上都成立。
+    const removesUploads = (text: string) =>
+      /rmSync|unlinkSync|fs\.rm\s*\(/.test(text) && /uploads/.test(text);
+    const offenders = fs
+      .readdirSync('src', { recursive: true })
+      .filter((p) => p.endsWith('.ts'))
+      .map((p) => `src/${p}`)
+      .filter((f) => removesUploads(fs.readFileSync(f, 'utf8')));
+    check('★ 没有任何代码会自动删 data/uploads/ 里的上传件（只增不减是设计；要删得先满足 §7 那两条判据）',
+      offenders.length === 0, offenders.join('、'));
+    check('★ 上面那条守卫真的会抓漂移：喂一段"删上传件"的写法它必须命中',
+      removesUploads(`fs.unlinkSync(path.join('data/uploads', name))`));
 
     // —— ④ 干跑：形状说清楚，且**一次库都不写** ——
     const yaml = baseYaml.replace(/^source\s*:.*$/m, `source: ${upl.file}`);
@@ -2605,23 +2723,641 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
     badType.issues.map((i) => i.code).join(','));
 }
 
+// ============ 28. CLI `ingest dry-run` / `ingest run`：薄壳真的跑通一遍 ============
+log('\n════════ 28. CLI ingest dry-run / run（真读源、真落库）════════');
+{
+  // ★ 补的是一个**覆盖缺口**：这两个命令此前只过了解析层（`parseCliArgs` 认得它们）——
+  //   引擎侧哪怕把 `planOnly` 传反、把"被拒"映射成退出码 0，也没有一条断言会红。
+  //   而 CLI 恰恰是三个入口里**唯一给脚本**的那个：脚本只看退出码，
+  //   "安静地报成功却没写库"正是本仓库最讨厌的失败形态（铁律 12）。
+  //   ★ 用夹具而不是生产规格 —— 干净克隆里也得跑得动（第 19 阶段那条教训）。
+  const { main } = await import('../src/cli.ts');
+  const cli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+  const facts = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const SPEC = 'test/fixtures/集团导出长表.yaml';
+
+  // —— ① 干跑：真读源文件、只回形状；一次库都不写 ——
+  const before = await facts();
+  const dry = await cli(['ingest', 'dry-run', SPEC]);
+  const dryJson = JSON.parse(dry.out) as {
+    planOnly: boolean; ok: boolean; inserted: number;
+    shape: { blocks: Array<{ coordinates: { total: number } }> };
+  };
+  check('★ CLI `ingest dry-run` 真跑通（退出码 0 + planOnly 标记），且一次库都不写',
+    dry.code === 0 && dryJson.planOnly === true && dryJson.ok === true && (await facts()) === before,
+    `code=${dry.code} ok=${dryJson.ok} 事实行 ${before} → ${await facts()}`);
+  check('干跑读到的是真实形状（960 个坐标），返回里没有任何金额',
+    dryJson.shape.blocks[0]!.coordinates.total === 960 && findAmountLike(dryJson).length === 0,
+    `坐标=${dryJson.shape.blocks[0]!.coordinates.total} 金额=${findAmountLike(dryJson).length} 处`);
+  check('干跑：数据走 stdout、摘要在 stderr（脚本能直接 `> report.json` 接管道）',
+    dry.out.trim().startsWith('{') && !dry.out.includes('bilite ingest dry-run') &&
+      dry.err.includes('bilite ingest dry-run'));
+
+  // —— ② 结构诊断不过的规格 → 退 1 且标 `refused`：这一步**连源文件都不读** ——
+  const BAD = 'test/fixtures/.e2e-cli-坏规格.yaml';
+  fs.writeFileSync(BAD, fs.readFileSync(SPEC, 'utf8').replace('anchor: E2', 'anchor: 不是坐标'));
+  try {
+    const refused = await cli(['ingest', 'dry-run', BAD]);
+    const rj = JSON.parse(refused.out) as { refused?: boolean; errors: Array<{ code: string }> };
+    check('★ 结构诊断不过的规格：CLI 退 1、标 `refused`，且一步都没读源文件',
+      refused.code === 1 && rj.refused === true && (rj.errors ?? []).length > 0,
+      `code=${refused.code} refused=${rj.refused} 码=${(rj.errors ?? []).map((x) => x.code).join(',')}`);
+  } finally {
+    fs.rmSync(BAD, { force: true });
+  }
+
+  // —— ②' 静态诊断过了、但源**读不到**（白名单外）：也要退 1 ——
+  //    ★ 这条是写这段断言时**当场撞出来的真缺陷**：干跑原先无论有没有 error 都退 0，
+  //      于是 `export BILITE_DB=... ; bilite ingest dry-run x.yaml || echo 失败` 这种脚本
+  //      会把"这份源根本读不了"当成成功。现在 error 一律退 1（`needsDecision` 才退 0）。
+  const OUTSIDE = 'test/fixtures/.e2e-cli-白名单外.yaml';
+  fs.writeFileSync(OUTSIDE, fs.readFileSync(SPEC, 'utf8').replace(/^source:.*$/m, 'source: /etc/passwd'));
+  try {
+    const outside = await cli(['ingest', 'dry-run', OUTSIDE]);
+    const oj = JSON.parse(outside.out) as { errors: Array<{ code: string }> };
+    check('★ 源在白名单外：CLI 干跑退 1 并报 SOURCE_OUTSIDE_ROOTS（"读不了"不是成功）',
+      outside.code === 1 && oj.errors.some((x) => x.code === 'SOURCE_OUTSIDE_ROOTS'),
+      `code=${outside.code} 码=${oj.errors.map((x) => x.code).join(',')}`);
+  } finally {
+    fs.rmSync(OUTSIDE, { force: true });
+  }
+
+  // —— ③ 真落库：自己造一个干净起点（这份长表的坐标在前面的阶段里已经存在，规格是 reject）——
+  await db.execute('DELETE FROM fact_finance');
+  const at0 = await facts();
+  const run = await cli(['ingest', 'run', SPEC]);
+  const rj = JSON.parse(run.out) as {
+    ok: boolean; inserted: number; batchId: string | null; archived: boolean; errors: unknown[];
+  };
+  check('★ CLI `ingest run` 真落了库：退出码 0、批次有 id、Parquet 归档成功',
+    run.code === 0 && rj.ok === true && rj.batchId !== null && rj.archived === true,
+    `code=${run.code} 批次=${rj.batchId} 归档=${rj.archived}`);
+  // ★ 判据来自**独立算法**（直接 SQL 数一遍），不是信返回值里的 inserted（AGENTS.md §6.1）
+  const at1 = await facts();
+  check('★★ 落库行数以直接 SQL 为准：库内 0 → 960，与自报的 inserted 一致',
+    at0 === 0 && at1 - at0 === 960 && rj.inserted === 960, `库内 ${at0} → ${at1}，自报 ${rj.inserted}`);
+  check('CLI `ingest run` 的返回值里没有金额（只回路径与计数）',
+    findAmountLike(rj).length === 0, `${findAmountLike(rj).length} 处`);
+
+  // —— ④ 同一份再落一次：规格是 reject → 整批拒绝、退 1，不静默覆盖 ——
+  const again = await cli(['ingest', 'run', SPEC]);
+  const aj = JSON.parse(again.out) as { errors: Array<{ code: string }> };
+  check('★ 重复落库：CLI 退 1 并报 CONFLICT_WITH_EXISTING（"被拒"这件事映射到了退出码，脚本看得见）',
+    again.code === 1 && aj.errors.some((x) => x.code === 'CONFLICT_WITH_EXISTING'),
+    `code=${again.code} 码=${aj.errors.map((x) => x.code).join(',') || '(无)'}`);
+  check('被拒的那一次一行都没写（库内行数不变）', (await facts()) === at1, `${at1} → ${await facts()}`);
+
+  // —— ⑤ 1904 日期系统的工作簿：引擎在**着陆之前**响亮拒绝 → CLI 退 1 且把原因写在 stderr ——
+  const d1904 = await cli(['ingest', 'run', 'test/fixtures/接入-日期格1904.yaml']);
+  check('★ 引擎的响亮拒绝映射成退出码 1（不是"安静的 ok"），stderr 给出原因',
+    d1904.code === 1 && /1904/.test(d1904.err), d1904.err.trim().slice(0, 60));
+}
+
+// ============ 29. Parquet 归档的小文件合并（R8 compaction）============
+log('\n════════ 29. Parquet 归档 compaction（R8）════════');
+{
+  // ★ 这一段守的是 R8：归档层是**只增不减**的 KB 级碎片（1000 行 ≈ 5KB，实测）。
+  //   合并本身不难，难的是"删源文件"那一步 —— 所以本阶段的判据重心全在**守卫**上：
+  //   ① 合并后逐 batch_id 与**合并前独立记下的行数**对上（不是只比总数：总数相等会掩盖"某个源是 0 行"）；
+  //   ② 对拍不过 → 抛错，**一个源文件都不删**、半个产物都不留；
+  //   ③ 没有候选是**正常结果**（退 0），不是失败；
+  //   ④ 0 行的残骸不动它、单独报出来、并让脚本看见（退 1）—— 它是过去某次归档失败的证据。
+  const cmp = await import('../src/db/compact.ts');
+  const { main } = await import('../src/cli.ts');
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+  interface OneResult {
+    table: string; merged: string | null; sources: string[]; rows: number;
+    perBatch: Record<string, number>; skipped: Array<{ dir: string; reason: string }>; note: string;
+  }
+  type CliOut = { tables: string[]; results: OneResult[]; suspects: string[] };
+  const snap = () => cmp.listArchiveDirs('fact_finance').map((d) => `${d.name}:${d.bytes}`).join('|');
+
+  const before = cmp.listArchiveDirs('fact_finance');
+  check('前置：磁盘上有 ≥ 2 个小归档目录（否则这一阶段什么都没验）', before.length >= 2, `${before.length} 个`);
+
+  // ★ 合并前先把"每个源文件里有多少行"独立记下来 —— 源文件马上就会被删掉，
+  //   而**对拍必须跟删除之前的事实比**（拿删除之后的磁盘去比是在自证）。
+  const preCounts = await cmp.countPerBatch(before.map((d) => d.file));
+  const preTotal = Object.values(preCounts).reduce((a, b) => a + b, 0);
+
+  // —— ① dry-run：计划给你看，一个字节都不动 ——
+  const beforeSnap = before.map((d) => `${d.name}:${d.bytes}`).join('|');
+  const dry = await runCli(['compact', '--dry-run']);
+  const dj = JSON.parse(dry.out) as CliOut;
+  check('★ `compact --dry-run` 报出候选与行数，但磁盘一个字节都没动',
+    dry.code === 0 && dj.results[0]!.sources.length === before.length &&
+      dj.results[0]!.rows === preTotal && dj.results[0]!.merged === null && snap() === beforeSnap,
+    `${dj.results[0]!.sources.length} 个候选 / ${dj.results[0]!.rows} 行 / 磁盘未变`);
+
+  // —— ② 真跑：合并 + 逐批次对拍 + 删源 ——
+  const real = await runCli(['compact']);
+  const rj = JSON.parse(real.out) as CliOut;
+  const res0 = rj.results[0]!;
+  const left = cmp.listArchiveDirs('fact_finance');
+  check('★ 合并成功：产物存在、源目录已删、只剩一个归档目录',
+    real.code === 0 && res0.merged !== null && fs.existsSync(`${res0.merged}/part.parquet`) &&
+      res0.sources.every((s) => !fs.existsSync(s)) && left.length === 1,
+    `${res0.sources.length} 个小文件 → 1（${left[0]?.name}）`);
+
+  const gotPairs = Object.entries(res0.perBatch).sort();
+  const wantPairs = Object.entries(preCounts).filter(([, n]) => n > 0).sort();
+  check('★★ 逐批次对拍：产物的 batch_id → 行数与**合并前独立记下的**那一份完全相同',
+    JSON.stringify(gotPairs) === JSON.stringify(wantPairs) && res0.rows === preTotal,
+    `产物 ${gotPairs.length} 个批次 / ${res0.rows} 行 vs 合并前 ${wantPairs.length} 个批次 / ${preTotal} 行`);
+
+  // —— ②' 再加一道**真独立**的算法：库里的同一批还在的，行数必须与产物一致 ——
+  const ids = gotPairs.map(([b]) => `'${b}'`).join(', ');
+  const fromDb = await db.query<{ batch_id: string; n: number }>(
+    `SELECT batch_id, count(*) AS n FROM fact_finance WHERE batch_id IN (${ids}) GROUP BY 1`,
+  );
+  const dbMap = new Map(fromDb.map((r) => [r.batch_id, Number(r.n)]));
+  const disagreed = [...dbMap].filter(([b, n]) => (res0.perBatch[b] ?? 0) !== n);
+  check('★★ 产物与**库**对拍（独立算法：直接 SQL 数事实行；历史上被 DELETE 过的批次不在库里，自动跳过）',
+    disagreed.length === 0 && dbMap.size > 0,
+    `${dbMap.size} 个仍在库里的批次逐一对上`);
+
+  // —— ③ 幂等：再跑就没有候选（而且这不是失败）——
+  const again = await runCli(['compact']);
+  const aj = JSON.parse(again.out) as CliOut;
+  check('★ 幂等：没有候选时 merged=null 且退 0（"没有可合并的"是正常结果）',
+    again.code === 0 && aj.results[0]!.merged === null && snap() === left.map((d) => `${d.name}:${d.bytes}`).join('|'),
+    aj.results[0]!.note);
+
+  // —— ④ ★ 守卫真的会抓：喂错的期望值 → 抛错，且一个源文件都不删、半个产物都不留 ——
+  const probe = 'data/parquet/_probe';
+  fs.mkdirSync(`${probe}/batch=g1`, { recursive: true });
+  fs.mkdirSync(`${probe}/batch=g2`, { recursive: true });
+  for (const g of ['g1', 'g2']) fs.copyFileSync(`${res0.merged}/part.parquet`, `${probe}/batch=${g}/part.parquet`);
+  const srcs = cmp.listArchiveDirs('_probe');
+  let guardErr = '';
+  try {
+    await cmp.mergeArchives(`${probe}/compacted=guard`, srcs, { g1: 1, g2: 1 }); // 故意错的期望值
+  } catch (e) { guardErr = (e as Error).message; }
+  check('★ 合并的守卫真的会抓：逐批次对不上 → 抛错，源一个不删、半个产物也不留',
+    /对不上/.test(guardErr) && srcs.length === 2 && srcs.every((s) => fs.existsSync(s.file)) &&
+      !fs.existsSync(`${probe}/compacted=guard`),
+    guardErr.slice(0, 70));
+  fs.rmSync(probe, { recursive: true, force: true });
+
+  // —— ⑤ 0 行残骸：不动它、报出来、退 1（R13 那种"安静的失败"要能被看见）——
+  //    造法是真的：用一条恒假的查询导出一份 0 行归档 —— 与过去那次失败留下的东西一模一样。
+  const EMPTY = 'data/parquet/fact_finance/batch=zz-empty';
+  fs.mkdirSync(EMPTY, { recursive: true });
+  await db.exportParquet(
+    `COPY (SELECT * FROM fact_finance WHERE 1 = 0) TO '${EMPTY}/part.parquet' (FORMAT parquet)`,
+  );
+  const sus = await runCli(['compact']);
+  const sj = JSON.parse(sus.out) as CliOut;
+  check('★ 0 行残骸：不参与合并、不被删、单独报出来，并且**退 1**（安静的残骸是最坏的那种）',
+    sus.code === 1 && sj.suspects.length === 1 && sj.suspects[0] === EMPTY &&
+      fs.existsSync(`${EMPTY}/part.parquet`),
+    `${sj.suspects.length} 个残骸 | code=${sus.code} | ${sus.err.trim().slice(0, 50)}`);
+  fs.rmSync(EMPTY, { recursive: true, force: true });
+}
+
+// ============ 30. 生成器（P2）：models/*.yml → IR → plan / apply ============
+log('\n════════ 30. 生成器 P2（声明 → IR → plan / apply）════════');
+{
+  // ★ 这一阶段守的是 P2 的**全部验收标准**（`docs/开发计划.md` §3 P2）：
+  //   ① IR 是真抽象 —— 换一种 YAML 写法，IR 以下一行都不该改；
+  //   ② apply 幂等 —— 落完地再 plan，diff 为空；
+  //   ③ 加列 → plan 只报那一列 → apply 后**数据不重写**；
+  //   ④ `_meta_columns` 与真实库结构不漂移（契约是声明的投影，不是第二份真相）；
+  //   ⑤ plan 与 apply 是**两条**命令：plan 一个字节都不写（判据是那个库里真的没有业务表）。
+  const gen = await import('../src/gen/parse.ts');
+  const irMod = await import('../src/gen/ir.ts');
+  const planMod = await import('../src/gen/plan.ts');
+  const applyMod = await import('../src/gen/apply.ts');
+  const { META, metaProblems } = await import('../src/meta/columns.ts');
+  const { main } = await import('../src/cli.ts');
+  const { DuckDBInstance } = await import('@duckdb/node-api');
+  const { execFileSync } = await import('node:child_process');
+  const pathMod = await import('node:path');
+
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① IR 是真抽象：同一张表两种写法 → 逐字段相同的 IR ——
+  const probes: Array<{ name: string; n: number }> = [];
+  const flat = [
+    'kind: fact',
+    'title: 探针表',
+    'grain: [a, b]',
+    'columns:',
+    '  - { name: a, type: date, role: pk, key: true }',
+    '  - { name: b, type: varchar, role: dim_fk, key: true, refs: dim_probe }',
+    '  - { name: n, type: integer, role: measure, unit: 件, semantic: count }',
+    '  - { name: batch_id, type: varchar, role: provenance }',
+  ].join('\n');
+  const split = [
+    'kind: fact',
+    'title: 探针表',
+    'grain: [a, b]',
+    'keys:',
+    '  - { name: a, type: date, key: true }',
+    '  - { name: b, type: varchar, role: dim_fk, key: true, refs: dim_probe }',
+    'measures:',
+    '  - { name: n, type: integer, unit: 件, semantic: count }',
+    'provenance:',
+    '  - { name: batch_id, type: varchar }',
+  ].join('\n');
+  const irFlat = gen.parseModel(flat, 'fact_probe.yml');
+  const irSplit = gen.parseModel(split, 'fact_probe.yml');
+  check('★★ IR 是真抽象：同一张表的两种 YAML 写法（平铺 / 分组）解析出**逐字段相同**的 IR',
+    JSON.stringify(irFlat) === JSON.stringify(irSplit),
+    `列=${irFlat.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}`).join(',')}`);
+
+  // ★ 断言里的数字取自**声明本身**（不是写死的 5/6）：加一张声明表不该让断言红 ——
+  //   那正是"表由声明长出来"的意思。
+  const declaredTables = gen.loadModels().tables.length;
+
+  // —— ② 业务表真由声明长出来（e2e 的库就是 open() 空库引导建起的）——
+  const bizTables = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
+      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+  );
+  const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
+  const deps = await db.query<{ depends_on: string }>(
+    `SELECT DISTINCT depends_on FROM _model_dep WHERE name = 'fact_finance' ORDER BY 1`,
+  );
+  check(`★ ${declaredTables} 张业务表由 models/*.yml 生成（不是手写 DDL 建的）`,
+    Number(bizTables[0]!.n) === declaredTables && Number(modelRows[0]!.n) === declaredTables,
+    `业务表 ${bizTables[0]!.n} / _model ${modelRows[0]!.n} / 声明 ${declaredTables}`);
+  check('★ `_model_dep` 依赖图由 apply 写入：fact_finance → dim_company / dim_metric',
+    deps.map((d) => d.depends_on).join(',') === 'dim_company,dim_metric');
+
+  // —— ③ plan 幂等 + 契约同源 ——
+  const plan = await planMod.planModels(gen.loadModels());
+  check('★ plan 幂等：刚落完地的库 diff 为空（这正是"apply 之后再次 plan → 空 diff"）',
+    plan.pending === false && plan.changes.length === 0, `changes=${plan.changes.length}`);
+  check('★★ 列契约是**声明层的投影**（META === metaOf(loadModels())），且与真实库结构零漂移',
+    JSON.stringify(META) === JSON.stringify(irMod.metaOf(gen.loadModels())) && (await metaProblems()).length === 0);
+
+  // —— ④ 子进程：`bilite plan` 在一个**没被动过的库**上必须一个字节都不写 ——
+  //    ★ 判据不是"它自己说只读"，而是**那个库里真的只有基础表**。
+  const FRESH = 'test/output/gen-fresh.duckdb';
+  fs.rmSync(FRESH, { force: true });
+  const bizCountInFresh = async () => {
+    const inst = await DuckDBInstance.create(FRESH, { enable_external_access: 'false', access_mode: 'READ_ONLY' });
+    try {
+      const c = await inst.connect();
+      try {
+        const r = await c.runAndReadAll(
+          `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
+            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+        );
+        return Number((r.getRowObjectsJson() as Array<{ n: unknown }>)[0]!.n);
+      } finally { c.closeSync(); }
+    } finally { inst.closeSync(); }
+  };
+  const cliInFresh = (args: string[]) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), ...args], {
+        env: { ...process.env, BILITE_DB: FRESH }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }) };
+    } catch (e) { return { code: (e as { status?: number }).status ?? -1, out: '' }; }
+  };
+  const p1 = cliInFresh(['plan']);
+  const p1j = JSON.parse(p1.out) as { pending: boolean; changes: Array<{ sql?: string }>; appliedHash: string | null };
+  check('★★ `bilite plan` 一个字节都不写：它在空库上算出全部建表项，而**那个库里业务表一张都没有**',
+    p1.code === 0 && p1j.pending === true && p1j.changes.filter((c) => c.sql).length === declaredTables &&
+      p1j.appliedHash === null && (await bizCountInFresh()) === 0,
+    `pending=${p1j.pending} 建表=${p1j.changes.filter((c) => c.sql).length} 库里业务表=${await bizCountInFresh()}`);
+  check('★ `plan --check` 有未落地的变更 → 退 1（给 CI 用的那面旗）',
+    cliInFresh(['plan', '--check']).code === 1 && cliInFresh(['plan']).code === 0);
+  const ap1 = cliInFresh(['apply']);
+  check('★ `bilite apply` 把全部声明的表落地；再 plan 就为空（幂等收敛）',
+    ap1.code === 0 && (await bizCountInFresh()) === declaredTables &&
+      (JSON.parse(cliInFresh(['plan']).out) as { pending: boolean }).pending === false,
+    `apply code=${ap1.code} 库里业务表=${await bizCountInFresh()}`);
+
+  // —— ⑤ 加列：plan 只报那一列；apply 之后**数据不重写** ——
+  //    用一张**探针表**（临时模型目录里声明）而不是动真表：测的是"加列不重写数据"，
+  //    不该顺手把 e2e 的基线库改出一个新列来（那会让后面的断言与环境相关）。
+  const TMP = 'test/output/gen-models';
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.cpSync('models', TMP, { recursive: true });
+  const probeModel = (withMemo: boolean) =>
+    [
+      'kind: fact',
+      'title: 探针表（生成器阶段专用）',
+      'grain: [id]',
+      'keys:',
+      '  - { name: id, type: varchar, key: true }',
+      ...(withMemo ? ['  - { name: memo, type: varchar, comment: 后加的一列 }'] : []),
+      'measures:',
+      '  - { name: n, type: integer, unit: 件, semantic: count }',
+      '',
+    ].join('\n');
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(false));
+  const first = await applyMod.applyModels(gen.loadModels(TMP));
+  check('★ 临时声明目录里加一张新表 → apply 建表（不改 gen/ 里任何代码，这正是生成器的价值）',
+    first.blocked.length === 0 && first.applied.some((c) => c.kind === 'create-table' && c.table === 'fact_probe'));
+  await db.execute(`INSERT INTO fact_probe (id, n) VALUES ('p1', 11), ('p2', 22)`);
+  const before = await db.query<{ n: number; s: number }>('SELECT count(*) AS n, sum(n) AS s FROM fact_probe');
+
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(true));
+  const plan2 = await planMod.planModels(gen.loadModels(TMP));
+  check('★ 加一列 → plan 只报那一列（其余全是"无变更"）',
+    plan2.structural.length === 1 && plan2.structural[0]!.column === 'memo' &&
+      plan2.blocking.length === 0,
+    `结构变更 ${plan2.structural.map((c) => `${c.table}.${c.column}`).join(',')} / 阻塞 ${plan2.blocking.length}`);
+  const second = await applyMod.applyModels(gen.loadModels(TMP));
+  const after = await db.query<{ n: number; s: number }>('SELECT count(*) AS n, sum(n) AS s FROM fact_probe');
+  const memoLive = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'fact_probe' AND column_name = 'memo'`,
+  );
+  check('★★ 加列**不重写数据**：列真的加上了，而行数与值（count / sum）一模一样',
+    second.blocked.length === 0 && Number(memoLive[0]!.n) === 1 &&
+      Number(after[0]!.n) === Number(before[0]!.n) && Number(after[0]!.s) === Number(before[0]!.s),
+    `${before[0]!.n} 行 / sum=${before[0]!.s} → ${after[0]!.n} 行 / sum=${after[0]!.s}`);
+
+  // —— ⑥ 删列：**永不自动做** —— plan 标阻塞，apply 一行不动 ——
+  fs.writeFileSync(`${TMP}/fact_probe.yml`, probeModel(false));
+  const cliApply = await runCli(['apply', '--models', TMP]);
+  const aj = JSON.parse(cliApply.out) as { blocked: Array<{ kind: string; column: string | null }> };
+  const memoStill = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'fact_probe' AND column_name = 'memo'`,
+  );
+  check('★★ 声明里删掉一列 → 阻塞（生成器永不自动删列），`bilite apply` 退 1 且列还在库里',
+    cliApply.code === 1 && aj.blocked.some((c) => c.kind === 'drop-column' && c.column === 'memo') &&
+      Number(memoStill[0]!.n) === 1 && cliApply.err.includes('一行都没动'),
+    `blocked=${aj.blocked.map((c) => c.kind).join(',')} code=${cliApply.code}`);
+
+  // —— ⑦ 收尾：探针表不能留在 e2e 的基线库里（它会变成下一阶段的"无主语义表"）——
+  await db.execute('DROP TABLE fact_probe');
+  await db.execute(`DELETE FROM _meta_columns WHERE table_name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _meta_objects WHERE object_name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _model WHERE name = 'fact_probe'`);
+  await db.execute(`DELETE FROM _model_dep WHERE name = 'fact_probe'`);
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.rmSync(FRESH, { force: true });
+  check('★ 探针清理干净（库里没有无主语义表）', (await metaProblems()).length === 0);
+}
+
+// ============ 31. 运营事实表：目标表由**声明**决定（无口径列也能落库）============
+log('\n════════ 31. 运营事实表 fact_business_line（target 由声明决定）════════');
+{
+  // ★ 这一阶段守的是 `docs/开发计划.md` §6 里那条推后理由的反面：
+  //   「`runIngest` 的目标表硬编码 `fact_finance`，而运营事实表没有口径列 —— 先建表 = 一张永远空的表」。
+  //   现在目标表、必需坐标、行内退化列**全部读声明**（铁律 18），所以：
+  //   ① 声明说清了 fact_business_line 的形状（无口径列 + 行内退化列 business_line）；
+  //   ② 静态诊断与落库用**同一份判据**（少给一次 ctx 就会"工具说没问题、落库却被拒"）；
+  //   ③ 数落进目标表，**默认表一行不动**；
+  //   ④ 重放（删行 → 从 raw 重建）逐行一致，含退化列；
+  //   ⑤ 撞库预检对运营事实表同样生效（主键里含 business_line —— 工业/消费 两条不互相撞）。
+  const { diagnoseIngest, parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { main } = await import('../src/cli.ts');
+  const { listArchiveDirs } = await import('../src/db/compact.ts');
+
+  const SPEC = 'test/fixtures/接入-业务线.yaml';
+  const yaml = fs.readFileSync(SPEC, 'utf8');
+  const facts = declaredFactsOf();
+  const ctx = { periodTypes: ['本年累计', '单月'], facts };
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① 声明说清了形状：没有口径列、退化列是 business_line、它进主键 ——
+  const bl = facts.find((f) => f.name === 'fact_business_line')!;
+  check('★ 声明说清 fact_business_line 的形状：**无口径列** + 行内退化列 business_line（且在粒度里）',
+    bl !== undefined && bl.periodTypeColumn === null && bl.degenerateColumns.join(',') === 'business_line' &&
+      bl.primaryKey.join(',') === 'fin_month,company_id,metric_id,business_line',
+    `口径列=${String(bl?.periodTypeColumn)} 退化列=${bl?.degenerateColumns.join(',')} 主键=${bl?.primaryKey.join(',')}`);
+
+  // —— ② 同一份判据：规格放行 ——
+  const ok = diagnoseIngest(yaml, ctx);
+  check('★ 业务线规格放行（判据只有一份：静态诊断与落库共用 lintIngest）',
+    ok.willBeRejected === false, ok.issues.map((i) => i.code).join(',') || '无 issue');
+
+  // —— ③④⑤ 三条"写错了会怎样"（每条都必须在解析期响）——
+  const noDecl = diagnoseIngest(yaml.replace('target: fact_business_line', 'target: fact_nope'), ctx);
+  check('★ target 指向没声明的表 → TARGET_NOT_DECLARED（不静默写进默认表）',
+    noDecl.issues.some((i) => i.code === 'TARGET_NOT_DECLARED'), noDecl.issues.map((i) => i.code).join(','));
+  const withPt = diagnoseIngest(yaml.replace('          columns: [E]', '          columns: [E]\n          periodTypes: [单月]'), ctx);
+  check('★ 给**没有口径列**的目标声明值列口径 → TARGET_NO_PERIOD_TYPE（运营指标没有财务那套口径体系）',
+    withPt.issues.some((i) => i.code === 'TARGET_NO_PERIOD_TYPE'), withPt.issues.map((i) => i.code).join(','));
+  const noLine = diagnoseIngest(yaml.replace('          - col: D\n            as: business_line\n', ''), ctx);
+  check('★ 行内退化列没有来源 → COORD_MISSING（它不是可选的：它进了事实表的主键）',
+    noLine.issues.some((i) => i.code === 'COORD_MISSING' && i.message.includes('business_line')),
+    noLine.issues.map((i) => i.code).join(','));
+
+  // —— ⑥ CLI 真跑：干跑 → 落库；数据只进目标表 ——
+  const ffCount = async () => Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const blRows = async () =>
+    db.query<{ m: string; company: string; metric: string; line: string; amount: number }>(
+      `SELECT strftime(b.fin_month, '%Y-%m-%d') AS m, c.name AS company, mt.name AS metric,
+              b.business_line AS line, b.amount AS amount
+       FROM fact_business_line b
+       JOIN dim_company c ON c.id = b.company_id
+       JOIN dim_metric mt ON mt.id = b.metric_id
+       ORDER BY 1, 2, 3, 4`,
+    );
+  const before = await blRows();
+  const ffBefore = await ffCount();
+  check('前置：这张运营事实表此刻是空的（下面那条"只进目标表"才说明问题）', before.length === 0);
+
+  const dry = await runCli(['ingest', 'dry-run', SPEC]);
+  const dj = JSON.parse(dry.out) as { ok: boolean; shape: { blocks: Array<{ dataRows: number; coordinates: { total: number; incomplete: number } }> } };
+  check('★ CLI 干跑：形状是 4 行 / 4 坐标 / 0 空缺（没有口径列也说得清形状）',
+    dry.code === 0 && dj.ok === true && dj.shape.blocks[0]!.dataRows === 4 &&
+      dj.shape.blocks[0]!.coordinates.total === 4 && dj.shape.blocks[0]!.coordinates.incomplete === 0,
+    `ok=${dj.ok} 行=${dj.shape.blocks[0]!.dataRows} 坐标=${dj.shape.blocks[0]!.coordinates.total}`);
+
+  const first = await runCli(['ingest', 'run', SPEC]);
+  const fj = JSON.parse(first.out) as { ok: boolean; inserted: number; archived: boolean };
+  const after = await blRows();
+  check('★★ 数据落进 **fact_business_line**，而默认表 fact_finance 一行没动',
+    first.code === 0 && fj.ok === true && fj.inserted === 4 && after.length === 4 && (await ffCount()) === ffBefore,
+    `inserted=${fj.inserted} 目标表=${after.length} 行 / fact_finance ${ffBefore} → ${await ffCount()}`);
+  check('★ 行内退化列按原样写进事实表（工业 / 消费），且金额来自值列',
+    after.map((r) => `${r.company}|${r.metric}|${r.line}|${Number(r.amount)}`).join(' ; ') ===
+      '华东子公司|签约额|工业|1200.5 ; 华东子公司|签约额|消费|800.25 ; 华南子公司|交付台数|工业|12 ; 华南子公司|签约额|工业|640.75',
+    after.map((r) => `${r.metric}/${r.line}`).join(' '));
+  check('★ 归档目录按**目标表**命名（不再写死 fact_finance）',
+    fj.archived === true && listArchiveDirs('fact_business_line').length === 1 &&
+      fs.existsSync(`${listArchiveDirs('fact_business_line')[0]!.file}`),
+    `目录=${listArchiveDirs('fact_business_line').map((d) => d.name).join(',')}`);
+
+  // —— ⑦ 重放：删掉行 → 用同一份 raw 重建 → 逐行（含退化列）相同 ——
+  await db.execute('DELETE FROM fact_business_line');
+  const replay = await runCli(['ingest', 'run', SPEC]);
+  check('★★ 重放：清空后用同一份 raw 重建，事实行逐行相同（含 business_line）',
+    replay.code === 0 && JSON.stringify(await blRows()) === JSON.stringify(after),
+    `重放后 ${(await blRows()).length} 行`);
+
+  // —— ⑧ 撞库：主键含 business_line —— 再跑一次必须整批拒绝 ——
+  const again = await runCli(['ingest', 'run', SPEC]);
+  const aj = JSON.parse(again.out) as { errors: Array<{ code: string }> };
+  check('★ 撞库预检对运营事实表同样生效：重复落库整批拒绝（主键里含 business_line）',
+    again.code === 1 && aj.errors.some((e) => e.code === 'CONFLICT_WITH_EXISTING'),
+    `code=${again.code} 码=${aj.errors.map((e) => e.code).join(',')}`);
+
+  // —— ⑨ 落库那条路与静态诊断的**判据同一份**：直接调 runIngest 也不该出现"工具放行、落库被拒" ——
+  //    （上面 CLI 已经走了一遍；这里再钉一次"同一个 spec 对象在两条路上都成立"）
+  const spec = parseIngestSpec(yaml, ctx);
+  const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
+  const dry2 = await dryRunIngest(spec, { catalog: await masterCatalog() });
+  check('★ 同一个 spec 在库层也成立（dryRunIngest 不报 target 相关的 error）',
+    !dry2.issues.some((i) => i.level === 'error' && i.code.startsWith('TARGET')),
+    dry2.issues.map((i) => `${i.level}:${i.code}`).join(',') || '无');
+}
+
+// ============ 32. 维度版本行（SCD2 类型 2）：历史挂在侧表 ============
+log('\n════════ 32. 维度版本行 SCD2（历史侧表 + 时点查询）════════');
+{
+  // ★ 这一阶段守的是 ④ 的**验收线**（`docs/开发计划.md` §6 的推后理由反面）：
+  //   "上了它，每个既有查询与 spec 编译都得带 is_current，是纯成本" ——
+  //   所以本阶段的判据是：**维度属性变了之后，当前态查询的数字逐个不变**，
+  //   而"当时那一版"能通过显式时点查询（dimAsOf）拿到。
+  //   形态选择：历史挂**侧表**（`dim_company_hist`），`dim_company` 仍是当前态的唯一真相 ——
+  //   既有查询一个字都不用改（零回归是结构性的，不靠"记得补 is_current"）。
+  const scd = await import('../src/db/scd2.ts');
+  const { queryMetrics } = await import('../src/semantic/query.ts');
+  const { versionCount, setDimAttributes, dimAsOf, dimHistory, scdProblems } = scd;
+
+  // —— ① 历史表由声明长出来；而且**此刻不变量已经成立** ——
+  const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
+  const histTables = await db.query<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'
+      AND table_name IN ('dim_company_hist', 'dim_metric_hist') ORDER BY 1`,
+  );
+  const problems0 = await scdProblems();
+  check('★ 历史侧表由声明长出来（`_model` 里有它），且**接入层建维时写的首版**让不变量当即成立',
+    Number(modelRows[0]!.n) === 8 && histTables.length === 2 && problems0.length === 0,
+    `_model=${modelRows[0]!.n} 历史表=${histTables.length} 不变量问题=${problems0.join(' | ') || '无'}`);
+
+  // —— ② 首版的生效日 = **本批最早的期数**（不是 now()，重放才确定）——
+  const one = (await db.query<{ id: string; name: string; group_name: string | null }>(
+    `SELECT c.id, c.name, c.group_name FROM dim_company c
+      WHERE EXISTS (SELECT 1 FROM fact_finance f WHERE f.company_id = c.id)
+      ORDER BY c.name LIMIT 1`,
+  ))[0]!;
+  const firstVersion = (await dimHistory('company', one.id))[0]!;
+  check('★★ 首版的生效日用的是**期数首日**（2026-01-01，长表那批覆盖 12 个月）——不是 now()',
+    String(firstVersion.valid_from) === '2026-01-01' && firstVersion.valid_to === null &&
+      firstVersion.is_current === true,
+    `${one.name}: valid_from=${String(firstVersion.valid_from)} ~ ${String(firstVersion.valid_to)}`);
+
+  // —— ③ "零回归"的基线：改属性**之前**先把真实查询结果记下来 ——
+  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const };
+  const before = JSON.stringify(await queryMetrics(probe));
+
+  // —— ④ 属性没变 → **不产生新版本**（否则历史会被"每次导入"刷满）——
+  const n0 = await versionCount('company', one.id);
+  const same = await setDimAttributes('company', one.id, { group_name: one.group_name });
+  check('★ 属性没变 → 不产生新版本（幂等；历史不会被每次导入刷满）',
+    same.changed === false && (await versionCount('company', one.id)) === n0, `${same.note} / 版本数 ${n0}`);
+
+  // —— ⑤ 属性变了 → 关旧版 + 开新版 + 当前态跟上 ——
+  const late = await setDimAttributes('company', one.id, { group_name: '新能源板块' }, { effectiveFrom: '2026-07-01' });
+  const hist = await dimHistory('company', one.id);
+  const cur = (await db.query<{ group_name: string }>(`SELECT group_name FROM dim_company WHERE id = '${one.id}'`))[0]!;
+  check('★★ 属性变了 → 旧版关闭（valid_to = 新版生效日）、新版生效、当前态维表同步成新值',
+    late.changed === true && hist.length === n0 + 1 &&
+      String(hist[0]!.valid_to) === '2026-07-01' && hist[0]!.is_current === false &&
+      hist[1]!.is_current === true && hist[1]!.valid_to === null &&
+      String(hist[1]!.group_name) === '新能源板块' && cur.group_name === '新能源板块',
+    `版本 ${hist.length} 条：${hist.map((h) => `${String(h.valid_from)}~${h.valid_to === null ? '现在' : String(h.valid_to)}`).join(' / ')}`);
+
+  // —— ⑥ 时点查询：历史真的能回答"那一期是什么" ——
+  const asOfJun = await dimAsOf('company', one.id, '2026-06-01');
+  const asOfAug = await dimAsOf('company', one.id, '2026-08-01');
+  check('★★ 时点查询（半开区间）：2026-06 拿到旧板块、2026-08 拿到新板块 —— 历史不是摆设',
+    asOfJun !== null && String(asOfJun.group_name ?? '') === String(one.group_name ?? '') &&
+      asOfAug !== null && String(asOfAug.group_name) === '新能源板块',
+    `06 → ${String(asOfJun?.group_name)} / 08 → ${String(asOfAug?.group_name)}`);
+
+  // —— ⑦ ★ 零回归：改完属性，同一批当前态查询**逐格**不变 ——
+  //    比的是"标签 + 每格的值"（不是整包 JSON）：哪天返回体多了个 asOf/计时字段，
+  //    这条断言不该因为那种无关差异变红 —— 那样它就从"守数字"退化成"守序列化格式"。
+  const after = JSON.stringify(await queryMetrics(probe));
+  const bj = JSON.parse(before) as { columns: unknown[]; groups: Array<{ label: string; cells: unknown[] }> };
+  const aj = JSON.parse(after) as typeof bj;
+  //    ⚠️ 分组顺序比不了：GROUP BY 不带 ORDER BY 时 DuckDB 不保证行序（实测两次调用顺序不同）。
+  //       那就**按标签排序后**再逐格比 —— 要守的是"每个格子的数字没变"，不是"行的顺序没变"。
+  const keyed = (groups: typeof bj.groups) =>
+    [...groups].sort((x, y) => JSON.stringify(x.values).localeCompare(JSON.stringify(y.values)));
+  const bg = keyed(bj.groups);
+  const ag = keyed(aj.groups);
+  const cellDiff = bg.findIndex((g, i) => JSON.stringify(g) !== JSON.stringify(ag[i]));
+  check('★★ **零回归**：维度属性变了，当前态查询的**每一格数字与标签都逐字未变**（这是 ④ 的验收线）',
+    cellDiff === -1 && JSON.stringify(bj.columns) === JSON.stringify(aj.columns),
+    cellDiff === -1
+      ? `${bg.length} 组逐格相同`
+      : `第 ${cellDiff} 组变了：${JSON.stringify(bg[cellDiff])} → ${JSON.stringify(ag[cellDiff])}`);
+
+  // —— ⑧ 生效日不晚于当前版本起点 → 拒绝（否则两个版本同时"生效中"）——
+  let overlap = '';
+  try {
+    await setDimAttributes('company', one.id, { group_name: '更早的板块' }, { effectiveFrom: '2026-07-01' });
+  } catch (e) { overlap = (e as Error).message; }
+  check('★ 生效日不晚于当前版本起点 → 抛错（不许造出重叠区间：那会让两版同时生效）',
+    /重叠|不晚于/.test(overlap), overlap.slice(0, 80));
+
+  // —— ⑨ 守卫**真的会抓**：绕过 setDimAttributes 只改维表 → scdProblems() 报 ② ——
+  await db.execute(`UPDATE dim_company SET group_name = '偷偷改的' WHERE id = '${one.id}'`);
+  const caught2 = (await scdProblems()).filter((p) => p.includes('②'));
+  check('★★ 守卫真的会抓：绕过接口直改维表 → ② "与它的开放版本不一致"',
+    caught2.length === 1 && caught2[0]!.includes(one.id), caught2[0] ?? '（一条都没报 —— 守卫形同虚设）');
+  await db.execute(`UPDATE dim_company SET group_name = '新能源板块' WHERE id = '${one.id}'`);
+
+  // —— ⑩ 孤儿版本（历史里有、当前态没有）也要报 ——
+  await db.execute(
+    `INSERT INTO dim_company_hist (id, valid_from, valid_to, is_current, name) VALUES ('c_孤儿', '2026-07-01'::DATE, NULL, TRUE, '不存在的公司')`,
+  );
+  const caught3 = (await scdProblems()).filter((p) => p.includes('③'));
+  check('★ 孤儿版本（历史里有、当前态没有）→ ③ 报出来',
+    caught3.length === 1, caught3[0] ?? '（没报）');
+  await db.execute(`DELETE FROM dim_company_hist WHERE id = 'c_孤儿'`);
+
+  check('★ 收尾：所有操作之后，历史与当前态仍然一致（不变量为空）', (await scdProblems()).length === 0,
+    (await scdProblems()).slice(0, 2).join(' | '));
+}
+
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
-//   ★ 这一条把一条**人工纪律**变成断言：`AGENTS.md` §3/§6 与 `docs/需求与架构.md` §11.1
-//     都写着条数，而"改了断言要同步条数"这条规矩在本项目里**漂过两次**
-//     （231 与 247 对不上过一次，根因就是没人管它）。现在改了断言却忘同步，e2e 自己会红，
-//     失败信息直接把三处该改成多少告诉你。
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
+//   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
+//     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 一直是没人管的那份**：
+//     2026-10-02 我在这条断言里加进 README 时，它还写着 247 与「231 项断言，15 个阶段」；
+//     2026-10-02 晚些时候补 README 那两处过时说法时，又发现"技术选型"表格里还留着那个 231
+//     —— 所以它现在**也在这张表里**（六处），不再靠人记得翻。
+//     根因就是"没人管"—— 所以交给门禁：改了断言却忘同步，红的是 e2e，并告出六处各是多少。
 {
   const actual = pass + fail + 1; // +1 = 这一条本身（先算进来，否则每次都比实际少 1）
-  const readNum = (file: string, re: RegExp) => {
-    const m = re.exec(fs.readFileSync(file, 'utf8'));
-    return m ? Number(m[1]) : null;
-  };
-  const at3 = readNum('AGENTS.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/);
-  const at6 = readNum('AGENTS.md', /\*\*(\d+) 项 e2e 断言\*\*/);
-  const atArch = readNum('docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/);
-  check('★ 三处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
-    at3 === actual && at6 === actual && atArch === actual,
-    `实际 ${actual}；AGENTS §3=${at3}、AGENTS §6=${at6}、需求与架构 §11.1=${atArch}`);
+  const spots: Array<[file: string, re: RegExp, label: string]> = [
+    ['AGENTS.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/, 'AGENTS §3'],
+    ['AGENTS.md', /\*\*(\d+) 项 e2e 断言\*\*/, 'AGENTS §6'],
+    ['docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/, '需求与架构 §11.1'],
+    ['README.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/, 'README 快速开始'],
+    ['README.md', /唯一门禁，(\d+) 项断言/, 'README 命令表'],
+    ['README.md', /自研 harness[^\n]*?(\d+) 项断言/, 'README 技术选型'],
+  ];
+  const got = spots.map(([f, re, label]) => {
+    const m = re.exec(fs.readFileSync(f, 'utf8'));
+    return `${label}=${m ? Number(m[1]) : '（没匹配到）'}`;
+  });
+  check('★ 六处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
+    got.every((s) => s.endsWith(`=${actual}`)), `实际 ${actual}；${got.join('、')}`);
 }
 
 // ============ 汇总 ============

@@ -1,0 +1,38 @@
+# 财务事实：三维交点 × 口径（口径是**列**不是行，铁律 5）
+kind: fact
+title: 财务事实（公司 × 指标 × 期间 × 口径）
+grain: [fin_month, company_id, metric_id, period_type]
+keys:
+  - name: fin_month
+    type: date
+    key: true
+    notNull: true
+    semantic: period
+  - name: company_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_company
+    notNull: true
+    semantic: org
+  - name: metric_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_metric
+    notNull: true
+    semantic: metric
+  - name: period_type
+    type: varchar
+    key: true
+    notNull: true
+    semantic: period_type
+    comment: 本年累计 / 去年同期累计 / 单月 / 单月同比 / 账面累计
+measures:
+  - name: amount
+    type: decimal(18,2)
+    unit: 元
+    semantic: money
+provenance:
+  - name: batch_id
+    type: varchar

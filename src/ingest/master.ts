@@ -6,7 +6,16 @@
  *   同一批数据两套结论），所以凡是"判重/归并/校验"要用的快照，都从这里取。
  */
 import { catalog } from '../semantic/query.ts';
+import { declaredFactsOf } from '../gen/parse.ts';
 import type { MasterCatalog } from './dryrun.ts';
+
+/**
+ * 声明里的事实表（**不碰库**：models/*.yml → IR → 投影）。
+ *
+ * ★ 静态诊断（`ingest lint` / `lint_ingest` / `/api/ingest/lint`）用它校验 `target:`；
+ *   落库那条路走 `masterCatalog()`（同一个投影，只是顺带读了主数据）。
+ */
+export const staticFacts = () => declaredFactsOf();
 
 export async function masterCatalog(): Promise<MasterCatalog> {
   const c = await catalog();
@@ -15,5 +24,7 @@ export async function masterCatalog(): Promise<MasterCatalog> {
     metrics: c.metrics.map((x) => x.name),
     // ★ period_type 的实际取值就是 PERIOD_TYPES 的 id（catalog 已把它当数据下发）
     periodTypes: c.periodTypes.map((x) => x.id),
+    // ★ 事实表由**声明**决定：目标表、必需坐标、列角色 —— 见 gen/ir.ts 的 declaredFacts
+    facts: staticFacts(),
   };
 }

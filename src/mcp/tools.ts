@@ -568,7 +568,8 @@ async function lookAtSource(args: { source?: string; sheet?: string; range?: str
 async function lintIngestTool(args: { spec?: string; specFile?: string }) {
   const { text, from } = loadIngestSpecText(args);
   const cat = await masterCatalog();
-  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+  const d = diagnoseIngest(text, lintCtx);
   const errors = d.issues.filter((i) => i.level === 'error');
   const warnings = d.issues.filter((i) => i.level === 'warn');
   return {
@@ -591,7 +592,8 @@ async function lintIngestTool(args: { spec?: string; specFile?: string }) {
 async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown }) {
   const { text, from } = loadIngestSpecText(args);
   const cat = await masterCatalog();
-  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+  const d = diagnoseIngest(text, lintCtx);
   if (d.willBeRejected) {
     return {
       from,
@@ -601,7 +603,7 @@ async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisi
       note: '规格没通过静态诊断，先按 errors 改规格（这一步连源文件都没读）。',
     };
   }
-  const spec = parseIngestSpec(text);
+  const spec = parseIngestSpec(text, lintCtx);
   const r = await runIngest(spec, { catalog: cat, planOnly: true, decisions: parseDecisions(args.decisions) });
   return { from, planOnly: true, ...r };
 }
@@ -610,7 +612,8 @@ async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisi
 async function runIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean }) {
   const { text, from } = loadIngestSpecText(args);
   const cat = await masterCatalog();
-  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+  const d = diagnoseIngest(text, lintCtx);
   if (d.willBeRejected) {
     return {
       from,
@@ -620,7 +623,7 @@ async function runIngestTool(args: { spec?: string; specFile?: string; decisions
       note: '规格没通过静态诊断，没有落任何数据。',
     };
   }
-  const spec = parseIngestSpec(text);
+  const spec = parseIngestSpec(text, lintCtx);
   const r: IngestRunResult = await runIngest(spec, {
     catalog: cat,
     decisions: parseDecisions(args.decisions),

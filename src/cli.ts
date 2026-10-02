@@ -70,6 +70,17 @@ export type Invocation =
     }
   | { kind: 'catalog-dump'; format: 'json' | 'prompt' }
   | { kind: 'catalog-show'; object: string }
+  | {
+      kind: 'compact';
+      /** 空的 = 归档里**所有**表（`data/parquet/` 下的目录名） */
+      tables: string[];
+      /** null = 用模块自己的默认值（默认值只允许有一份，在 `db/compact.ts`） */
+      maxBytes: number | null;
+      minFiles: number | null;
+      dryRun: boolean;
+    }
+  | { kind: 'plan'; modelsDir: string | null; check: boolean }
+  | { kind: 'apply'; modelsDir: string | null }
   | { kind: 'validate'; specFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
@@ -99,6 +110,9 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'render') return parseRenderArgs(tokens.slice(1));
   if (first === 'query') return parseQueryArgs(tokens.slice(1));
   if (first === 'catalog') return parseCatalogArgs(tokens.slice(1));
+  if (first === 'compact') return parseCompactArgs(tokens.slice(1));
+  if (first === 'plan') return parseGenArgs('plan', tokens.slice(1));
+  if (first === 'apply') return parseGenArgs('apply', tokens.slice(1));
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
@@ -248,6 +262,67 @@ function parseCatalogArgs(tokens: readonly string[]): Invocation {
 }
 
 /**
+ * `compact` —— 合并 Parquet 归档里的小文件（架构 §10 R8）。
+ *
+ * ★ 它不是"库的命令"：归档目录不是库，合并只碰 `data/parquet/**`，用内存实例读它们，
+ *   **既不打开 `.duckdb` 文件、也不碰库锁** —— 所以服务端正在跑时也能跑（e2e 钉着"不碰库"）。
+ * ★ 表名判据**不在这里**：`--table` 的形状由 `compact.ts` 的 `assertSafeTableName()` 说了算，
+ *   这里只负责"给了几个"与"数字长得对不对"（判据只有一份，铁律 17）。
+ */
+function parseCompactArgs(tokens: readonly string[]): Invocation {
+  const hint = 'bilite compact --help';
+  if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'compact' };
+
+  const args = scanArgs(tokens, ['--table', '--max-bytes', '--min-files'], ['--dry-run'], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`compact 不接受位置参数（收到 ${args.positionals[0]}）—— 表名用 --table 给`, hint);
+  }
+
+  const positiveInt = (flag: string, min: number): number | null | Invocation => {
+    const raw = args.values[flag]?.[0];
+    if (raw === undefined) return null; // 交给模块自己的默认值
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < min) return usage(`${flag} 要写成 ≥ ${min} 的整数（收到 ${raw}）`, hint);
+    return n;
+  };
+  const maxBytes = positiveInt('--max-bytes', 1);
+  // ⚠️ `typeof null === 'object'` —— 少了 `!== null` 这一半，缺选项时会直接把 null 当 Invocation 返回
+  if (maxBytes !== null && typeof maxBytes === 'object') return maxBytes;
+  const minFiles = positiveInt('--min-files', 2);
+  if (minFiles !== null && typeof minFiles === 'object') return minFiles;
+
+  return {
+    kind: 'compact',
+    tables: args.values['--table'] ?? [],
+    maxBytes,
+    minFiles,
+    dryRun: '--dry-run' in args.values,
+  };
+}
+
+/**
+ * `plan` / `apply` —— 生成器侧的两条命令（P2）。
+ *
+ * ★ 为什么必须是**两条**命令（而不是一条带 `--yes`）：先见 diff 再决定落地，
+ *   是这个生成器存在的理由（`docs/开发计划.md` §3 P2 的验收）。`plan` 一个字节都不写。
+ * ★ 默认目录不在这里写死：缺 `--models` 时交给 `gen/parse.ts` 的 `MODELS_DIR`
+ *   （默认值只允许有一份 —— 同 `compact` 的 `--max-bytes`）。
+ */
+function parseGenArgs(cmd: 'plan' | 'apply', tokens: readonly string[]): Invocation {
+  const hint = `bilite ${cmd} --help`;
+  if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: cmd };
+  const args = scanArgs(tokens, ['--models'], cmd === 'plan' ? ['--check'] : [], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`${cmd} 不接受位置参数（收到 ${args.positionals[0]}）—— 模型目录用 --models 给`, hint);
+  }
+  const modelsDir = args.values['--models']?.[0] ?? null;
+  if (cmd === 'apply') return { kind: 'apply', modelsDir };
+  return { kind: 'plan', modelsDir, check: '--check' in args.values };
+}
+
+/**
  * `validate <yaml>` —— §8.2 的第 ④ 条接口：**可执行、带修复建议**的校验。
  *
  * ★ 它**不写新判据**。判据仍是那两份（接入规格 `diagnoseIngest` / 报表规格 `diagnoseSpec`），
@@ -337,9 +412,9 @@ function isIngestSub(s: string): s is IngestSub {
  */
 let dbOpened = false;
 
-async function openDb() {
+async function openDb(opts?: { models?: 'ensure' | 'skip' }) {
   const db = await import('./db/index.ts');
-  await db.open();
+  await db.open(undefined, opts);
   dbOpened = true;
   return db;
 }
@@ -374,6 +449,9 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'query',
   'catalog-dump',
   'catalog-show',
+  'compact',
+  'plan',
+  'apply',
   'validate',
   'skill-export',
 ];
@@ -413,8 +491,10 @@ export const COMMANDS: CliCommand[] = [
       //   于是 lint 在服务端正持有库锁时也能跑（§7.2 的"被占用就报错"对它不适用）。
       const { diagnoseIngest } = await import('./ingest/types.ts');
       const { staticCatalog } = await import('./semantic/query.ts');
+      // ★ 目标表也是判据的一部分：声明的投影**不碰库**，所以 lint 照旧零 DB 访问
+      const { declaredFactsOf } = await import('./gen/parse.ts');
       const text = readSpecFile(inv.specFile);
-      const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id) });
+      const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
       const errors = d.issues.filter((i) => i.level === 'error');
       const warns = d.issues.filter((i) => i.level === 'warn');
       jsonTo(io, {
@@ -450,7 +530,10 @@ export const COMMANDS: CliCommand[] = [
       const text = readSpecFile(inv.specFile);
       await openDb();
       const cat = await masterCatalog();
-      const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
+      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
+      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+      const d = diagnoseIngest(text, lintCtx);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -462,7 +545,7 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest dry-run: 静态诊断没通过，未读源文件\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text);
+      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         planOnly: true,
@@ -470,14 +553,19 @@ export const COMMANDS: CliCommand[] = [
       });
       jsonTo(io, { from: inv.specFile, planOnly: true, ...r });
       io.err(
-        `bilite ingest dry-run: 本批会写 ${r.inserted} 行` +
-          (r.needsDecision.length
-            ? `；${r.needsDecision.length} 个名字需要人拍板（这些行不会落库）`
-            : '') +
-          '\n',
+        r.errors.length
+          ? `bilite ingest dry-run: ${r.errors.length} 个 error（${r.errors.map((e) => e.code).join('、')}）` +
+              ' —— 现在跑进去也只会一行不落地被拒\n'
+          : `bilite ingest dry-run: 本批会写 ${r.inserted} 行` +
+              (r.needsDecision.length
+                ? `；${r.needsDecision.length} 个名字需要人拍板（这些行不会落库）`
+                : '') +
+              '\n',
       );
-      // needsDecision 是待办不是失败（铁律 16），所以这里仍是 0
-      return EXIT.OK;
+      // ★ 退出码的分界就在这一行：`needsDecision` 是**待办**不是失败（铁律 16），所以退 0；
+      //   但 `error` 不是待办 —— 脚本只看退出码，把"这份源根本读不了"报成成功
+      //   正是本仓库最讨厌的那种安静失败（铁律 12）。
+      return r.errors.length > 0 ? EXIT.FAILED : EXIT.OK;
     },
   },
   {
@@ -494,7 +582,10 @@ export const COMMANDS: CliCommand[] = [
       const text = readSpecFile(inv.specFile);
       await openDb();
       const cat = await masterCatalog();
-      const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
+      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
+      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+      const d = diagnoseIngest(text, lintCtx);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -506,7 +597,7 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest run: 静态诊断没通过，一行都没写\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text);
+      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         decisions: parseDecisions(await loadDecisions(inv.decisionsPath)),
@@ -642,6 +733,133 @@ export const COMMANDS: CliCommand[] = [
     },
   },
   {
+    invocation: 'compact',
+    name: 'compact',
+    summary: 'Parquet 归档的小文件合并（R8）：先逐批次对拍再删源文件；不碰库、不碰库锁',
+    usage: 'bilite compact [--table <表名>]... [--max-bytes <n>] [--min-files <n>] [--dry-run]',
+    async run(inv, io) {
+      if (inv.kind !== 'compact') throw new Error('命令表与 Invocation 不匹配');
+      const { compactParquet, listArchiveTables, assertSafeTableName, suspectInputs } = await import('./db/compact.ts');
+
+      // 不给 --table 就是"归档里的所有表" —— 定期 compaction 就是 `bilite compact`
+      const tables = inv.tables.length > 0 ? inv.tables : listArchiveTables();
+      const results = [];
+      for (const t of tables) {
+        assertSafeTableName(t); // 判据在模块里，这里只是调用点
+        results.push(
+          await compactParquet(t, {
+            maxBytes: inv.maxBytes ?? undefined,
+            minFiles: inv.minFiles ?? undefined,
+            dryRun: inv.dryRun,
+          }),
+        );
+      }
+      const suspects = results.flatMap(suspectInputs);
+      jsonTo(io, {
+        dryRun: inv.dryRun,
+        tables,
+        results,
+        suspects,
+        note: inv.dryRun
+          ? 'dry-run：计划给你看，一个字节都没写。'
+          : '合并产物已逐批次对拍通过，源文件已删；没有候选的表是正常结果，不是失败。',
+      });
+      io.err(
+        `bilite compact: ` +
+          (results.length === 0
+            ? '归档里一张表都没有（data/parquet 是空的）\n'
+            : results
+                .map(
+                  (r) =>
+                    `${r.table} ` +
+                    (r.sources.length > 1
+                      ? inv.dryRun
+                        ? `会合并 ${r.sources.length} 个小文件`
+                        : `${r.sources.length} 个小文件 → 1`
+                      : '无候选'),
+                )
+                .join(' / ') + '\n') +
+          (suspects.length > 0
+            ? `⚠️ ${suspects.length} 个 0 行残骸没动（那多半是过去某次归档失败的证据）：${suspects.join('、')}\n`
+            : ''),
+      );
+      // 0 行残骸不是"合并成功"该有的样子 —— 让脚本能看见（铁律 12：不许安静）
+      return suspects.length > 0 ? EXIT.FAILED : EXIT.OK;
+    },
+  },
+  {
+    invocation: 'plan',
+    name: 'plan',
+    summary: '把 models/*.yml 的声明与库结构对一遍，出人可读的变更清单 —— 一个字节都不写',
+    usage: 'bilite plan [--models <目录>] [--check]',
+    async run(inv, io) {
+      if (inv.kind !== 'plan') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
+      const { planModels, summarizePlan } = await import('./gen/plan.ts');
+      const dir = inv.modelsDir ?? MODELS_DIR;
+
+      const d = diagnoseModels(dir);
+      if (!d.ir) {
+        jsonTo(io, { models: dir, ok: false, issues: d.issues });
+        io.err('bilite plan: 声明本身有问题，先改声明\n');
+        return EXIT.FAILED;
+      }
+      // ★ 生成器自己的命令**不让 open() 碰声明**：plan 要看到一个没被动过的库
+      //   （否则空库引导会在 open() 里把变更落掉，plan 永远说"无变更"，这条命令就废了）
+      await openDb({ models: 'skip' });
+      const plan = await planModels(d.ir);
+      jsonTo(io, {
+        models: dir,
+        ok: true,
+        pending: plan.pending,
+        tables: plan.tables,
+        irHash: plan.irHash,
+        appliedHash: plan.appliedHash,
+        structuralCount: plan.structural.length,
+        changes: plan.changes,
+        blocking: plan.blocking,
+        note: 'plan 是只读的：它连一条 DDL 都没执行。要落地用 bilite apply。',
+      });
+      io.err(`bilite plan: ${summarizePlan(plan)}\n`);
+      // --check 给 CI 用：有未落地的变更就退 1（不给它时，plan 只是"给你看一眼"，不算失败）
+      if (inv.check && plan.pending) return EXIT.FAILED;
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'apply',
+    name: 'apply',
+    summary: '按 models/*.yml 落地变更（建表 / 加列 / 刷新契约）—— 删列与改类型永不自动做',
+    usage: 'bilite apply [--models <目录>]',
+    async run(inv, io) {
+      if (inv.kind !== 'apply') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
+      const { applyModels } = await import('./gen/apply.ts');
+      const dir = inv.modelsDir ?? MODELS_DIR;
+
+      const d = diagnoseModels(dir);
+      if (!d.ir) {
+        jsonTo(io, { models: dir, ok: false, issues: d.issues });
+        io.err('bilite apply: 声明本身有问题，一行都没动\n');
+        return EXIT.FAILED;
+      }
+      // 同理：apply 要自己报告落了什么，不能被 open() 抢先做掉
+      await openDb({ models: 'skip' });
+      const r = await applyModels(d.ir);
+      jsonTo(io, {
+        models: dir,
+        ok: r.blocked.length === 0,
+        tables: r.tables,
+        irHash: r.irHash,
+        applied: r.applied.map((c) => ({ kind: c.kind, table: c.table, column: c.column ?? null, detail: c.detail })),
+        blocked: r.blocked,
+        note: r.note,
+      });
+      io.err(`bilite apply: ${r.note}\n`);
+      return r.blocked.length > 0 ? EXIT.FAILED : EXIT.OK;
+    },
+  },
+  {
     invocation: 'validate',
     name: 'validate',
     summary: '校验一份 YAML（接入规格或报表规格），自动判别该用哪份判据；一次给全问题',
@@ -668,7 +886,8 @@ export const COMMANDS: CliCommand[] = [
       if (looksIngest) {
         const { diagnoseIngest } = await import('./ingest/types.ts');
         const { staticCatalog } = await import('./semantic/query.ts');
-        const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id) });
+        const { declaredFactsOf } = await import('./gen/parse.ts');
+        const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
         const c = count(d.issues);
         jsonTo(io, {
           kind: 'ingest',

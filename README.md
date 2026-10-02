@@ -5,7 +5,8 @@
 
 **两个方向**：Excel →（**接入规格**）→ 本地 DuckDB 星型库 →（**报表规格**）→ 按模板渲染的报送 Excel / 图表。
 **三个入口**：**MCP + skill**（agent 与你对话，把模糊模板敲成规格）、**Web**（浏览器三个页签）、
-**CLI**（定位的一部分，尚未实现 —— `package.json` 还没有 `bin`）。
+**CLI**（`bilite`，给人与脚本：`ingest lint|dry-run|run` · `render` · `query` · `catalog dump|show` ·
+`compact` · **`plan` / `apply`** · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
 
 财务数据**不以明文进入 LLM 上下文**——这不是靠过滤，是靠架构：agent 根本没有 SQL 权限，
 它只能产出**规格（spec）**，数值第一次出现是在你自己的浏览器里。
@@ -35,7 +36,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 247 项断言全流程验收
+npm run e2e             # ★ 433 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -238,7 +239,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 
 | 层 | 手段 |
 |---|---|
-| ① 能力边界 | agent **没有 SQL 权**，只暴露 6 个 MCP 工具，无 shell |
+| ① 能力边界 | agent **没有 SQL 权**，只暴露 12 个 MCP 工具，无 shell |
 | ② 给坐标不给数值 | `preview_spec` 返回 `B4:E8 将填 5 行 × 4 列`，看不到任何金额 |
 | ③ 查询下推 | spec 在服务端编译成参数化 SQL，在 DuckDB 内执行；维度只能来自白名单 |
 | ④ 分档 + 审计 | agent 视角的金额返 `12.3亿` 而非精确值，每格须 ≥3 行明细支撑；字段级审计 |
@@ -246,7 +247,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 **关键推论**：改口径只需要 spec 的文本 diff，**不需要任何数值参与**。
 所以"财务数据不进上下文"是架构上自然达成的，而不是靠事后过滤。
 
-### MCP 工具集（仅此七个）
+### MCP 工具集（仅此十二个）
 
 | 工具 | 作用 | 返回数值？ |
 |---|---|---|
@@ -257,6 +258,13 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | `render_report` | 渲染 Excel，返回文件路径 | 否（只回路径与计数） |
 | `diff_report` | 比较两版 spec 的差异 | 否 |
 | `generate_spec` | 从模板推断 spec 草稿（区分"读到的"与"猜的"） | 否（**不查库**，只读模板结构） |
+| `look_at_source` | 看源 Excel 的文本视图（表头/行标签/哪些格是数字） | 否（数字格只回 `{num:true}`） |
+| `lint_ingest` | **静态诊断**接入规格（源 Excel → 星型表的映射） | 否（不读源文件、**不查库**） |
+| `dry_run_ingest` | 干跑：形状 + 主数据判定，一次库都不写 | 否 |
+| `run_ingest` | 按接入规格真正落库（有歧义整批拒绝、一行不写） | 否 |
+| `get_catalog` | 库里现在有什么：L1 成员 / L2 结构 / L3 版本（按需下钻） | 否 |
+
+前七个是**报表侧**（spec → Excel/图表），后五个是**接入侧与现状**（源 Excel → 星型表、库里有什么）。
 
 另有一道**机械兜底**：任何工具返回值里若出现 ≥ 10000 的数字，本次调用直接失败。
 它不替代上面的结构设计，只是让"将来某次改动不小心泄漏"变成一个响亮的错误。
@@ -280,7 +288,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 }
 ```
 
-协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 7 个工具要拉 16MB，
+协议实现是**零依赖手写**的（约 150 行）——官方 SDK 只为 12 个工具要拉 16MB，
 而实际协议面只有 4 个方法。漂移风险用 e2e 对冲：验收阶段**用真实 MCP 客户端**连本服务，
 不是自打 mock。
 
@@ -296,7 +304,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 231 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 433 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -307,28 +315,34 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 
 ```
 src/
-  db/schema.ts       DDL（四维表 + 事实表 + 批次表）+ 口径注册表
+  cli.ts             命令行入口（与 Web / MCP 同构的薄壳；数据走 stdout、日志走 stderr）
+  gen/               ★ 生成器：models/*.yml → IR → plan / apply（业务表的 DDL 由声明长出来）
+  paths.ts           ★ 源文件路径白名单（唯一实现 —— 它是安全判据，不许再写一份）
+  db/schema.ts       DDL（四维表 + 事实表 + 批次表 + raw 着陆表 + 列契约表）+ 口径注册表
   db/index.ts        open / query / execute / exportParquet（单进程双连接）
-  import/longtable.ts 长表解析 + STAGED 三态校验 + 提交 + Parquet 归档
-                      commit() 两阶段：有歧义整体不落库
-  import/resolve.ts  ★ 主数据两档归并（Tier 1 自动 / Tier 2 人拍板）+ 别名表
+  land/              ★ 着陆层：源文件 → raw（append-only，可重放的唯一依据）+ 还成可读工作簿
+  ingest/            ★ 接入层：接入规格 YAML + 源 Excel → 星型表（两阶段落库 / 主数据两档归并）
+  meta/              列契约与 catalog（物理层向语义层 / agent 自省）
   spec/types.ts      spec 类型与校验 + diagnoseSpec()（一次给全所有问题）
   spec/dims.ts       ★ 维度角色表（量纲维 / 筛选维），DIMENSIONS 的单一来源
   spec/expr.ts       ★ 派生表达式求值器（手写，不是 eval）
-  spec/lint.ts       ★ 结构诊断的唯一判据（欠约束 / expr / join / order）
+  spec/lint.ts       ★ 结构诊断的唯一判据（欠约束 / expr / join / order / 口径名）
   spec/compile.ts    ★ 维度白名单 + spec → 参数化 SQL + runCompiled + planOf
   spec/template.ts   模板结构读取（表头/行标签/合并区/定义名称/公式行）
   spec/infer.ts      ★ 模板 → spec 草稿（带 source/evidence，猜的要人确认）
   semantic/query.ts  ★ 唯一的自由查询出口 + 受众分级 + 反推防护
   render/excel.ts    ★ xlsx-populate 模板填充（保版式）
   render/chart.ts    ★ 同一 spec → ECharts option / 形状描述
-  mcp/tools.ts       ★ 七个 MCP 工具（含 lint_spec）+ 金额兜底 + 审计
+  skill/export.ts    ★ 手册里可对拍的那部分（从实现投影，不是抄一份）
+  mcp/tools.ts       ★ 十二个 MCP 工具 + 金额兜底 + 审计
   mcp/server.ts      零依赖 MCP stdio 服务端
   server.ts          零框架本地 Web 服务
   web/               三个页签的前端（原生 JS）
+models/              ★ 业务表（dim_* / fact_*）的**声明** —— 它们不再手写 DDL：`bilite plan` → `bilite apply`
 specs/               口径规格 YAML
+ingest/              接入规格 YAML（源文件路径必须指向 data/ 下的稳定位置）
 templates/           原始报送模板（人工制作，不修改）
-docs/                需求与架构（规范文本）+ 实测调研报告
+docs/                需求与架构（规范文本）+ 实测调研报告 + 开发计划
 data/                ⚠️ 真实财务数据，永不提交
 ```
 
@@ -338,12 +352,16 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，231 项断言，15 个阶段
+npm run e2e        # ★ 唯一门禁，433 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
 
 > `npm run e2e` 会清空 `data/bi.duckdb` 重跑。**别拿它对着真实数据库跑。**
+
+> **CLI**（三个入口里的第三个，给人与脚本）：`npm link` 之后直接用 `bilite`，或 `node src/cli.ts`。
+> `bilite --help` 看全部命令。数据走 stdout、日志与进度走 stderr，退出码 **0 跑通 / 1 被拒 / 2 用法错误**
+> （"需要人拍板"算跑通，不算失败）。
 
 ---
 
@@ -354,20 +372,25 @@ npm run bench      # ⚠️ 未实现
 | 1. 导入闭环 | ✅ 服务端 + Web 导入向导 + Parquet 归档 |
 | 2. 语义层 + 查询 | ✅ 受众分级 / 反推防护 / 注入防护 + Web 看板 |
 | 3. 规格引擎 | ✅ Excel + ECharts 两个渲染器 + Web 报表预览导出 |
-| 4. agent 入口 | ✅ MCP 七工具（真实 MCP 客户端验收通过） |
+| 4. agent 入口 | ✅ MCP 十二工具（真实 MCP 客户端验收通过） |
 | 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
 | R1. 主数据对齐 | ✅ 两档归并（Tier 1 自动 / Tier 2 人拍板）+ `dim_alias` 表 + Web 待确认卡片 |
 | §7.2 路径 2 | ✅ 自然语言 → spec：靠"spec 语言挡住欠约束"实现（`lint_spec` + 边打字边诊断） |
+| CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `compact` · `plan` / `apply` · `validate` · `skill export` |
+| 维度版本行（SCD2） | ✅ 历史挂侧表 `dim_*_hist`；`dimAsOf` 时点查询；**当前态查询零回归** |
 
 ### 已知限制
 
 - **只有假数据在跑**。生产环境的导入格式会有差异，导入层对列名/公司名/指标名
-  有别名表，但**真实导出很可能超出这份表** —— 未识别的主数据会列进 `stage()` 的
-  待确认清单，需要人工确认，不会静默建维。
+  有别名表，但**真实导出很可能超出这份表** —— 未识别的主数据会列进 `runIngest()` 的
+  `needsDecision` 待确认清单，需要人工确认，不会静默建维。
 - **别名只增不减**：`dim_alias` 里的映射一旦登记就永久生效（人确认过一次，下月自动命中）。
   目前没有 Web 上的撤销入口，改错了要去 `GET /api/aliases` 看清单。
-  这也是 `commit()` 分两阶段的原因 —— 宁可整体不落库，也不留下半成品别名。
-- **`fact_business_line` 尚未建表**：运营指标（合同、业务线）目前只有 `fact_contract`。
+  这也是落库分两阶段（先判定、再写库）的原因 —— 宁可整体不落库，也不留下半成品别名。
+- **`data/uploads/` 只增不减是有意的**：上传件是接入规格 `source:` 可以直接指向的源文件，
+  删掉它那条规格立刻变成死路径（而且没有任何提示）。清理是人工动作，两条判据见 `AGENTS.md` §7。
+- **业务表由 `models/*.yml` 声明长出来**（`bilite plan` 看 diff、`bilite apply` 落地）——
+  `fact_business_line`（运营指标，**没有口径列**）与 `fact_contract` 都在其中，不再是手写 DDL。
 - **公式缓存值不写回**：xlsx-populate 不重算公式。下游若直接读公式列数值，
   Excel 打开时会自动重算，但程序化读取需要另做处理。
 - **重打包后有 10/18 个部件字节不等**（属性顺序、转义、空白等良性差异）。
@@ -379,7 +402,8 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（17 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（19 条铁律）
+- [`skills/bi-lite-ingest/AGENT-PROMPT.md`](skills/bi-lite-ingest/AGENT-PROMPT.md) —— **给 agent 的接线与 system prompt**（MCP 配置 + 行为纪律）
 
 ## License
 

@@ -106,7 +106,7 @@ function loadIngestText(body: { yaml?: string; specFile?: string }): { text: str
 /** 接入规格的静态诊断（与 MCP 侧 lint_ingest 同一套判据：diagnoseIngest） */
 async function diagIngest(text: string) {
   const cat = await masterCatalog();
-  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes, facts: cat.facts });
   return {
     cat,
     d,
@@ -369,7 +369,7 @@ export const routes: Record<string, Handler> = {
     if ('error' in t) return json(res, 400, t);
     const { cat, d, errors } = await diagIngest(t.text);
     if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
-    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, planOnly: true, decisions: body.decisions }));
+    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, planOnly: true, decisions: body.decisions }));
   },
 
   'POST /api/ingest/run': async (req, res) => {
@@ -378,7 +378,7 @@ export const routes: Record<string, Handler> = {
     if ('error' in t) return json(res, 400, t);
     const { cat, d, errors } = await diagIngest(t.text);
     if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
-    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, decisions: body.decisions }));
+    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, decisions: body.decisions }));
   },
 
   /** 定稿接入规格。与 /api/specs/save 同一纪律：**先校验再落盘**（拒绝把跑不了的规格写进仓库） */
@@ -387,7 +387,10 @@ export const routes: Record<string, Handler> = {
     if (!yaml || typeof yaml !== 'string') return json(res, 400, { error: '缺少 yaml' });
     let spec: IngestSpec;
     try {
-      spec = parseIngestSpec(yaml);
+      // ★ 与 dry-run / run 走**同一份判据**（同一个 ctx）：静态放行、落盘就不该被拒。
+      //   （这条路由原来没有 catalog 在作用域里 —— 换成 parseIngestSpec(yaml, ctx) 时踩过一次）
+      const cat = await masterCatalog();
+      spec = parseIngestSpec(yaml, { periodTypes: cat.periodTypes, facts: cat.facts });
     } catch (e) {
       return json(res, 400, { error: (e as Error).message });
     }

@@ -5,6 +5,7 @@
  * 导入与查询用**不同连接**，靠 MVCC 让读不被写阻塞。
  */
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
+import { PARQUET_ROOT } from './compact.ts';
 import { DDL } from './schema.ts';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,12 +24,15 @@ let openedPath: string | null = null;
  *   （`test/e2e.ts` 第 13 阶段就是这么做的）。没有这个口子，测试只能违反单写者约束，
  *   而那会把归档写成空文件（§4 备忘 13 的判例）。
  */
-export async function open(dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb') {
+export async function open(
+  dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb',
+  opts: { models?: 'ensure' | 'skip' } = {},
+) {
   if (instance) return;
   openedPath = dbPath;
 
-  // 确保归档目录存在
-  fs.mkdirSync(path.join('data/parquet'), { recursive: true });
+  // 确保归档目录存在（路径常量只有一份，见 db/compact.ts）
+  fs.mkdirSync(path.join(PARQUET_ROOT), { recursive: true });
 
   instance = await DuckDBInstance.create(dbPath, {
     // 财务数据敏感：禁用外部访问，避免 SQL 里意外读到任意文件
@@ -39,19 +43,68 @@ export async function open(dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb') {
   writeConn = await instance.connect();
   readConn = await instance.connect();
 
-  // 建表（幂等）
+  // 建表（幂等）：**基础元数据** DDL（运营侧 + 控制面）由手写 DDL 建；
+  // 业务表（dim_* / fact_*）由 models/*.yml 声明生成（见 ensureModels）。
   for (const stmt of DDL.split(';').map((s) => s.trim()).filter(Boolean)) {
     await writeConn.run(stmt);
   }
 
-  // ★ 列契约随**结构创建**一起登记。
-  //   架构 §7.2 把 `_meta_columns` 安排在"生成器 apply 时"写 —— 这里没有生成器，
-  //   等价的时刻就是**建表这一刻**（`open()`）。
-  //   为什么不能只靠接入层（`runIngest`）：那样**首次导入之前 catalog 是空的**，
-  //   agent 在那段时间看不到任何结构，而结构其实已经在了。接入层那次登记照旧保留 ——
-  //   它让"数据与元数据同一事务"，这里这次保证"结构一存在，契约就在"。
-  //   动态 import 是为了避开 db ↔ meta 的静态循环（meta/columns.ts 要用本模块的 execute/query）。
-  await (await import('../meta/columns.ts')).registerMeta();
+  // ★ 声明落地 + 列契约登记（P2 生成器）。
+  //   `_meta_columns` 有**两个**登记时刻，而它们投影的是同一份 IR（metaOf）：
+  //     ① 这里：**结构一存在，契约就在**（首次导入之前 catalog 也不是空的）；
+  //     ② 接入层落库时（runIngest 的事务里）：数据与元数据同一时刻落库。
+  //   `{ models: 'skip' }` 给生成器自己的两条命令用（`plan` 要看到一个**没被动过**的库；
+  //   `apply` 要自己报告它落了什么，而不是被 open() 抢先做掉）。
+  if (opts.models !== 'skip') await ensureModels();
+}
+
+/**
+ * 让库结构与 `models/*.yml` 的声明**对得上**（P2）。启动时的策略只有三条，都要能一眼说清：
+ *
+ *  ① **阻塞项（删列 / 改类型 / 加 NOT NULL 列 / 无主的语义表）→ 抛错**。
+ *     那种不一致只能由人决定，启动时糊弄过去最危险。
+ *  ② **空库（一张声明的表都不存在）→ 引导落地**。全新装起来必须能直接跑，
+ *     否则 `npm start` 的第一步就是"先手动 apply"。
+ *  ③ **非空库 + 有结构变更 → 不落地，只**响亮报告**。**
+ *     结构变更（DDL）一律要人点一次 `bilite apply` —— 这正是"plan 与 apply 是两条命令"的意义
+ *     （`docs/开发计划.md` §3 P2 的验收：先见 diff 再决定落地）。自动做的话，plan 就永远看不到东西了。
+ *     **只有不是 DDL 的变更（列契约刷新）随手做掉** —— 它不动数据、也不改结构。
+ */
+async function ensureModels(): Promise<void> {
+  const { loadModels, MODELS_DIR } = await import('../gen/parse.ts');
+  const { applyModels } = await import('../gen/apply.ts');
+  const { planModels, summarizePlan } = await import('../gen/plan.ts');
+
+  const ir = loadModels(MODELS_DIR);
+  const liveTables = new Set(
+    (await query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`,
+    )).map((r) => r.table_name),
+  );
+  const empty = ir.tables.every((t) => !liveTables.has(t.name));
+
+  const plan = await planModels(ir);
+  if (plan.blocking.length > 0) {
+    throw new Error(
+      `库结构与模型声明（${MODELS_DIR}/*.yml）不一致，而这些变更 apply 不会自动做：\n  - ` +
+        plan.blocking.map((c) => c.detail).join('\n  - ') +
+        `\n先跑 \`bilite plan\` 看完整清单，再改声明或手工处理库。`,
+    );
+  }
+  if (plan.structural.length > 0 && !empty) {
+    console.error(
+      `[gen] ⚠️ models/*.yml 有 ${plan.structural.length} 项**结构变更**没落地：\n  - ` +
+        plan.structural.map((c) => c.detail).join('\n  - ') +
+        `\n   结构变更一律要人点一次：\`bilite plan\` 看清单 → \`bilite apply\` 落地。` +
+        `\n   库仍是旧结构，引擎照常可用（不自动改结构是刻意的：否则 plan 就永远看不到东西）。`,
+    );
+    return;
+  }
+  const r = await applyModels(ir);
+  if (r.blocked.length > 0) {
+    throw new Error(`模型落地被拒：\n  - ` + r.blocked.map((c) => c.detail).join('\n  - '));
+  }
+  if (r.applied.length > 0) console.error(`[gen] ${empty ? '空库引导：' : ''}${summarizePlan(r.plan)}`);
 }
 
 export function writer(): DuckDBConnection {

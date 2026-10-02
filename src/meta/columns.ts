@@ -1,10 +1,10 @@
 /**
  * 列契约：**物理层向语义层与 Agent 自省自己**的那一份声明（架构 §7.2）。
  *
- * 用户 2026-10-01 拍板的方向：**不建生成器**，`_meta_columns` 由**接入层在落库时顺带登记**。
- * 理由是——表已经是常数（bi-lite 只有 8 张），生成器最主要的那个价值（表不随模板增长）
- * 在这儿用不上；而"哪些列是什么角色"本来就是接入层知道的事，
- * 让它在**同一个事务**里把数据与元数据一起写下，两者天然同源。
+ * 用户 2026-10-01 曾拍板"不建生成器"、由接入层落库时顺带登记；**2026-10-02 重新拍板重新开工**。
+ * 现在两层都在，而且不冲突：**生成器 apply 时登记一次**（结构建好那一刻），
+ * **接入层落库时再登记一次**（数据与元数据同一事务）—— 两处投影的是**同一份 IR**（`metaOf`）。
+ * 表不再是常数：`fact_business_line` 这类新表由声明长出来，不再是手写 DDL。
  *
  * ★ 那么这份"声明"跟"第二份人工维护的真相"有什么区别？区别只有一条，而它是硬的：
  *   **声明必须能被 `information_schema` 校验。** `metaProblems()` 会把声明与实际库结构对拍，
@@ -17,105 +17,23 @@
  */
 import { createHash } from 'node:crypto';
 import { execute, query } from '../db/index.ts';
-
-/** 列在语义层扮演的角色 —— 与架构 §7.2 的五个取值一一对应 */
-export type MetaRole = 'pk' | 'dim_fk' | 'measure' | 'degenerate' | 'provenance';
-
-export interface MetaColumn {
-  column: string;
-  role: MetaRole;
-  /** 语义类型：period / org / metric / money / …（给人和 agent 看的，不参与 SQL） */
-  semantic?: string;
-  unit?: string;
-  /** role='dim_fk' 时：指向哪张维表 */
-  refTable?: string;
-}
-
-export interface MetaObject {
-  name: string;
-  kind: 'dimension' | 'fact' | 'bridge';
-  /** 事实表的粒度（列名）；维度表留空 */
-  grain?: string[];
-  columns: MetaColumn[];
-}
-
-const PK = (column: string, semantic?: string): MetaColumn => ({ column, role: 'pk', semantic });
-const FK = (column: string, refTable: string, semantic?: string): MetaColumn => ({
-  column,
-  role: 'dim_fk',
-  refTable,
-  semantic,
-});
-const MEASURE = (column: string, unit?: string, semantic = 'money'): MetaColumn => ({
-  column,
-  role: 'measure',
-  unit,
-  semantic,
-});
-const DEG = (column: string, semantic?: string): MetaColumn => ({ column, role: 'degenerate', semantic });
-const PROV = (column: string): MetaColumn => ({ column, role: 'provenance' });
+import { metaOf, type MetaObject } from '../gen/ir.ts';
+import { loadModels, MODEL_API_VERSION } from '../gen/parse.ts';
 
 /**
- * **唯一一份**列契约。
+ * 列契约的**内容**不再手写在这里 —— 它现在投影自 `models/*.yml`（P2 生成器的声明层，
+ * 用户 2026-10-02 重新拍板重新开工）。本文件保留三件只有它该知道的事：
+ *   ① **运营侧**的表不进契约（`raw_*` / `import_batch` / `dim_alias` —— 见文件头）；
+ *   ② 把声明写进 `_meta_*`（`registerMeta`）；
+ *   ③ 把声明与真实库结构对拍（`metaProblems`）与结构指纹（`schemaFingerprint`）。
  *
- * 加列、改名、换角色时只改这里 —— `metaProblems()` 会立刻告诉你是不是忘了同步别处。
+ * ★ 判据只有一份：`META` 是 `metaOf(loadModels())` 的**投影**，不是第二份声明。
+ *   谁要改列角色，改的是 `models/<表>.yml`，然后 `bilite plan` / `bilite apply`。
  */
-export const META: readonly MetaObject[] = [
-  {
-    name: 'dim_company',
-    kind: 'dimension',
-    columns: [
-      PK('id', 'org'),
-      DEG('name', 'org'),
-      FK('parent_id', 'dim_company', 'org'),
-      DEG('level'),
-      DEG('group_name'),
-      PROV('alias'),
-    ],
-  },
-  {
-    name: 'dim_metric',
-    kind: 'dimension',
-    columns: [
-      PK('id', 'metric'),
-      DEG('name', 'metric'),
-      DEG('category'),
-      DEG('unit'),
-      DEG('direction'),
-      PROV('alias'),
-    ],
-  },
-  {
-    name: 'dim_period',
-    kind: 'dimension',
-    columns: [PK('fin_month', 'period'), DEG('year', 'period'), DEG('month', 'period'), DEG('is_audited')],
-  },
-  {
-    name: 'fact_finance',
-    kind: 'fact',
-    grain: ['fin_month', 'company_id', 'metric_id', 'period_type'],
-    columns: [
-      PK('fin_month', 'period'),
-      FK('company_id', 'dim_company', 'org'),
-      FK('metric_id', 'dim_metric', 'metric'),
-      PK('period_type', 'period_type'),
-      MEASURE('amount', '元'),
-      PROV('batch_id'),
-    ],
-  },
-  {
-    name: 'fact_contract',
-    kind: 'fact',
-    grain: ['fin_month', 'company_id', 'metric_id'],
-    columns: [
-      PK('fin_month', 'period'),
-      FK('company_id', 'dim_company', 'org'),
-      FK('metric_id', 'dim_metric', 'metric'),
-      MEASURE('amount', '元'),
-      PROV('batch_id'),
-    ],
-  },
-];
+export type { MetaRole, MetaColumn, MetaObject } from '../gen/ir.ts';
+
+/** **唯一一份**列契约：模型声明的投影（见上） */
+export const META: readonly MetaObject[] = metaOf(loadModels());
 
 /** SQL 字符串字面量转义。⚠️ 本仓库另有几份同功能实现，待收拢 */
 function lit(v: string): string {
@@ -143,8 +61,8 @@ const NON_SEMANTIC = new Set([
  * ★ 由 `runIngest` 在**阶段 2 的事务里**调用：数据与元数据同一时刻落库。
  *   这样"元数据漂移"只可能来自**声明写错**，而那种漂移会被 `metaProblems()` 当场抓住。
  */
-export async function registerMeta(): Promise<void> {
-  for (const obj of META) {
+export async function registerMeta(meta: readonly MetaObject[] = META): Promise<void> {
+  for (const obj of meta) {
     await execute(
       `INSERT INTO _meta_objects (object_name, kind, grain, api_version) VALUES ` +
         `(${lit(obj.name)}, ${lit(obj.kind)}, ${obj.grain ? lit(obj.grain.join(',')) : 'NULL'}, ${lit(API_VERSION)}) ` +
@@ -162,8 +80,9 @@ export async function registerMeta(): Promise<void> {
   }
 }
 
-/** 契约的版本号。改 `META` 的结构时手动递增 —— catalog 靠它判断"agent 手里那份是不是旧的" */
-export const API_VERSION = '2026-10-01';
+/** 契约的版本号 = **模型声明的口径版本**（`gen/parse.ts` 的 MODEL_API_VERSION）。
+ *  catalog 靠它判断"agent 手里那份是不是旧的" —— 所以它跟着声明走，不手写第二份。 */
+export const API_VERSION = MODEL_API_VERSION;
 
 /**
  * **声明 vs 实际库结构**：把漂移全部找出来。

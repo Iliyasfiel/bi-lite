@@ -1,66 +1,18 @@
 /**
  * 数据模型（对应 docs/需求与架构.md §4）
  *
- * 采用 Kimball 星型模型：维度共享，事实表按业务域拆分。
- * 三维度：公司 × 指标 × 期间，口径是事实表的一个列（不是行）。
+ * ★ 本文件现在只放**基础元数据 DDL**（手写、不由声明生成）—— 见 `docs/开发计划.md` §3 P1/P2：
+ *   - 运营侧：`raw_*`（着陆层）、`import_batch`（批次）、`dim_alias`（别名映射）
+ *   - 控制面：`_meta_objects` / `_meta_columns`（列契约）、`_model` / `_model_dep`（模型指纹与依赖）
+ *
+ * ★ **业务表（`dim_*` / `fact_*`）的 DDL 不在这里** —— 它们在 `models/*.yml` 里声明，
+ *   由生成器（`src/gen/`）算 diff 后落地：`bilite plan` 看变更，`bilite apply` 执行。
+ *   为什么要分开：业务表会随业务增长（`fact_business_line` 就是下一张），
+ *   手写 DDL 每加一张表就要人肉保证"表、列契约、依赖图"三处一致 —— 那就是漂移的温床。
+ *   不变的运营侧表留在这里，因为它们**不是**声明层管的（它们的角色对"有哪些维度和指标"没有贡献）。
  */
 
 export const DDL = `
--- ---------- 维度表 ----------
-
--- 公司维度：必须有层级，支撑"按板块汇总"这类保送需求
-CREATE TABLE IF NOT EXISTS dim_company (
-  id         VARCHAR PRIMARY KEY,
-  name       VARCHAR NOT NULL,
-  parent_id  VARCHAR,            -- 自引用，集团→子公司多层树
-  level      INTEGER,            -- 层级深度，1=集团
-  group_name VARCHAR,            -- 所属板块
-  alias      VARCHAR[]           -- 导入时识别到的别名
-);
-
--- 指标维度
-CREATE TABLE IF NOT EXISTS dim_metric (
-  id        VARCHAR PRIMARY KEY,
-  name      VARCHAR NOT NULL,
-  category  VARCHAR,             -- 主要指标 / 盈利指标 ... 用于 spec 的 filter
-  unit      VARCHAR,             -- 元 / 万元 / %
-  direction VARCHAR,             -- positive（越大越好）/ negative（成本类）
-  alias     VARCHAR[]
-);
-
--- 期间维度：财务期与自然月可能不一致
-CREATE TABLE IF NOT EXISTS dim_period (
-  fin_month  DATE PRIMARY KEY,
-  year       INTEGER,
-  month      INTEGER,
-  is_audited BOOLEAN DEFAULT FALSE
-);
-
--- ---------- 事实表 ----------
-
--- 财务事实：三维交点 × 口径
--- 口径是列不是行；账面累计含调整故必须实存（文档 §3.1.2）
-CREATE TABLE IF NOT EXISTS fact_finance (
-  fin_month   DATE    NOT NULL,
-  company_id  VARCHAR NOT NULL,
-  metric_id   VARCHAR NOT NULL,
-  period_type VARCHAR NOT NULL,   -- 本年累计/去年同期累计/单月/单月同比/账面累计
-  amount      DECIMAL(18,2),
-  batch_id    VARCHAR,
-  PRIMARY KEY (fin_month, company_id, metric_id, period_type)
-);
-
--- 运营事实独立成表，共享 dim_company / dim_period
--- 不要塞进 fact_finance：量纲、频率、口径体系都不同
-CREATE TABLE IF NOT EXISTS fact_contract (
-  fin_month  DATE    NOT NULL,
-  company_id VARCHAR NOT NULL,
-  metric_id  VARCHAR NOT NULL,
-  amount     DECIMAL(18,2),
-  batch_id   VARCHAR,
-  PRIMARY KEY (fin_month, company_id, metric_id)
-);
-
 -- ---------- 主数据别名映射（§10 R1）----------
 -- 人确认过一次的写法记在这里，下个月自动命中，不再问第二遍。
 -- normalized 是 normalizeName() 的结果（只去格式噪音，不改语义）——
@@ -126,11 +78,9 @@ CREATE TABLE IF NOT EXISTS raw_cell (
 -- ---------- 控制面元数据：物理层向语义层 / Agent 自省自己的契约（架构 §7.2）----------
 -- ⚠️ 这段注释里**不能出现反引号** —— 整个 DDL 是一个模板字符串，
 --    写一个反引号进去就会把它提前闭合，报错却是"Expected a semicolon"，指在毫不相干的下一行（踩过一次）。
--- ★ 内容由 src/meta/columns.ts 的**唯一一份声明**写入，不是人手改表。
---   而那份声明必须能被 information_schema 校验（metaProblems()，e2e 有断言）——
---   否则它就退化成"第二份人工维护的真相"，正是本仓库反复判过的那种漂移源。
--- ★ 为什么不用生成器写它（用户 2026-10-01 拍板）：表已经是常数，
---   而"哪些列是什么角色"本来就是**接入层**在落库时知道的事 —— 让它在同一事务里顺手记下。
+-- ★ 内容由 src/meta/columns.ts 的 registerMeta() 写入，而它的**唯一来源**是 models/*.yml
+--   （投影自 IR，见 src/gen/ir.ts 的 metaOf）；那份投影必须能被 information_schema 校验
+--   （metaProblems()，e2e 有断言）—— 否则它就退化成"第二份人工维护的真相"。
 
 CREATE TABLE IF NOT EXISTS _meta_objects (
   object_name VARCHAR PRIMARY KEY,
@@ -147,6 +97,26 @@ CREATE TABLE IF NOT EXISTS _meta_columns (
   unit       VARCHAR,
   ref_table  VARCHAR,                -- role=dim_fk 时指向哪张维表
   PRIMARY KEY (table_name, column_name)
+);
+
+-- ---------- 生成器的账本（P2）----------
+-- 为什么需要它（而不是直接看 information_schema）：**声明变了、结构恰好没变**是最常见的一种变更
+-- （改一个列角色、改 title）。那种时候 diff 是空的，但列契约必须重登一次 ——
+-- ddl_hash 就是"我上次落地的是哪一版声明"的凭证。
+CREATE TABLE IF NOT EXISTS _model (
+  name        VARCHAR PRIMARY KEY,   -- 表名
+  kind        VARCHAR NOT NULL,      -- dimension / fact / bridge
+  title       VARCHAR,
+  ddl_hash    VARCHAR NOT NULL,      -- 该表声明的结构指纹（src/gen/ir.ts 的 ddlHashOf）
+  declared_at TIMESTAMP
+);
+
+-- 表之间的声明式依赖（列 → 它引用的表）。整份投影，每次 apply 按声明重写。
+CREATE TABLE IF NOT EXISTS _model_dep (
+  name        VARCHAR NOT NULL,
+  depends_on  VARCHAR NOT NULL,
+  column_name VARCHAR NOT NULL,
+  PRIMARY KEY (name, depends_on, column_name)
 );
 `;
 
