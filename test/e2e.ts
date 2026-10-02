@@ -664,6 +664,21 @@ check('拒绝下载目录穿越', traversal3.status === 404);
     codes.every(([, s]) => s === 200), codes.map(([p, s]) => `${p}=${s}`).join(' '));
 }
 
+// ★ 页面里 fetch 的每个 /api 路径，必须真的在路由表里。
+//   上面那条查的是"GET 入口能不能应答"（只覆盖 5 个）；这条查的是"**页面与路由表对得上**"：
+//   覆盖 `src/web/app.js` 里的全部路径，任一侧漏改都会被它抓住 —— 而这类 404
+//   只有在浏览器里才看得见（那次就是走查才发现），所以这条断言比"点一遍"更早也更便宜。
+{
+  const { routes: serverRoutes } = await import('../src/server.ts');
+  const appjsText = await (await fetch(base + '/static/app.js')).text();
+  const called = [...new Set(appjsText.match(/\/api\/[a-zA-Z0-9/_-]+/g) ?? [])].sort();
+  const known = new Set(Object.keys(serverRoutes).map((k) => k.split(' ')[1]!));
+  const missing = called.filter((p) => !known.has(p));
+  check('★ 页面调用的每个 /api 路径都真的在路由表里（少一个 = 页面上的 404）',
+    called.length >= 10 && missing.length === 0,
+    `页面调了 ${called.length} 个路径、路由表 ${known.size} 个；缺：${missing.join('、') || '无'}`);
+}
+
 // ★ 退场守卫：旧导入路由必须**真的不在了**（404），而不是"还在但没人调"。
 //   删掉一段代码容易，之后就再没人知道它删干净了 —— 这条把"删干净"变成断言。
 {
@@ -803,7 +818,10 @@ try {
   );
   mcpOk = true;
 
+  // ── 记下**实际调用过**的工具名：这一阶段末尾要断言"每个工具都被真调用过" ──
+  const calledTools = new Set<string>();
   const raw = async (name: string, args: Record<string, unknown> = {}) => {
+    calledTools.add(name);
     const r = await client.callTool({ name, arguments: args });
     const text = (r.content as Array<{ type: string; text: string }>)[0].text;
     return { isError: r.isError === true, text, json: (() => { try { return JSON.parse(text); } catch { return null; } })() };
@@ -1212,6 +1230,17 @@ sheets:
     const dp = await raw('dry_run_ingest', { spec: spec(DUP) });
     const dupMsg = issuesOf(dp.json).find((i) => i.code === 'ROWKEY_DUPLICATE_IN_FILE')?.message ?? '';
     check('同一公司内部重复指标被拦，报错点出完整行键「公司=… / 指标=…」', /公司=接入测试甲公司 \/ 指标=营业收入/.test(dupMsg), dupMsg);
+  }
+
+  // ★ 每个 MCP 工具都必须被**真实调用**过一次。
+  //   这不是"多加一条断言"：`AGENTS.md` §6.1 早就规定了"新增 MCP 工具必须补断言"，
+  //   而那条规矩此前只靠人记 —— 现在它由这条断言替你记（漏了它就红，且直接点名漏了谁）。
+  {
+    const { TOOLS } = await import('../src/mcp/tools.ts');
+    const notCalled = TOOLS.map((t) => t.name).filter((n) => !calledTools.has(n));
+    check('★ 每个 MCP 工具都被真实调用过（新增工具不补断言，这里会响）',
+      notCalled.length === 0,
+      `调过 ${calledTools.size} 个（含错误路径 ${calledTools.has('no_such_tool') ? '是' : '否'}）；漏调：${notCalled.join('、') || '无'}`);
   }
 
   await client.close();
@@ -2574,6 +2603,25 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
   check('★ keys[].type 写错 → KEYS_TYPE_BAD（不是静默退回默认读法）',
     badType.willBeRejected === true && badType.issues.some((i) => i.code === 'KEYS_TYPE_BAD'),
     badType.issues.map((i) => i.code).join(','));
+}
+
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
+//   ★ 这一条把一条**人工纪律**变成断言：`AGENTS.md` §3/§6 与 `docs/需求与架构.md` §11.1
+//     都写着条数，而"改了断言要同步条数"这条规矩在本项目里**漂过两次**
+//     （231 与 247 对不上过一次，根因就是没人管它）。现在改了断言却忘同步，e2e 自己会红，
+//     失败信息直接把三处该改成多少告诉你。
+{
+  const actual = pass + fail + 1; // +1 = 这一条本身（先算进来，否则每次都比实际少 1）
+  const readNum = (file: string, re: RegExp) => {
+    const m = re.exec(fs.readFileSync(file, 'utf8'));
+    return m ? Number(m[1]) : null;
+  };
+  const at3 = readNum('AGENTS.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/);
+  const at6 = readNum('AGENTS.md', /\*\*(\d+) 项 e2e 断言\*\*/);
+  const atArch = readNum('docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/);
+  check('★ 三处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
+    at3 === actual && at6 === actual && atArch === actual,
+    `实际 ${actual}；AGENTS §3=${at3}、AGENTS §6=${at6}、需求与架构 §11.1=${atArch}`);
 }
 
 // ============ 汇总 ============
