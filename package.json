@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=22.6"
   },
+  "bin": {
+    "bilite": "src/cli.ts"
+  },
   "scripts": {
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",

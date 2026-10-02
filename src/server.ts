@@ -15,14 +15,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import * as db from './db/index.ts';
-import { stage, commit, readLongTable, type DimDecision } from './import/longtable.ts';
-import { normalizeName, type DimKind } from './import/resolve.ts';
+import type { DimDecision } from './ingest/types.ts';
+import { normalizeName, type DimKind } from './ingest/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
 import { renderTemplate, type RenderBlock } from './render/excel.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
 import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
+import { diagnoseIngest, parseIngestSpec, type IngestSpec } from './ingest/types.ts';
+import { runIngest } from './ingest/run.ts';
+import { masterCatalog } from './ingest/master.ts';
 
 const require = createRequire(import.meta.url);
 const PORT = Number(process.env.PORT ?? 4319);
@@ -31,6 +34,8 @@ const UPLOAD_DIR = 'data/uploads';
 const OUTPUT_DIR = 'output';
 /** 用户上传的待推断模板（临时）；`templates/` 下人工维护的模板才是正式版本 */
 const TEMPLATE_UPLOAD_DIR = 'templates/uploads';
+/** 已定稿的接入规格（源 Excel → 星型表的映射 YAML） */
+const INGEST_DIR = 'ingest';
 
 // ---------------- 工具 ----------------
 
@@ -88,6 +93,28 @@ function listSpecs() {
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
 
+/** 取接入规格文本：优先内联 YAML，其次文件；都没有就是一次明确的 400 */
+function loadIngestText(body: { yaml?: string; specFile?: string }): { text: string; from: string } | { error: string } {
+  if (body.yaml) return { text: body.yaml, from: '(内联 YAML)' };
+  if (body.specFile) {
+    if (!fs.existsSync(body.specFile)) return { error: `接入规格文件不存在: ${body.specFile}` };
+    return { text: fs.readFileSync(body.specFile, 'utf8'), from: body.specFile };
+  }
+  return { error: '需要 yaml（接入规格文本）或 specFile（路径）' };
+}
+
+/** 接入规格的静态诊断（与 MCP 侧 lint_ingest 同一套判据：diagnoseIngest） */
+async function diagIngest(text: string) {
+  const cat = await masterCatalog();
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  return {
+    cat,
+    d,
+    errors: d.issues.filter((i) => i.level === 'error'),
+    warnings: d.issues.filter((i) => i.level === 'warn'),
+  };
+}
+
 const routes: Record<string, Handler> = {
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
   'GET /api/catalog': async (_req, res) => {
@@ -128,65 +155,9 @@ const routes: Record<string, Handler> = {
     });
   },
 
-  /** 导入第一步：STAGED 校验（写入临时文件，不动数据库） */
-  'POST /api/import/stage': async (req, res) => {
-    const rawName = String(req.headers['x-filename'] ?? '上传.xlsx');
-    const name = safeName(decodeURIComponent(rawName));
-    if (!name) return json(res, 400, { error: '缺少文件名' });
-
-    const buf = await readBody(req, 32 * 1024 * 1024);
-    if (!buf.length) return json(res, 400, { error: '文件为空' });
-
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-    const dest = path.join(UPLOAD_DIR, `${Date.now()}-${name}`);
-    fs.writeFileSync(dest, buf);
-
-    const sheet = req.headers['x-sheet'] ? decodeURIComponent(String(req.headers['x-sheet'])) : undefined;
-    const staged = await stage(dest, sheet);
-    json(res, 200, staged);
-  },
-
-  /** 导入第二步：提交（写维度 + 事实表 + Parquet 归档） */
-  'POST /api/import/commit': async (req, res) => {
-    const { batchId, file, sheet, autoCreateDims, decisions } = await readJson<{
-      batchId: string; file: string; sheet?: string; autoCreateDims?: boolean;
-      decisions?: DimDecision[];
-    }>(req);
-
-    // 文件路径必须落在上传目录内，避免被伪造成任意路径
-    const resolved = path.resolve(file);
-    if (!resolved.startsWith(path.resolve(UPLOAD_DIR))) {
-      return json(res, 400, { error: '文件不在上传目录内' });
-    }
-
-    const rows = await readLongTable(resolved, sheet);
-    const result = await commit(batchId, rows, {
-      autoCreateDims: autoCreateDims !== false,
-      decisions,
-    });
-
-    // ★ 有歧义的名字 → 一行都没写，把待确认清单回给前端。
-    //   这不是错误（HTTP 200），是"需要人拍板"的正常中间状态：
-    //   报 4xx 会让前端把它当成失败，而它其实是一条待办。
-    if (result.needsDecision.length) {
-      return json(res, 200, { ...result, archived: false, pendingConfirm: true });
-    }
-
-    let archived = true;
-    try {
-      const { archiveParquet } = await import('./import/longtable.ts');
-      await archiveParquet(batchId);
-    } catch (e) {
-      // 归档失败不影响主链路（查询不依赖 Parquet），但绝不静默 —— 见 §4.4
-      archived = false;
-      console.error(`[归档] 批次 ${batchId} 的 Parquet 归档失败:`, (e as Error).message);
-    }
-    json(res, 200, { ...result, archived });
-  },
-
   /** 别名映射清单（§10 R1）—— 人确认过一次的写法，下月自动命中 */
   'GET /api/aliases': async (_req, res) => {
-    const { listAliases } = await import('./import/resolve.ts');
+    const { listAliases } = await import('./ingest/resolve.ts');
     json(res, 200, await listAliases());
   },
 
@@ -203,7 +174,7 @@ const routes: Record<string, Handler> = {
     if (kind !== 'company' && kind !== 'metric') return json(res, 400, { error: 'kind 必须是 company 或 metric' });
     if (!raw || !targetId) return json(res, 400, { error: '缺少 raw 或 targetId' });
 
-    const { registerAlias, loadEntities } = await import('./import/resolve.ts');
+    const { registerAlias, loadEntities } = await import('./ingest/resolve.ts');
     // 目标必须真实存在 —— 否则会造出一条指向虚空的别名，将来更难查
     const target = (await loadEntities(kind)).find((e) => e.id === targetId);
     if (!target) return json(res, 400, { error: `目标主数据不存在: ${targetId}` });
@@ -212,28 +183,7 @@ const routes: Record<string, Handler> = {
     json(res, 200, { ...r, kind, raw, normalized: normalizeName(raw), targetId, targetName: target.name });
   },
 
-  /**
-   * 未识别名称的候选建议（不写库）。
-   *
-   * 页面在提交被 `pendingConfirm` 拦下后调用它拿候选，也可以独立用来
-   * 上传前先看看"这批名字里有多少是见过的"。
-   */
-  'POST /api/import/suggest': async (req, res) => {
-    const { names } = await readJson<{ names: Array<{ kind: DimKind; raw: string }> }>(req);
-    if (!Array.isArray(names)) return json(res, 400, { error: '缺少 names 数组' });
-    const { buildResolver } = await import('./import/resolve.ts');
-    const resolvers = { company: await buildResolver('company'), metric: await buildResolver('metric') };
-    json(res, 200, {
-      suggestions: names.map((n) => ({
-        kind: n.kind,
-        raw: n.raw,
-        resolved: resolvers[n.kind].resolve(n.raw) ?? null,
-        candidates: resolvers[n.kind].candidates(n.raw),
-      })),
-    });
-  },
-
-  /** 已注册报表列表（specs/*.yaml） */
+  /** 已注册报表列表（`specs/*.yaml`）—— 报表页的"已注册报表"就靠它 */
   'GET /api/specs': async (_req, res) => {
     json(res, 200, listSpecs());
   },
@@ -241,7 +191,7 @@ const routes: Record<string, Handler> = {
   /**
    * 从模板推断 spec 草稿（§7.2 路径 1）。
    *
-   * 与 `/api/import/stage` 同一套路：原始二进制 body + `X-Filename` 头，不用 multipart。
+   * 与 `/api/ingest/upload` 同一套路：原始二进制 body + `X-Filename` 头，不用 multipart。
    * 上传的模板落在 `templates/uploads/`，与 `templates/` 下人工维护的模板分开，
    * 避免临时上传被当成正式模板版本化（`.gitignore` 只忽略后者）。
    */
@@ -328,6 +278,116 @@ const routes: Record<string, Handler> = {
     const dest = path.join('specs', `${base}.yaml`);
     fs.writeFileSync(dest, yaml);
     json(res, 200, { file: dest, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length });
+  },
+
+  // ---------------- 接入规格：源 Excel → 星型表 ----------------
+  // YAML 由 agent（或人）产出，引擎只负责**确定性执行**与**确定性拒绝**。
+  // 这里的三条纪律：诊断 200 + willBeRejected 表达"能不能跑"；干跑不写库；
+  // 有歧义的名字整批拒绝、一行都不写（合并两家公司的钱会静默相加，没人会来查）。
+
+  /**
+   * 已定稿的接入规格（`ingest/` 下）。
+   *
+   * ★ 顺带把文本带回去：向导要"载入某份规格进编辑器"。若另开一条 `?file=` 的读文件路由，
+   *   就得再写一份"这个路径允不允许读"的判断 —— 而**枚举出来的路径天然是允许的**。
+   *   少一处判据，就少一处会漂的判据（铁律 17）。
+   */
+  'GET /api/ingest/specs': async (_req, res) => {
+    const files = fs.existsSync(INGEST_DIR) ? fs.readdirSync(INGEST_DIR).filter((f) => /\.ya?ml$/.test(f)).sort() : [];
+    json(
+      res,
+      200,
+      files.map((f) => {
+        const file = path.join(INGEST_DIR, f);
+        return { file, id: f.replace(/\.ya?ml$/, ''), yaml: fs.readFileSync(file, 'utf8') };
+      }),
+    );
+  },
+
+  /**
+   * 上传**源 Excel**：只落盘，不解析、不落库。
+   *
+   * ★ 为什么必须单独一步：接入规格里的 `source:` 是一个**路径**，而引擎只认白名单内真实
+   *   存在的文件（`src/paths.ts` 的 `resolveSource`）。浏览器给不出一个服务端路径，
+   *   所以只能先把文件放进来、再让规格指过去。
+   * ★ 与 `/api/ingest/upload` 同一套路：原始二进制 body + `X-Filename` 头（不为上传引 multipart）。
+   * ★ 这里**不写任何新判据** —— 校验与落库都在接入层那条路上
+   *   （`diagnoseIngest` / `runIngest`）；上传层多一道判断就是多一份会漂的判据（铁律 17）。
+   *   唯一要保证的是一个**不变式**：落点必须在 `SOURCE_ROOTS` 内，否则这里给出的路径
+   *   到了 `source:` 里会被接入层拒 —— 那时报错已经离现场很远了。所以直接问那份唯一判据。
+   */
+  'POST /api/ingest/upload': async (req, res) => {
+    const rawName = String(req.headers['x-filename'] ?? '源文件.xlsx');
+    const name = safeName(decodeURIComponent(rawName));
+    if (!name) return json(res, 400, { error: '缺少文件名' });
+
+    const buf = await readBody(req, 32 * 1024 * 1024);
+    if (!buf.length) return json(res, 400, { error: '文件为空' });
+
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const dest = path.join(UPLOAD_DIR, `${Date.now()}-${name}`);
+    fs.writeFileSync(dest, buf);
+
+    try {
+      const { resolveSource } = await import('./paths.ts');
+      resolveSource(dest);
+    } catch (e) {
+      return json(res, 400, { error: (e as Error).message });
+    }
+    json(res, 200, { file: dest, name, size: buf.length });
+  },
+
+  'POST /api/ingest/lint': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { d, errors, warnings } = await diagIngest(t.text);
+    json(res, 200, {
+      from: t.from,
+      id: d.spec?.id ?? null,
+      source: d.spec?.source ?? null,
+      ok: !d.willBeRejected,
+      willBeRejected: d.willBeRejected,
+      parseError: d.parseError,
+      errors,
+      warnings,
+    });
+  },
+
+  'POST /api/ingest/dry-run': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { cat, d, errors } = await diagIngest(t.text);
+    if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
+    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, planOnly: true, decisions: body.decisions }));
+  },
+
+  'POST /api/ingest/run': async (req, res) => {
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    const t = loadIngestText(body);
+    if ('error' in t) return json(res, 400, t);
+    const { cat, d, errors } = await diagIngest(t.text);
+    if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
+    json(res, 200, await runIngest(parseIngestSpec(t.text), { catalog: cat, decisions: body.decisions }));
+  },
+
+  /** 定稿接入规格。与 /api/specs/save 同一纪律：**先校验再落盘**（拒绝把跑不了的规格写进仓库） */
+  'POST /api/ingest/save': async (req, res) => {
+    const { yaml } = await readJson<{ yaml?: string }>(req);
+    if (!yaml || typeof yaml !== 'string') return json(res, 400, { error: '缺少 yaml' });
+    let spec: IngestSpec;
+    try {
+      spec = parseIngestSpec(yaml);
+    } catch (e) {
+      return json(res, 400, { error: (e as Error).message });
+    }
+    const base = safeName(spec.id ?? '');
+    if (!base) return json(res, 400, { error: '非法 id（YAML 里的 id 不能为空且不能全是特殊字符）' });
+    fs.mkdirSync(INGEST_DIR, { recursive: true });
+    const dest = path.join(INGEST_DIR, `${base}.yaml`);
+    fs.writeFileSync(dest, yaml);
+    json(res, 200, { file: dest, id: spec.id, source: spec.source });
   },
 
   /** 报表预览：出坐标计划（不含金额）+ 矩阵（含数值，给浏览器） */

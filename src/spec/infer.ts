@@ -19,10 +19,12 @@ import { unpinnedMeaningDims } from './lint.ts';
 import {
   openTemplate,
   readRegion,
+  readPeriodHint,
   findHeader,
   type Region,
   type RegionRow,
   type HeaderHint,
+  type PeriodHint,
 } from './template.ts';
 import type { Workbook } from 'xlsx-populate';
 
@@ -41,6 +43,13 @@ export interface InferredAxis {
   dim: string;
   order: string[];
   source: Source;
+  /**
+   * 维度的来源，可与 order 的来源不同。
+   * 真实模板上这是常态：**行清单**是模板里印好的（事实），
+   * 但「这些行属于哪个维度」是从角格猜的。只报 source 会把这次猜测藏起来。
+   * 省略时视为与 source 相同。
+   */
+  dimSource?: Source;
   /** 若 source === 'template'，这里是它在模板中的坐标；否则是候选来源说明 */
   evidence: string;
 }
@@ -67,6 +76,11 @@ export interface InferredBlock {
   format: string | null;
   /** 被排除、不会写入数据区的行（公式行等） */
   excluded: ExcludedRow[];
+  /**
+   * 模板里写着的期数（如 B 列「期数」= 2026-06）。
+   * 读不到时为 null —— 那才该回落到默认 params，而且必须让人知道这是回落来的。
+   */
+  period: PeriodHint | null;
 }
 
 export interface InferResult {
@@ -94,6 +108,30 @@ function matchDim(labels: string[], reg: Registry): string | null {
 function unmatchedIn(labels: string[], reg: Registry): string[] {
   const known = new Set([...reg.metrics, ...reg.companies, ...reg.periodTypes]);
   return labels.filter((l) => !known.has(l));
+}
+
+/** 标签重复（保留首次出现顺序）—— 重复的标签会互相覆盖到同一个格子 */
+function duplicatesOf(labels: string[]): string[] {
+  const seen = new Set<string>();
+  const dup: string[] = [];
+  for (const l of labels) {
+    if (seen.has(l)) {
+      if (!dup.includes(l)) dup.push(l);
+    } else seen.add(l);
+  }
+  return dup;
+}
+
+/** 行标签重复 + 涉及的行号（行号是给人回模板里改的） */
+function duplicatesWithRows(rows: RegionRow[]): Array<{ label: string; rows: number[] }> {
+  const byLabel = new Map<string, number[]>();
+  for (const r of rows) {
+    if (r.label === null) continue;
+    const arr = byLabel.get(r.label);
+    if (arr) arr.push(r.row);
+    else byLabel.set(r.label, [r.row]);
+  }
+  return [...byLabel.entries()].filter(([, rs]) => rs.length > 1).map(([label, rs]) => ({ label, rows: rs }));
 }
 
 /** 轴名 → 维度键 */
@@ -166,6 +204,31 @@ function inferSheet(
 
   const region: Region = readRegion(wb, sheetName, start.row, start.col);
 
+  // ---- 1b. 读取侧的自证：撞上限 / 残留数字，都必须显式说出来 ----
+  //
+  // ★ 这是「探」的完整性底线。上一次的教训恰好是反的：读取被静默截断，
+  //   报出去的却是「模板预置的行标签比注册表少 90 项」—— 把读取的错说成模板的错，
+  //   人会去改模板，而模板本来是对的。
+  for (const c of region.clip) {
+    issues.push({
+      level: 'error',
+      sheet: sheetName,
+      message:
+        `数据区读取撞到安全上限（${c.axis === 'rows' ? '行' : '列'} ≥ ${c.limit}），后面的内容**没有被读到**。` +
+        `已读到的部分不可信，请先确认模板规模，或把数据区拆小。`,
+    });
+  }
+  if (region.strayDataCells.length) {
+    issues.push({
+      level: 'warn',
+      sheet: sheetName,
+      message:
+        `模板的数据格里有 ${region.strayDataCells.length}${region.strayDataCells.length >= 20 ? '（或更多）' : ''} 处残留数值` +
+        `（如 ${region.strayDataCells.slice(0, 5).join(', ')}）。模板应当是空表：这些值会被渲染覆盖，` +
+        `也可能被误读成上期实际数。`,
+    });
+  }
+
   // ---- 2. 列：表头文本 ----
   const colsDim = matchDim(region.colLabels, reg);
   if (!colsDim) {
@@ -203,6 +266,33 @@ function inferSheet(
   }
   const dataLabels = dataRows.map((r) => r.label as string);
 
+  // ---- 4a. 重复标签必须按 error 拦 ----
+  //
+  // 报表里两行同名 = 两个格子写同一个名字：渲染时后写的盖前写的，
+  // 读者看到一行，账面少一格 —— 而模板本身看起来完全正常。
+  // 实测：用户模板第 89/90 行同名「经营活动产生的现金流量净额」。
+  const dupRows = duplicatesWithRows(dataRows);
+  if (dupRows.length) {
+    issues.push({
+      level: 'error',
+      sheet: sheetName,
+      message:
+        `行标签重复：${dupRows.slice(0, 5).map((d) => `「${d.label}」在第 ${d.rows.join('、')} 行`).join('；')}` +
+        `${dupRows.length > 5 ? `（共 ${dupRows.length} 处）` : ''}。重复标签会互相覆盖，请先改模板。`,
+    });
+  }
+  const dupCols = duplicatesOf(region.colLabels);
+  if (dupCols.length) {
+    issues.push({
+      level: 'error',
+      sheet: sheetName,
+      message: `表头标签重复：${dupCols.map((c) => `「${c}」`).join('、')}。列口径重复会让同一口径被写两次。`,
+    });
+  }
+
+  const badRows = unmatchedIn(dataLabels, reg);
+  if (badRows.length) unmatched.push({ sheet: sheetName, axis: 'rows', names: badRows });
+
   // ---- 4. 行维度判定：先看模板预置的行标签，再看表头左侧的角格 ----
   const cornerCell = textLeftOf(wb, sheetName, start);
   const cornerDim = cornerCell ? AXIS_TO_DIM[cornerCell] ?? null : null;
@@ -210,6 +300,7 @@ function inferSheet(
   let rowsDim: string | null = null;
   let rowsSource: Source = 'template';
   let rowsEvidence = '';
+  let dimSource: Source | undefined;
 
   const labelDim = matchDim(dataLabels, reg);
   if (labelDim) {
@@ -226,8 +317,32 @@ function inferSheet(
         message: `模板预置的行标签比注册表少 ${missing.length} 项（${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '…' : ''}）。已严格按模板的行清单生成 order；若模板是漏写，请补齐模板或手工加回 order。`,
       });
     }
+  } else if (dataLabels.length > 0) {
+    // ---- ★ 模板**有**行标签，却没有一个维度能整体认下来 ----
+    //
+    // 这个判据必须先于下面的角格分支，而且顺序曾经是反的：
+    // 角格写着「指标」→ 走 cornerDim 的"猜"分支 → 用注册表候选（示例库里 5 个指标）
+    // **顶替**模板自己的 130 个行标签，于是数落到了别人的标签旁边（D2=62797 紧挨 C2=EVA），
+    // 而 warnings 是空的。读取截断 + 顶替 + 零告警，三件事叠起来就是静默错位。
+    //
+    // 现在的规矩：**模板写了什么，就用什么**。行清单永远取自模板（rowsSource='template'），
+    // 认不出维度只报"维度是猜的"（dimSource='guessed'）+ error，绝不改写行清单。
+    rowsDim = cornerDim;
+    rowsSource = 'template';
+    dimSource = 'guessed';
+    rowsEvidence = cornerDim
+      ? `行清单取自模板预置的 ${dataLabels.length} 个标签（原样保留）；维度按表头左侧角格「${cornerCell}」猜为 ${cornerDim}，但这些名字不在注册表里`
+      : `行清单取自模板预置的 ${dataLabels.length} 个标签（原样保留）；模板没有角格轴名，维度无从判定`;
+    issues.push({
+      level: 'error',
+      sheet: sheetName,
+      message:
+        `模板预置的行标签 [${dataLabels.slice(0, 5).join(', ')}${dataLabels.length > 5 ? '…' : ''}]` +
+        `（共 ${dataLabels.length} 个）无法整体识别为已注册的指标/公司，需要人工指定 rows.dim。` +
+        `已**原样保留**模板的行清单，未用注册表候选顶替。`,
+    });
   } else if (cornerDim) {
-    // 模板没预置行标签，但表头左侧写了轴名（如「公司」）→ 用注册表补候选
+    // 模板确实**没有**预置行标签，但表头左侧写了轴名（如「公司」）→ 用注册表补候选
     rowsDim = cornerDim;
     rowsSource = 'guessed';
     rowsEvidence = `表头左侧角格写着「${cornerCell}」，据此判定行维为 ${cornerDim}；模板未预置行标签，候选值取自注册表`;
@@ -236,26 +351,34 @@ function inferSheet(
       sheet: sheetName,
       message: `模板未预置行标签，已按角格「${cornerCell}」推断行维为 ${cornerDim}，候选值取自注册表。**请人工确认行清单与顺序**。`,
     });
-  } else if (dataLabels.length > 0) {
-    issues.push({
-      level: 'error',
-      sheet: sheetName,
-      message: `模板预置的行标签 [${dataLabels.slice(0, 5).join(', ')}${dataLabels.length > 5 ? '…' : ''}] 无法整体识别为已注册的指标/公司，需要人工指定 rows.dim。`,
-    });
   }
 
-  const badRows = unmatchedIn(dataLabels, reg);
-  if (badRows.length) unmatched.push({ sheet: sheetName, axis: 'rows', names: badRows });
-
   // ---- 5. 组装 order ----
-  const rowsOrder = rowsSource === 'template' ? dataLabels : rowsDim ? candidatesFor(rowsDim, reg) : [];
+  //
+  // ★ 注意这里**没有** registry 分支：行清单只有一个合法来源 —— 模板自己写的。
+  //   认不出维度是"维度的问题"，不是"行清单的问题"（见上面 4 的两条分支）。
+  const rowsOrder = dataLabels.length > 0 ? dataLabels : rowsDim ? candidatesFor(rowsDim, reg) : [];
   const colsOrder = region.colLabels;
+
+  // ---- 6. 模板里写着的期数 ----
+  //
+  // 用户模板的 B 列明明白白写着「期数 2026-06」，而旧代码直接生成
+  // params: { year: 2026, month: 6 }（硬编码）。换一期报表就静默出错数：
+  // 数字来自 2026-05，params 却写着 6 —— 而且看起来一切正常。
+  // readPeriodHint 认不出就返回 null（不猜），那才回落到默认值。
+  const period = readPeriodHint(wb, sheetName, start.row, start.col, dataRows.length);
 
   const block: InferredBlock = {
     sheet: sheetName,
     anchor,
     anchorNote,
-    rows: { dim: rowsDim ?? '(待指定)', order: rowsOrder, source: rowsSource, evidence: rowsEvidence },
+    rows: {
+      dim: rowsDim ?? '(待指定)',
+      order: rowsOrder,
+      source: rowsSource,
+      ...(dimSource ? { dimSource } : {}),
+      evidence: rowsEvidence,
+    },
     cols: {
       dim: colsDim ?? '(待指定)',
       order: colsOrder,
@@ -264,6 +387,7 @@ function inferSheet(
     },
     format: region.format,
     excluded,
+    period,
   };
 
   const specBlock: Block = {
@@ -351,8 +475,12 @@ function renderYaml(spec: Spec, inf: InferResult): string {
   L.push(`template: ${spec.template}`);
   L.push('');
   L.push('params:');
-  L.push('  year: 2026');
-  L.push('  month: 6');
+  // ★ 期数从哪来必须写在脸上：旧代码硬编码 2026/6，模板换成 5 月也照填 6 月。
+  const pHint = inf.blocks.map((b) => b.period).find((p) => p !== null) ?? null;
+  if (pHint) L.push(`  # 期数读自模板：${pHint.evidence}`);
+  else L.push('  # ⚠ 模板里没读到期数（没有「期数/期间/年月」列，或取值不一致）：以下是默认值，请改成实际报送期');
+  L.push(`  year: ${spec.params?.year ?? 2026}`);
+  L.push(`  month: ${spec.params?.month ?? 6}`);
   L.push('');
   L.push('sheets:');
   for (const sheet of spec.sheets) {
@@ -439,11 +567,15 @@ export async function inferSpec(opts: InferOptions): Promise<InferResult> {
     throw new Error(`未能从模板 ${template} 中识别出任何数据区（没有找到含已注册口径/指标/公司的表头）`);
   }
 
+  // ★ 期数优先取自模板（取第一个读到的）；读不到才回落默认值。
+  //   回落也要让人在 YAML 里看见（renderYaml 会写注释），不能像以前那样静默硬编码。
+  const periodHint = blocks.map((b) => b.period).find((p): p is PeriodHint => p !== null) ?? null;
+
   const spec: Spec = {
     id: opts.id ?? '从模板推断的报表',
     title: opts.title,
     template,
-    params: { year: 2026, month: 6 },
+    params: periodHint ? { year: periodHint.year, month: periodHint.month } : { year: 2026, month: 6 },
     sheets: sheetSpecs,
   };
 
@@ -456,8 +588,14 @@ export async function inferSpec(opts: InferOptions): Promise<InferResult> {
 export function guessedAxes(r: InferResult): Array<{ sheet: string; axis: string; dim: string; count: number }> {
   const out: Array<{ sheet: string; axis: string; dim: string; count: number }> = [];
   for (const b of r.blocks) {
-    if (b.rows.source === 'guessed') out.push({ sheet: b.sheet, axis: 'rows', dim: b.rows.dim, count: b.rows.order.length });
-    if (b.cols.source === 'guessed') out.push({ sheet: b.sheet, axis: 'cols', dim: b.cols.dim, count: b.cols.order.length });
+    // ★ 行清单来自模板、维度却是猜的，也算"猜的"。
+    //   只认 source 会把「130 个真实标签 + 猜出来的 metric」这种最危险的情形报成"读到的"。
+    if (b.rows.source === 'guessed' || b.rows.dimSource === 'guessed') {
+      out.push({ sheet: b.sheet, axis: 'rows', dim: b.rows.dim, count: b.rows.order.length });
+    }
+    if (b.cols.source === 'guessed' || b.cols.dimSource === 'guessed') {
+      out.push({ sheet: b.sheet, axis: 'cols', dim: b.cols.dim, count: b.cols.order.length });
+    }
   }
   return out;
 }

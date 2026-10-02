@@ -1,0 +1,26 @@
+
+id: 月度经营接入
+source: data/月度经营接入源.xlsx
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: D2
+        rows:
+          - col: A
+            dim: company
+          - col: C
+            dim: metric
+        values:
+          columns: [D, E, F]
+          skip:
+            - columns: [F]
+              why: 同比% 是派生列
+          periodTypes: [本年累计, 单月]
+        keys:
+          - col: B
+            as: period
+        drop:
+          labels: [合计]

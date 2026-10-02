@@ -26,6 +26,10 @@ import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type Re
 import { readTemplateSchema, textAt } from '../spec/template.ts';
 import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
 import { chartShape, type ChartSpec } from '../render/chart.ts';
+import { diagnoseIngest, parseIngestSpec, parseDecisions, type IngestSpec } from '../ingest/types.ts';
+import { resolveSource } from '../ingest/dryrun.ts';
+import { runIngest, type IngestRunResult } from '../ingest/run.ts';
+import { masterCatalog } from '../ingest/master.ts';
 
 const OUTPUT_DIR = 'output';
 const DEFAULT_TEMPLATE = 'test/fixtures/月度保送表.xlsx';
@@ -439,8 +443,18 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
       sheet: b.sheet,
       anchor: b.anchor,
       anchorNote: b.anchorNote,
-      rows: { dim: b.rows.dim, source: b.rows.source, count: b.rows.order.length, labels: b.rows.order, evidence: b.rows.evidence },
+      // dimSource：行清单来自模板（事实）、维度却是猜的 —— 只报 source 会把这次猜测藏起来
+      rows: {
+        dim: b.rows.dim,
+        source: b.rows.source,
+        dimSource: b.rows.dimSource ?? null,
+        count: b.rows.order.length,
+        labels: b.rows.order,
+        evidence: b.rows.evidence,
+      },
       cols: { dim: b.cols.dim, source: b.cols.source, count: b.cols.order.length, labels: b.cols.order, evidence: b.cols.evidence },
+      // 期数读自模板（B 列/年月列）；null = 没读到，params 里那个是默认值
+      period: b.period,
       format: b.format,
       excluded: b.excluded,
     })),
@@ -455,6 +469,184 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
       '请先按 issues 里的 error 补上约束再保存 —— 不要试图绕过校验。' +
       '本工具只读模板结构与标签文本，不读模板里的任何数字，也不查数据库。',
   };
+}
+
+
+// ---------------- 接入规格（源 Excel → 星型表）的工具 ----------------
+
+function loadIngestSpecText(args: { spec?: string; specFile?: string }): { text: string; from: string } {
+  if (args.specFile) {
+    if (!fs.existsSync(args.specFile)) throw new Error(`接入规格文件不存在: ${args.specFile}`);
+    return { text: fs.readFileSync(args.specFile, 'utf8'), from: args.specFile };
+  }
+  if (args.spec) return { text: args.spec, from: '(内联 YAML)' };
+  throw new Error('需要 spec（接入规格 YAML 文本）或 specFile（路径）');
+}
+
+// 决定的解析与校验已统一到 `src/ingest/types.ts` 的 parseDecisions() ——
+// 曾在这里另写一份，CLI 进来时就会变成两份判据（铁律 17）。
+
+/**
+ * 2.6 look_at_source —— 看源文件/模板的**文本视图**
+ *
+ * ★ 存在的理由：agent 看不到 xlsx。要写接入规格，它必须知道表头在第几行、
+ *   行标签在哪一列、哪些列是数字列、哪些行带公式。这些都不需要金额。
+ *
+ * 安全不变量（铁律 1）：数字格**只报"这里是个数"**，永不回传数值本身。
+ *   所以这个工具既能看见形状，又结构上不可能把数带出去。
+ */
+async function lookAtSource(args: { source?: string; sheet?: string; range?: string; maxRows?: number; maxCols?: number }) {
+  if (!args.source) throw new Error('需要 source（源 Excel 路径，相对仓库根）');
+  const resolved = resolveSource(args.source);
+  if (!fs.existsSync(resolved)) throw new Error(`源文件不存在: ${args.source}`);
+  const wb = await XLSXPopulate.fromFileAsync(resolved);
+  const names = wb.sheets().map((sh) => sh.name());
+  const sheetName = args.sheet ?? names[0];
+  const sheet = wb.sheet(sheetName);
+  if (!sheet) throw new Error(`sheet 不存在: ${sheetName}。实际有: ${names.join(', ')}`);
+
+  const maxRows = Math.min(Math.max(args.maxRows ?? 60, 1), 500);
+  const maxCols = Math.min(Math.max(args.maxCols ?? 30, 1), 80);
+
+  const used = sheet.usedRange();
+  const usedRef = used ? `${excelToRef(used.startCell().rowNumber(), used.startCell().columnNumber())}:${excelToRef(used.endCell().rowNumber(), used.endCell().columnNumber())}` : null;
+  const start = args.range ? excelParseRef(args.range.split(':')[0]) : { row: 1, col: 1 };
+  const stop = args.range
+    ? excelParseRef(args.range.includes(':') ? args.range.split(':')[1] : args.range)
+    : { row: (used?.endCell().rowNumber() ?? 1), col: (used?.endCell().columnNumber() ?? 1) };
+
+  const lastRow = Math.min(stop.row, start.row + maxRows - 1);
+  const lastCol = Math.min(stop.col, start.col + maxCols - 1);
+  const countText = new Map<string, number>();
+
+  const rows: Array<Array<unknown>> = [];
+  for (let r = start.row; r <= lastRow; r++) {
+    const line: Array<unknown> = [];
+    for (let c = start.col; c <= lastCol; c++) {
+      const cell = sheet.cell(r, c);
+      const v = cell.value();
+      const formula = (cell as { formula?: () => unknown }).formula?.();
+      const mark: Record<string, unknown> = {};
+      if (typeof v === 'string' && v !== '') mark.text = v;
+      else if (typeof v === 'number') mark.num = true;
+      else if (v instanceof Date) mark.date = true;
+      else if (typeof v === 'boolean') mark.bool = true;
+      else if (v !== undefined && v !== null && v !== '') mark.other = true;
+      if (formula) mark.formula = true;
+      if (!Object.keys(mark).length) {
+        line.push(null);
+        continue;
+      }
+      const key = `${r}.${c}`;
+      countText.set(key, 1);
+      line.push(mark);
+    }
+    rows.push(line);
+  }
+
+  return {
+    source: args.source,
+    sheets: names,
+    sheet: sheetName,
+    usedRange: usedRef,
+    range: `${excelToRef(start.row, start.col)}:${excelToRef(lastRow, lastCol)}`,
+    truncated: { rows: stop.row > lastRow, cols: stop.col > lastCol },
+    legend: {
+      text: '文本格原样回传（表头/行标签/期数多在这里）',
+      num: '数字格 —— **只报"这里有个数"，值不回传**（哪几列是数据列看这个）',
+      date: '日期格式格（值不回传）',
+      formula: '带公式的格（模板里的「合计」行多在这里，写 drop 时要排除）',
+    },
+    rows,
+    note:
+      '这是源文件的文本视图，用来写接入规格：先看表头在第几行、行标签在哪一列、' +
+      '哪几列是 num、哪些行 formula=true（要 drop）。金额永远看不到，也不需要看到。',
+  };
+}
+
+/** 2.7 lint_ingest —— 接入规格的静态诊断（一个字都不落到库） */
+async function lintIngestTool(args: { spec?: string; specFile?: string }) {
+  const { text, from } = loadIngestSpecText(args);
+  const cat = await masterCatalog();
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  const errors = d.issues.filter((i) => i.level === 'error');
+  const warnings = d.issues.filter((i) => i.level === 'warn');
+  return {
+    from,
+    id: d.spec?.id ?? null,
+    source: d.spec?.source ?? null,
+    willBeRejected: d.willBeRejected,
+    parseError: d.parseError ?? null,
+    errorCount: errors.length,
+    warningCount: warnings.length,
+    errors,
+    warnings,
+    note:
+      'errors 非空 → parseIngestSpec 会直接拒绝，先改规格。warnings 是可以带着跑的提醒。' +
+      '本工具不读源文件、不碰数据库。',
+  };
+}
+
+/** 2.8 dry_run_ingest —— 干跑：形状 + 主数据判定，一次库都不写 */
+async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown }) {
+  const { text, from } = loadIngestSpecText(args);
+  const cat = await masterCatalog();
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  if (d.willBeRejected) {
+    return {
+      from,
+      ok: false,
+      refused: true,
+      errors: d.issues.filter((i) => i.level === 'error'),
+      note: '规格没通过静态诊断，先按 errors 改规格（这一步连源文件都没读）。',
+    };
+  }
+  const spec = parseIngestSpec(text);
+  const r = await runIngest(spec, { catalog: cat, planOnly: true, decisions: parseDecisions(args.decisions) });
+  return { from, planOnly: true, ...r };
+}
+
+/** 2.9 run_ingest —— 真正落库（源 Excel → 星型表）。这是唯一会写库的接入工具 */
+async function runIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean }) {
+  const { text, from } = loadIngestSpecText(args);
+  const cat = await masterCatalog();
+  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes });
+  if (d.willBeRejected) {
+    return {
+      from,
+      ok: false,
+      refused: true,
+      errors: d.issues.filter((i) => i.level === 'error'),
+      note: '规格没通过静态诊断，没有落任何数据。',
+    };
+  }
+  const spec = parseIngestSpec(text);
+  const r: IngestRunResult = await runIngest(spec, {
+    catalog: cat,
+    decisions: parseDecisions(args.decisions),
+    strict: args.strict === true,
+  });
+  return { from, ...r };
+}
+
+/**
+ * 12. get_catalog —— 把「库里现在有什么」交给 agent（架构 §8.2 ②③、§8.5）。
+ *
+ * ★ 存在的理由：**只给规则是不够的**。skill 告诉 agent 语法（怎么写才合法），
+ *   但它不知道现在有哪些 code —— 于是看到"应收账款"就造一个 `receivable_amount`，
+ *   而库里早有 `account.receivable`。那不是维度值重复，是**指标身份重复**：
+ *   同一个口径两个 code，之后所有汇总都会出错，而且不报错。
+ *
+ * ★ 结构安全：这里返回的是**结构、成员名与计数**，一个格里的值都没有（连行数都只是计数）。
+ *   金额兜底（`callTool`）仍然照过一遍 —— 但真正的保证是"它压根不查明细值"。
+ */
+async function getCatalog(args: { object?: string }) {
+  const { catalogDump, catalogShow } = await import('../meta/catalog.ts');
+  if (args.object) {
+    const one = await catalogShow(args.object);
+    return { ...one, note: '单表结构：列、角色、粒度、行数。**格里的值一个都不回传**。' };
+  }
+  return catalogDump();
 }
 
 // ---------------- 工具注册表 ----------------
@@ -574,6 +766,105 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
     handler: (a) => generateSpec(a as { template?: string; sheets?: string[]; id?: string; title?: string }),
+  },
+  {
+    name: 'look_at_source',
+    description:
+      '看一份源 Excel（或报表模板）的**文本视图**：表头文本、行标签文本、哪些格是数字（只报"这里有个数"，' +
+      '永不回传数值）、哪些格带公式（模板里的「合计」行）。写接入规格前先用它确认表头在第几行、' +
+      '行标签在哪一列、数据列是哪几列、哪些行要 drop。金额看不到，也不需要看到。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: '源 Excel 路径（相对仓库根，必须在 data/ templates/ test/fixtures/ 之内）' },
+        sheet: { type: 'string', description: 'sheet 名；省略则用第一个' },
+        range: { type: 'string', description: '要看的区域，如 "A1:L40"；省略则从 A1 起到 usedRange 的末尾' },
+        maxRows: { type: 'number', description: '最多看多少行（默认 60，上限 500）' },
+        maxCols: { type: 'number', description: '最多看多少列（默认 30，上限 80）' },
+      },
+      required: ['source'],
+      additionalProperties: false,
+    },
+    handler: (a) => lookAtSource(a as { source?: string; sheet?: string; range?: string; maxRows?: number; maxCols?: number }),
+  },
+  {
+    name: 'lint_ingest',
+    description:
+      '诊断一份**接入规格 YAML**（源 Excel → 星型表的映射）：结构、列号、行键维度、值列与口径的对应、' +
+      '必需坐标（公司/指标/期数/口径）有没有来源。给 error/warn 清单与位置，一个字都不落到库、也不读源文件。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spec: { type: 'string', description: '接入规格 YAML 文本' },
+        specFile: { type: 'string', description: '接入规格文件路径（与 spec 二选一）' },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => lintIngestTool(a as { spec?: string; specFile?: string }),
+  },
+  {
+    name: 'dry_run_ingest',
+    description:
+      '**干跑**一份接入规格：读出形状（数据行数、被 drop 的行、重复的行键、值列与口径、坐标完整性、期数、' +
+      '库里对不上的主数据名）并做一次主数据判定（哪些会自动归并、哪些要人拍板、哪些会新建），' +
+      '一次库都不写。返回里没有任何金额。人手拍板前用这个把结论摆出来。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spec: { type: 'string', description: '接入规格 YAML 文本' },
+        specFile: { type: 'string', description: '接入规格文件路径（与 spec 二选一）' },
+        decisions: {
+          type: 'array',
+          description: '人对未识别主数据的处置（可选）：{kind: company|metric, raw, action: merge|create, targetId?, note?}',
+          items: { type: 'object' },
+        },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => dryRunIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown }),
+  },
+  {
+    name: 'run_ingest',
+    description:
+      '按接入规格把源 Excel **真正落库**（展开成星型表的 (公司,指标,期数,口径,金额) 行）。' +
+      '有歧义的名字（像已有主数据但不确定）会整批拒绝、一行都不写，并把要拍板的清单回给你；' +
+      '给出 decisions 后重跑即可。重复坐标按规格的 onConflict 处理（默认整批拒绝，不静默覆盖）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spec: { type: 'string', description: '接入规格 YAML 文本' },
+        specFile: { type: 'string', description: '接入规格文件路径（与 spec 二选一）' },
+        decisions: {
+          type: 'array',
+          description: '人对未识别主数据的处置：{kind: company|metric, raw, action: merge|create, targetId?, note?}',
+          items: { type: 'object' },
+        },
+        strict: { type: 'boolean', description: '遇到要人拍板的名称直接报错（默认 false：返回清单让人处理）' },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => runIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean }),
+  },
+  {
+    name: 'get_catalog',
+    description:
+      '导出**库里现在有什么** —— 写任何 YAML 之前先读它，否则你会造出重复的指标/维度名。' +
+      '三层：L1 业务成员（已注册的指标 / 公司 / 口径 / 维度）、L2 物理结构（表 / 列 / 角色 / 粒度）、' +
+      'L3 版本（apiVersion + ddlHash）。' +
+      '★ **按需下钻是默认用法**：传 object（如 object="fact_finance"）只看那一张表，别把整库吞下去。' +
+      '★ 返回值里**没有任何金额**，也不含装载批次历史（那是装载侧的事）。' +
+      '★ 它是一份**快照**，会过期：写完 YAML 要让 lint_ingest / lint_spec / validate 读**当下**结构复核。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        object: {
+          type: 'string',
+          description: '只看这一个对象（表名，如 fact_finance）—— 默认路径；省略则导出全部三层',
+        },
+      },
+      additionalProperties: false,
+    },
+    handler: (a) => getCatalog(a as { object?: string }),
   },
 ];
 

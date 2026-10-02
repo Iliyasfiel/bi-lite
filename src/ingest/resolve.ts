@@ -23,56 +23,12 @@ import { execute, query } from '../db/index.ts';
 
 export type DimKind = 'company' | 'metric';
 
-/** 全角 → 半角（ASCII 可见区 + 全角空格） */
-function toHalfWidth(s: string): string {
-  let out = '';
-  for (const ch of s) {
-    const c = ch.codePointAt(0)!;
-    if (c === 0x3000) out += ' ';
-    else if (c >= 0xff01 && c <= 0xff5e) out += String.fromCharCode(c - 0xfee0);
-    else out += ch;
-  }
-  return out;
-}
-
-/** 格式噪音：空白、各种括号引号、中英文标点、连字符 */
-const NOISE = /[\s\u00a0()[\]{}<>《》、,，.。;；:：!！?？'"“”‘’`~·\-_—/\\|]+/g;
-
-/**
- * 规范化：只去格式噪音，**不改变语义**。
- *
- * 安全含义：两个名字规范化后相同 → 它们本来就是同一个名字的两种写法 → 可自动归并。
- * 任何"会改变语义"的加工（去壳、缩写、同义词）都**不许**放进这里，只能进候选建议。
- */
-export function normalizeName(s: string): string {
-  return toHalfWidth(String(s ?? '')).replace(NOISE, '').toLowerCase();
-}
-
-/**
- * 公司名的「字号」：剥掉公司形式后缀（华东子公司 → 华东）。
- *
- * ⚠️ **只用于生成候选，绝不用于自动合并** —— 去壳会改变语义：
- * 「集团」与「有限公司」是两种公司形式，剥掉后可能把两家不同的公司撞在一起。
- */
-const COMPANY_SHELLS = [
-  '股份有限公司', '有限责任公司', '集团有限公司', '集团公司',
-  '有限公司', '子公司', '分公司', '集团', '公司', '有限', '责任', '厂', '本部',
-].map(normalizeName).sort((a, b) => b.length - a.length);
-
-export function stemCompany(s: string): string {
-  const t = normalizeName(s);
-  // 整个名字就是一个公司形式后缀（「公司」「有限公司」「集团有限公司」）时没有字号可言，
-  // 原样返回。硬剥会把「有限公司」剥成「有限」这种残留 —— 那不是字号，
-  // 只是另一个形式后缀的碎片，拿它当候选键会让纯壳名之间互相乱撞。
-  if (COMPANY_SHELLS.includes(t)) return t;
-  // 只从尾部剥，且不剥空
-  for (const shell of COMPANY_SHELLS) {
-    if (t.length > shell.length && t.endsWith(shell)) {
-      return t.slice(0, -shell.length);
-    }
-  }
-  return t;
-}
+// ★ 规范化的唯一实现已搬到 src/ingest/normalize.ts ——
+//   接入层判重与主数据归并必须共用同一份判据（旧实现两处不一致，出过静默覆盖）。
+//   这里**import 进来再转出**：本文件内部多处还在用它们，只 `export ... from`
+//   不会把名字带进本地作用域（那样会变成运行时 ReferenceError）。
+import { normalizeName, stemCompany } from '../ingest/normalize.ts';
+export { normalizeName, stemCompany };
 
 /** 编辑距离（用于"写法相近"的候选；短字符串足够快） */
 function editDistance(a: string, b: string): number {

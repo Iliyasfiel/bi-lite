@@ -144,3 +144,236 @@ await wb2.xlsx.writeFile(LONG);
 console.log(`✅ 模板: ${TPL}`);
 console.log(`✅ 长表: ${LONG}  (${n} 行数据)`);
 console.log(`   公司 ${COMPANIES.length} × 指标 ${METRICS.length} × 口径 ${PERIODS.length} × 月份 ${MONTHS.length} = ${n}`);
+
+// ============ 3. 接入路径的源夹具（新接入层：任意形态的 Excel → 星型表）============
+// ★ 为什么它必须由 fixtures 生成：接入层的全链路（源文件 → raw → 事实行）**需要一个真的
+//   存在、且在白名单内的源文件**，而 e2e 此前借用了 `data/` 下的一份探针文件 ——
+//   `data/` 是真实数据目录、又被 `.gitignore` 掉，于是
+//   「洁净 clone → npm run fixtures → npm run e2e」在接入这一段必挂。
+//   **测试不该借生产规格的源**：生产规格（`ingest/月度经营接入.yaml`）指向真实数据，
+//   本来就该在 `data/` 里；夹具是测试自己的，落 `test/fixtures/`。
+//
+// ★ 规格与源在**同一个地方**写出来：两者的路径与几何只有一个来源，不会各自漂。
+const INGEST_SRC = 'test/fixtures/月度经营接入源.xlsx';
+const INGEST_SPEC = 'test/fixtures/月度经营接入.yaml';
+
+const wb3 = new ExcelJS.Workbook();
+const is = wb3.addWorksheet('月报');
+is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%']);
+/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E 两个值列；F 是派生列（规格里跳过） */
+const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, month: number]> = [
+  ['华东子公司', '营业收入', 1234.5, 56.75],
+  ['华东子公司', '净利润', 200.25, 20.125],
+  ['华南子公司', '营业收入', 9876.5, 432.25],
+  ['华南子公司', '净利润', 500.75, 50.375],
+];
+for (const [company, metric, cumulative, month] of INGEST_ROWS) {
+  is.addRow([company, '2026-06', metric, cumulative, month, 0]);
+}
+// 「合计」行刻意留着：规格里的 drop 就是为它写的，夹具必须能真的验到那条规则
+is.addRow(['合计', '2026-06', '合计', null, null, 0]);
+for (let c = 1; c <= 6; c++) is.getColumn(c).width = 16;
+await wb3.xlsx.writeFile(INGEST_SRC);
+
+// 夹具规格：形状与 `ingest/月度经营接入.yaml` 一致，只有 source 指向夹具自己。
+// ★ 不要为了测试去改生产规格的 source —— 那会把"测试依赖"伪装成"生产配置"。
+fs.writeFileSync(
+  INGEST_SPEC,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **接入路径的测试夹具，不是生产规格**。
+# 生产那份在 ingest/ 下，指向 data/ 里的真实数据；这一份的源就在 test/fixtures/ 里，
+# 于是「洁净 clone → npm run fixtures → npm run e2e」不依赖任何不在版本库里的东西。
+id: 月度经营接入-夹具
+source: ${INGEST_SRC}
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: D2
+        rows:
+          - col: A
+            dim: company
+          - col: C
+            dim: metric
+        values:
+          columns: [D, E, F]
+          skip:
+            - columns: [F]
+              why: 同比% 是派生列
+          periodTypes: [本年累计, 单月]
+        keys:
+          - col: B
+            as: period
+        drop:
+          labels: [合计]
+`,
+);
+
+const factRows = INGEST_ROWS.length * 2; // 4 行数据 × 2 个接入的值列
+console.log(`✅ 接入源: ${INGEST_SRC}  (${INGEST_ROWS.length} 行数据 → ${factRows} 条事实 + 1 行「合计」被 drop)`);
+console.log(`✅ 接入规格: ${INGEST_SPEC}`);
+
+// ============ 4. 长表的接入规格（"新路径能表达长表"的夹具）============
+// ★ 为什么要它：要删掉旧长表路径（src/import/longtable.ts），先得让新路径能**表达**长表。
+//   长表和宽表在接入规格里的写法完全不同：宽表的期数整块同值（keys 列每行重复），
+//   而长表**每一行有自己的期数**，四个坐标全在列里：
+//       行键 = B 公司 / C 指标 / D 口径，期数 = A 列（keys），值列 = E 金额。
+//   这一段同时也是 e2e 第 26 阶段「新旧接入路径对拍」的输入（见 test/e2e.ts）。
+const LONG_SPEC = 'test/fixtures/集团导出长表.yaml';
+fs.writeFileSync(
+  LONG_SPEC,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **长表的测试夹具，不是生产规格**。
+# 四个坐标全在列里：期数在 A 列（逐行不同），公司/指标/口径在 B/C/D，金额在 E。
+# 与宽表（月度经营接入.yaml）的差别就在期数：这边每行一个期，那边整块同一个期。
+id: 集团导出长表-夹具
+source: ${LONG}
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 财务快报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+        values:
+          columns: [E]
+`,
+);
+console.log(`✅ 长表接入规格: ${LONG_SPEC}  (与旧长表路径同一份源，供对拍)`);
+
+// ============ 5. 主数据对齐的场景源（e2e 第 15 阶段用）============
+// 每个场景 = 一份 xlsx + 一份规格。长表形状（一行一条事实，四个坐标全在列里）。
+//
+// ★ 为什么规格用 `onConflict: replace`：这些场景刻意落在**种子数据已有的坐标**上
+//   （2026-01..06 × 营业收入 × 本年累计），而旧路（longtable）的语义就是 upsert。
+//   新路默认是 `reject` —— 用默认值会先撞库拒绝，把"主数据对齐"验成"撞库拒绝"，
+//   场景就偏了。顺带这也头一次把 `onConflict: replace` 这条分支纳入门禁。
+//
+// ★ 为什么不用同一份源：每个场景要**独立成批**（Tier 1 自动归并 → Tier 2 交人拍板 →
+//   人拍板后落库 → 下月自动命中），批次不能混。
+const ALIGN_SCENARIOS: Array<{ id: string; rows: Array<[company: string, month: string, amount: number]> }> = [
+  { id: '接入-对齐1', rows: [['（集团公司）', '2026-01', 100], ['（集团公司）', '2026-02', 200]] },
+  { id: '接入-对齐2', rows: [['华东分公司', '2026-03', 300], ['西北子公司', '2026-03', 400]] },
+  { id: '接入-对齐3', rows: [['华东分公司', '2026-04', 500]] },
+  { id: '接入-对齐4', rows: [['华南分公司', '2026-05', 1]] },
+  { id: '接入-对齐5', rows: [['华北分公司', '2026-06', 1]] },
+];
+
+for (const s of ALIGN_SCENARIOS) {
+  const src = `test/fixtures/${s.id}.xlsx`;
+  const wbA = new ExcelJS.Workbook();
+  const wsA = wbA.addWorksheet('财务快报');
+  wsA.addRow(['财务期', '公司名称', '指标名称', '口径', '金额']);
+  for (const [company, month, amount] of s.rows) {
+    wsA.addRow([`${month}-01`, company, '营业收入', '本年累计', amount]);
+  }
+  for (let c = 1; c <= 5; c++) wsA.getColumn(c).width = 16;
+  await wbA.xlsx.writeFile(src);
+
+  fs.writeFileSync(
+    `test/fixtures/${s.id}.yaml`,
+    `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— 主数据对齐的场景夹具。
+# onConflict: replace 是刻意的：这些坐标在种子数据里已有值，场景要验的是"归并/拍板"，
+# 不是"撞库拒绝"（旧长表路径的语义本来就是 upsert）。
+id: ${s.id}-夹具
+source: ${src}
+onConflict: replace
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 财务快报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+        values:
+          columns: [E]
+`,
+  );
+}
+console.log(`✅ 主数据对齐场景源: ${ALIGN_SCENARIOS.length} 组（${ALIGN_SCENARIOS.map((s) => s.id).join(', ')}）`);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 期数的**日期格**夹具（`keys[].type: date`）
+//
+// ★ 为什么需要它：真实集团导出的期数列很可能是 **Excel 日期格** —— 那种格的值是
+//   **序列号**（数字），不是文本。xlsx-populate 给的就是数字（实测 2026-06-01 = 46174），
+//   所以"只认文本"的读法会让整列期数凭空消失（干跑还报 ok，最难查的那类失败）。
+// ★ 为什么还要造一份 **1904 日期系统**：它的序列号整体差 1462 天（同一天 46174 vs 44712，实测）
+//   —— 拿 1900 基准去读会**静默差 4 年**。所以引擎明确拒绝这种工作簿，
+//   而这份夹具存在的唯一目的就是**证明那个拒绝真的会发生**。
+const DATE_ROWS: Array<[period: string, amount: number]> = [
+  ['2026-06-01', 100],
+  ['2026-07-01', 200],
+  ['2026-08-01', 300],
+];
+for (const [id, date1904] of [['接入-日期格', false], ['接入-日期格1904', true]] as const) {
+  const src = `test/fixtures/${id}.xlsx`;
+  const wbD = new ExcelJS.Workbook();
+  if (date1904) wbD.properties = { ...wbD.properties, date1904: true };
+  const wsD = wbD.addWorksheet('月报');
+  wsD.addRow(['期数', '单位', '指标', '口径', '本年累计']);
+  let row = 2;
+  for (const [period, amount] of DATE_ROWS) {
+    const [y, m, d] = period.split('-').map(Number);
+    const cell = wsD.getCell(row, 1);
+    cell.value = new Date(Date.UTC(y!, m! - 1, d!));
+    cell.numFmt = 'yyyy-mm-dd';   // ★ 关键就是这个格式：有它，Excel 才把序列号当日期显示
+    wsD.getCell(row, 2).value = '华东子公司';
+    wsD.getCell(row, 3).value = '营业收入';
+    wsD.getCell(row, 4).value = '本年累计';
+    wsD.getCell(row, 5).value = amount;
+    row++;
+  }
+  for (let c = 1; c <= 5; c++) wsD.getColumn(c).width = 16;
+  await wbD.xlsx.writeFile(src);
+
+  fs.writeFileSync(
+    `test/fixtures/${id}.yaml`,
+    `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— 期数的日期格夹具。
+# ★ keys[].type: date 是这份夹具的重点：A 列是 **Excel 日期格**（值是序列号，不是文本）。
+#   声明了它，引擎才按日期解读；不声明就报 PERIOD_CELL_NOT_TEXT —— 引擎**不猜**。
+id: ${id}-夹具
+source: ${src}
+onConflict: replace
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: E2
+        rows:
+          - col: B
+            dim: company
+          - col: C
+            dim: metric
+          - col: D
+            dim: period_type
+        keys:
+          - col: A
+            as: period
+            type: date
+        values:
+          columns: [E]
+`,
+  );
+}
+console.log('✅ 期数日期格夹具: 2 组（1900 系统 / 1904 系统）');

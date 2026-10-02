@@ -6,10 +6,12 @@
 
 ## 0. 一分钟认知
 
-bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
+bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML 规格 → 本地 DuckDB 星型库 → 按模板出表。
+三个入口共用同一套引擎（**CLI 的引擎侧命令已落地** —— 生成器侧与物料侧按阶段挂上，见 `docs/开发计划.md` §7）：**MCP + skill** 给 agent，**Web** 给人，**CLI** 给人与脚本。
 
 **它不是 BI 看板。** 保送填表（把财务数据按不同给定表格形式填成 Excel 报送）是主战场，
-看板是副产品。核心抽象只有一个：`spec`（声明式口径规格），Excel 与图表都是它的 renderer。
+看板是副产品。核心抽象只有一个：`spec`（声明式规格 YAML）—— **接入规格**说"这份 Excel 怎么读"，
+**报表规格**说"这张表按什么口径算、填进哪张模板"；Excel 与图表都是它的 renderer。
 详见 `docs/需求与架构.md` §0。
 
 技术栈：**Node ≥ 22.6（本机 26.7.0，原生跑 `.ts`，无构建步骤）** + DuckDB（明细，进程内单文件）
@@ -25,6 +27,7 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 | 1 | `docs/需求与架构.md` | **唯一的规范文本**。§3 选型 / §4 数据模型 / §5 spec 与渲染 / §6 安全 / §7 Agent / §10 风险 / §11 落地顺序 |
 | 2 | `docs/tech-research-excel-template-and-duckdb.md` | 实测原始记录（含源码行号与完整输出）。§5.3 的结论都出自这里 |
 | 3 | `src/` 各文件头部注释 | 每个模块开头都指向对应章节 |
+| 4 | `skills/bi-lite-ingest/SKILL.md` | **给 agent 的操作手册**：接入规格/报表规格的字段、五步流程、lint 与 dry-run 的分工、**不要向用户索要金额** |
 
 **文档即规范**（code follows docs）：实现与文档冲突 → 改代码或改文档，**不悄悄偏离**。
 若改动涉及 §5.3（渲染器）或 §6（安全），先更新文档再改代码。
@@ -32,9 +35,14 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 ## 2. 铁律（违反任何一条 = 回滚，不接受"临时"例外）
 
 1. **明细数据不出 DuckDB 进程；金额不进 LLM 上下文。**
-   - agent **没有 SQL 权**。只暴露 §7.1 的七个工具，无 shell。
+   - agent **没有 SQL 权**。只暴露 §7.1 的工具（当前 12 个），无 shell。
    - 给 agent 的预览（`planOf()`）**只含坐标与形状，不含数值**。
    - 新增任何"返回查询结果"的工具或接口前，先确认它是否会把明细值送进 LLM。
+   - **输入侧与输出侧是两条不同的防线**（用户 2025 定调）：引擎**不做脱敏、不管输入** ——
+     它的职责是「**不往外发数据**」：`look_at_source` 对数字格只回 `{num:true}`，
+     `dry_run_ingest` 与所有 `planOf()` 类响应里**永远没有金额**（e2e 有断言专门比对）。
+     "别把金额贴给我"这件事写在 `skills/bi-lite-ingest/SKILL.md` 里 ——
+     它是**提醒**，不是防线；用户真把金额贴进对话时，引擎能做的只有不把它再发出去。
    - 参考：Lightdash/Metabase/Superset 三家都给 LLM SQL 权再加闸门，**bi-lite 是根本不给**。
      这是自觉的路线分歧，不要因为"别人都这么做"而改。
 2. **维度白名单是唯一 SQL 入口。** `spec/compile.ts` 的 `DIMENSIONS` 是唯一的维度注册表。
@@ -50,7 +58,10 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
    `src/db/schema.ts` 的 `PERIOD_TYPES`，不是新增表或新增列。
 6. **账面累计必须实存，不得从单月派生。** 它含审计调整，累加不等。
    `PERIOD_TYPES` 里 `derivable: false` 的项都不许在代码里"顺手算出来"。
-7. **导入链路的每一行都不经过 LLM。** `src/import/` 下任何代码不得引用 LLM/MCP 相关模块。
+7. **执行链路的每一行都不经过 LLM。** 接入规格 YAML 与报表规格 YAML **由 agent（或人）产出**，
+   引擎只做**确定性执行**与**确定性拒绝**：`src/ingest/`、`src/spec/`、`src/render/` 下任何代码
+   不得引用 LLM/MCP 相关模块，也不得为了"跑通"而放宽判据。
+   *（原表述是「导入链路的每一行都不经过 LLM / `src/import/`」；**长表导入已退场**（2026-10-01），见 `docs/开发计划.md` §10。*
 8. **运营指标独立成表**，共享 `dim_company` / `dim_period`，**不要塞进 `fact_finance`**：
    量纲、频率、口径体系都不同（Kimball 星型）。
    现有 `fact_contract`（已建表）；后续的 `fact_business_line` **尚未建**，加运营指标时新建表，别扩 `fact_finance`。
@@ -74,7 +85,8 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
     详见 §4 备忘 9 与 `docs/需求与架构.md` §4.4.1。
 12. **禁止裸 `catch {}`。** 有意容错的地方必须留下可观测痕迹（打日志 + 回传状态字段）。
     判例：Parquet 归档曾因裸 `catch {}` **静默失效多轮**而无人察觉（R13）。
-    现在 `POST /api/import/commit` 回传 `archived: boolean`，e2e 有 3 项断言守着。
+    现在 `POST /api/ingest/run` 回传 `archived: boolean`，而且**写完会在同一个只读实例上读回来数一遍**
+    （对不上就判失败 —— 见 §4 备忘 13），e2e 有断言守着。
 13. **MCP 工具返回值必须过金额兜底；审计日志只记字段名，不记值。**
     `src/mcp/tools.ts` 的 `callTool()` 对每个返回值递归扫描，出现 **≥ `AMOUNT_TRIPWIRE`（10000）的数字**
     即判定泄漏：记审计 + 打 stderr + 返回 `内部错误：… 已拦截（安全不变量）`。
@@ -98,22 +110,23 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
     判维要求**全部标签命中**某维度，不许"半数像就算"。
     公式行必须**先排除、再判维**（首版顺序反了，导致「合计」行的标签被送去匹配指标表而失败）。
 16. **主数据归并分两档；不确定就停下问人，绝不"按相似度自动合并"。**
-    立场（`src/import/resolve.ts` 头部）：**合并两家公司比不合并危险得多** ——
+    立场（`src/ingest/resolve.ts` 头部）：**合并两家公司比不合并危险得多** ——
     不合并时数字明显不对（少了一半），人会来查；错合并时两家的钱被静默加在一起，
     **报表看起来完全正常，没人会来查**。因此：
     - **Tier 1 自动**：仅 `normalizeName()` 后完全相同（全角/空白/括号/大小写 = **格式噪音**），
       且自动归并必须在 `issues` 里**留痕**（否则「我的公司名怎么不见了」会变成无从排查的疑问）。
     - **Tier 2 需确认**：去壳字号相同 / 互相包含 / 编辑距离相近 —— **只给候选，由人拍板**；
       候选必须带 `why`（判断依据），**不给人看依据的推荐等于猜**。
-    - **`commit()` 必须分两阶段**：`registerAlias()` 写的别名**永久生效且无干净撤销办法**，
-      所以阶段 1（`plan()`）**一次库都不写**，有歧义就整体返回 `needsDecision`、一行都不落。
+    - **落库必须分两阶段**（`runIngest` 的 `planOnly` 干跑 / 正式落库）：`registerAlias()` 写的别名
+      **永久生效且无干净撤销办法**，所以阶段 1（干跑）**一次库都不写**，有歧义就整体返回
+      `needsDecision`、一行都不落。
       *（可行的关键：新建维度的 id 是 `hash(raw)` 的纯函数，无需写库即可算出。）*
     - 阶段 2 顺序：**先建维度、再登记别名**（别名可指向本批同时新建的实体），
       且登记前校验目标存在 —— 否则会造出**指向虚空却从此自动命中**的别名。
     - 判据细节：`stemCompany()` **不能把纯壳名剥空**（`'有限公司'` 剥成 `'有限'` 是碎片、不是字号）；
       "写法相近"**必须要求首字相同**（否则「西北子公司」vs「华东子公司」仅差 2 字、相似度 0.6 会误报），
       且**字号一旦对上就直接返回、不补弱信号**（有强信号时就不要弱信号）。
-    - 有歧义时接口返 **HTTP 200 + `pendingConfirm:true`**，不是 4xx —— **那是待办，不是失败**。
+    - 有歧义时**只回 `needsDecision` 且一行都不写**（HTTP 200，不是 4xx）—— **那是待办，不是失败**。
 17. **量纲维必须被钉住；欠约束的 spec 在解析期就拒绝，不许"先出数再看"。**
     `metric` 与 `period_type` 是**量纲维**（决定"这个数是什么"）；公司/月份/年份是**筛选维**
     （只是"哪些数加进来"）。前两者必须有约束，否则多个指标的金额会被**加成一个数**。
@@ -136,16 +149,17 @@ bi-lite = **「长表 → 口径规格 → 多形态产出」的引擎**。
 ## 3. 常用命令
 
 ```bash
-npm run fixtures   # 生成测试假数据（模板 + 960 行长表）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，231 项断言，唯一的门禁
+npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
+npm run e2e        # ★ 全链路验收，365 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 断言覆盖 15 个阶段：模板指纹 → 开库 → STAGED 校验 →
-  提交 → spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 →
-  语义层 → 图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）**。
+- **`npm run e2e` 必须全绿才可提交。** 断言覆盖全部阶段 —— **刻意不写阶段条数，那个数字漂过两次**
+  （条数以实跑输出为准）：模板指纹 → **CLI 解析层与命令表** → 开库 → 接入规格干跑 → 落库 →
+  spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 → 语义层 →
+  图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -175,6 +189,9 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 5. **DuckDB 单写者锁**：有跨进程写者时，其它进程**连 `READ_ONLY` 都拿不到锁**。
    当前设计规避了这点：**单进程独占一个 `.duckdb` 文件**，导入与查询用同进程内的两个连接（MVCC 让读不被写阻塞）。
    导入频率是每月几次，故不需要更复杂的方案。**不要引入第二个常驻进程去开这个库。**
+   ⚠️ **别把这条读成"只有服务端能开库"**：Web / MCP / **CLI** 三个入口都是"薄壳 + 自己开库"，
+   互斥由上面这把锁天然强制。CLI 是**短命进程**（用完即退），不构成本条禁止的"常驻进程"；
+   服务端在跑时它拿不到锁，**明确报错**即可，不许静默失败。见 `docs/需求与架构.md` §4.4 末。
    （唯一例外：`exportParquet()` 会开一个**同进程内、用完即弃的只读实例**做 Parquet 归档 —— 见备忘 9。
    它在同进程内，不构成"第二个进程"，且只读。）
 6. **`exceljs` 只能用于生成测试 fixture**（`devDependencies`）。
@@ -207,27 +224,123 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
       断言 `headers.get('content-length')` 会拿到 `null`。要按**实际字节**判（`(await res.arrayBuffer()).byteLength`）。
     - **不用 multipart 上传**。为省依赖，上传走**原始二进制 body + `X-Filename` 头**（前端 File API 读成 ArrayBuffer 直发）。
       文件名要 `encodeURIComponent`，服务端 `safeName()` 会剥掉路径成分。
+11. **整段 DDL 是一个模板字符串 —— 注释里不能出现反引号。** `src/db/schema.ts` 的 `DDL` 用反引号包住，
+    在 SQL 注释里写一个 `` ` `` 会把它**提前闭合**，于是后面的 SQL 被当成 TS 解析，
+    报错是 `Expected a semicolon` 而且**指在毫不相干的下一行**（实测踩过：排查花了两轮）。
+    想要代码样式就用中文引号，或直接写名字。
+12. **`xlsx-populate` 把「日期格」给成**序列号（number）**，不是 `Date` 对象** —— 日期格要靠 spec 声明（`type: date`）才读得对。**
+    实测：一个 `numFmt = 'yyyy-mm-dd'` 的日期格，`cell.value()` 返回 `number`、`typeof` 也是 `number`
+    —— 于是 `v instanceof Date` 这类判断**是死代码**。
+    后果实测过两次，两个方向都踩了：
+    - 旧长表路径 `normalizeMonth()` 里正是这么写的 → 实际走 `String(46173)`，
+      再配 `^(\d{4})[-/年]?(\d{1,2})` → **2026-06 的日期格被读成 `4617-04-01`**。
+      数字看着像年份、格式完全正常，**没人会去查**（详见 `docs/需求与架构.md` §11.6）。
+    - 新接入层用的是 `textAt()`，它**只认字符串**（这是有意的：数字在类型层面没有出口，铁律 1）
+      → 日期格被读成"没有值"，期数列凭空消失，而干跑还报 `ok`（只是坐标空缺）。
+
+    **现在的处置：由 spec 声明「这一列是日期」** —— `keys: [{ col: A, as: period, type: date }]`。
+    声明了，引擎才把格子里的序列号按日期解读（序列号 → 日期，只支持 **1900 系统**）；
+    没声明就报 `PERIOD_CELL_NOT_TEXT`，并在提示里把两条路都写出来（改成文本 / 声明 `type: date`）。
+    - **为什么不自动看 `numFmt` 判断**（那是更"聪明"的做法）：**因为重放**。raw 里存的是那个数字
+      （实测 `kind=number, raw_value=46174`），**压根没存"它是日期格"这件事**；
+      靠读 xlsx 的格式来判断，首灌（读 xlsx）与重放（读 raw）就会得出**不同的期数**。
+      把解读写成声明，两条路读的是同一份事实（e2e 第 27 阶段有用例钉着这一点）。
+    - **只支持 1900 系统，1904 一律拒绝**：同一个日期在两套系统里的序列号差 **1462 天**
+      （实测 2026-06-01 = 46174 vs 44712），拿 1900 基准去读 1904 的工作簿会**静默差 4 年**。
+      xlsx-populate **不给**这个标志（实测三个可疑属性全是 `undefined`），只能自己看
+      `xl/workbook.xml` 的 `<workbookPr date1904="1">`（`template.ts` 的 `usesDate1904()`）。
+      拒绝发生在**两处**：打开始源文件（干跑/落库都会走到）与**着陆之前** ——
+      后者是因为"raw 存了序列号却存不下日期系统"，那种 raw 会变成重放陷阱。
+    - 序列号 **< 61 一律拒绝**（0/负数/1900 年 1–2 月）：Excel 凭空算进了 1900-02-29（序列号 60），
+      1..59 与 ≥61 的基准差一天 —— 而在这里**差一天就等于差一个月**，所以不猜。
+    - **"按序列号猜年份"这条路永远不要走**（旧路就是这么静默写出 4617 年的）。
+13. **★ 归档用的"短命只读实例"会顺手把主实例的库锁丢掉 —— 于是第二个进程能进来。**
+    这是 2026-10-01 由一条新断言（e2e"归档文件可被 DuckDB 读回"）挖出来的、**存在了很久**的
+    静默失效。三点都实测过：
+    - **归档之前**：第二个进程 `db.open()` 报 `Could not set lock on file`（备忘 5 的不变式成立）。
+    - **归档一次之后**：那个只读实例 `closeSync()` 的那一刻，**主实例的锁就没了**
+      —— 第二个进程 `db.open()` **直接成功**。`CHECKPOINT`、跑一条空查询都拿不回来；
+      **只有"把主实例关掉重开"能拿回来**（所以 `exportParquet()` 的 `finally` 里调 `reattach()`）。
+    - **只读实例是"创建那一刻的快照"**：把它留着不关能保住锁，但它再也看不见后来的提交
+      （实测连续三次归档都读回 0 行）。所以只读实例必须**每次新建**。
+    **后果长什么样**（要能一眼认出来）：两个写者同开一个库 → 主实例后续的归档全部读到**过期视图**
+    → 写出的 Parquet **只有表头、0 行**（实测 960 行的批次写成 **222 字节**），
+    而 `archived` 还报 `true`。判据：**`archived: true` 不等于"归档里有数"** ——
+    所以 `exportParquet()` 现在带 `verify`（写完在同一实例上 `read_parquet` 数一遍），
+    对不上就抛错、`archived` 置 false。
+    **推论（比这条本身重要）**：`exportParquet()` 是**跨进程也会改变库状态边界**的操作。
+    "同进程内、只读、用完即弃"这套说辞（备忘 5 末尾的"唯一例外"）**不成立** —— 别再照着它推理。
 
 ## 5. 架构地图
 
 ```
 src/
+  cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §7）
+                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · validate · skill export
+                   （`scanArgs` 是唯一的参数扫描器）
+                   ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`（顶层有没有 source）
+                   ★ 解析层 parseCliArgs() 是纯函数 —— 不启动任何东西即可覆盖整个命令面
+                   ★ handler 惰性 import（--help / lint 不加载 duckdb）；数据走 stdout、日志走 stderr
+                   ★ 命令表自检：注册了却没 handler → 启动即报错（别让它静默空转）
+                   ★ query 的受众**写死 human**（铁律 10）—— 没有 `--audience` 这种开关
+                   ⚠️ 不许把 CLI 取数命令写进 agent 侧物料 —— 那等于给 agent 开一条取数路（§7.5，e2e 有断言）
+  paths.ts          ★ 源文件路径白名单（resolveSource）—— **唯一实现**，是安全判据，别复制第二份
+  land/             ★ 着陆层：源文件 → raw_file / raw_cell（append-only，**"可重放"的唯一依据**）
+    raw.ts         landRawFile()：sha256 幂等（同 hash 一格都不重写）+ 只存有值的格
+                   + raw_source（路径 → 最近一次着陆）：**源文件删了也能重放**；
+                     findRawFile() 两步走 —— 文件在按内容找，文件不在按路径找
+                   + raw_value 不 trim（与 template.ts 的 textAt 语义刻意不同）+ BEGIN/COMMIT
+                   ★ 返回值结构上只有计数与哈希，不含任何格内容（照 previewSpec「根本不查库」那套路）
+                   ★ **1904 日期系统的工作簿拒绝着陆** —— raw 存得下序列号、存不下日期系统，
+                     那种 raw 会变成"重放得出另一个答案"的陷阱
+                   read.ts        rawWorkbook()：把 raw_cell 还成「可读工作簿」（忠实还原，不解读）
+                                  ★ 这是「可重放」的落点：删掉 stg/dim/fact 后仍能从 raw 重建
+                   ⚠️ 清洗/换算一律不许往回写 raw —— 否则它就成了第二份真相
+  skill/           ★ 手册里**可对拍**的那部分，从实现投影（架构 §8.2 ①：规则是实现的投影）
+    export.ts      skillFactsFrom(TOOLS) → 工具面 + 注册表；skillPrompt → Markdown
+                   + skillProblems(SKILL.md, 工具名)：**把「手册会不会漂」变成断言**（同 metaProblems 的套路）
+                   ⚠️ 诚实边界写在导出物里：规格字段清单与判据 code 全集**反射不到**
+                     （strip-only，类型在运行时不存在），所以它替代不了 SKILL.md，只是它的可对拍部分
+  meta/            ★ 列契约与 catalog：物理层向语义层 / Agent 自省自己（架构 §7.2、§8.5）
+    columns.ts     META：**唯一一份**列角色声明（pk / dim_fk / measure / degenerate / provenance）
+                   + registerMeta()：由 runIngest 在**同一事务**里登记（数据与元数据同时刻产生）
+                   + metaProblems()：把声明与 information_schema 对拍，四类漂移全报（可注入声明，e2e 据此证明它真会抓）
+                   + schemaFingerprint()：ddlHash，agent 靠它判断手里那份 catalog 是不是旧的
+    catalog.ts     catalogDump() 三层导出（L1 业务成员 / L2 物理结构 / L3 版本）+ catalogShow() 按需下钻
+                   ★ 零金额；**不含** raw_* / _ingest_batch / dim_alias —— 那些是运营侧，混进来会把快照撑成运营日志
   db/
-    schema.ts      DDL（四维表 + 事实表 + 批次表）+ PERIOD_TYPES 口径注册表
+    schema.ts      DDL（四维表 + 事实表 + 批次表 + raw 着陆表 + _meta_* 契约表）+ PERIOD_TYPES 口径注册表
+                   ⚠️ 整段 DDL 是**模板字符串**：注释里写反引号会把它提前闭合（报错却指在下一行）
     index.ts       open() / writer() / reader() / query() / execute() / close()
-                   + exportParquet()（★ 短命只读实例写归档，见铁律 11）
+                   + exportParquet()（★ 只读实例写归档 → **归档后重开主实例把库锁拿回来**（`reattach()`）
+                     → **写完读回来数一遍**；见铁律 11 与 §4 备忘 13）
                    —— 单进程双连接；query() 已处理 BigInt 与 JSON 解析
-  import/
-    longtable.ts   长表解析 + stage()（STAGED 校验，不写库）+ commit() + archiveParquet()
-                   三态：STAGED → SYNCING → READY / ERROR
-                   commit() ★ 严格两阶段：plan() 只判断不写库 → 有歧义整体返回
-                   needsDecision；阶段 2 先建维度、再登记别名（铁律 16）
-    resolve.ts     ★ 两档主数据归并（铁律 16）
+  ingest/          ★ 接入层：源 Excel（任意形态）→ 星型表。YAML 由 agent 产出，这里只确定性执行
+    types.ts       IngestSpec 类型 + parseIngestSpec() + lintIngest() + diagnoseIngest()
+                   ★ 判据只有一份（与 spec/lint.ts 同理）；口径从调用方注入，不 import PERIOD_TYPES
+    dryrun.ts      展开网格 → 事实行（只出形状与计数；onRow 回调是金额唯一一次离开读取循环）
+                   openBook? 决定「值从哪来」：默认开 xlsx，已着陆则换成 raw（src/land/read.ts）
+                   ⚠️ 有 openBook 时**不要求源文件还在** —— 否则「删了源文件也能重放」到不了这一步
+                   ★ **长表也走这一条路**（四个坐标全在列里、期数逐行不同）：行键 = rows 列 + 期数；
+                     期数认完整日期；`PERIOD_PER_ROW` 只是 warn（按每行各自的期数落库）。
+                     这四条能力是"取代旧长表路径"的前提，e2e 第 26 阶段有对拍（§11.6）
+                   ★ **日期格靠声明**：`keys[].type: date` 才把序列号按日期解读（默认 text）——
+                     自动读 numFmt 会在**重放**时失效（raw 里只有那个数字）；1904 系统两处拒绝。
+                     序列号 < 61 直接拒绝（差额只有一天，而这里差一天 = 差一个月）。e2e 第 27 阶段有断言
+    run.ts         runIngest()：**关卡 0 先着陆**（同一份文件幂等）→ 关卡 1 形状不对一行不写 →
+                   关卡 2 无值格 → 主数据两档归并 → 落库。落库那条路**从 raw 读**（可重放）；
+                   干跑不写库：已着陆就读 raw，没着陆就读工作簿
+                   ★ 阶段 2 的全部库写包在 **BEGIN/COMMIT** 里（Parquet 归档在 COMMIT 之后 ——
+                     它另开实例拿锁，事务里拿不到）。中途失败整体回滚，不留半个批次
+                   ★ `dimIdOf()` 取不到维度 id 当场抛 —— 否则 lit(undefined) 会写出 `'undefined'` 脏 id
+    normalize.ts   toHalfWidth/normalizeName/stemCompany（判重与归并共用）
+    resolve.ts     ★ 两档主数据归并（铁律 16）—— 原在 import/，2026-10-01 搬进接入层
                    + normalizeName()（去格式噪音，Tier 1 判据）
                    + stemCompany()（剥公司形式后缀，仅用于生成候选）
                    + buildResolver() / candidates()（候选必带 why）
                    + registerAlias() / listAliases() / describeUnresolved()
                    + 立场：合并两家公司比不合并危险得多
+    master.ts      masterCatalog()：主数据快照的唯一实现（MCP 工具与 Web 路由共用，防判据漂移）
   spec/
     types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
                    + parseSpecLenient()（解析但不校验，给诊断用）
@@ -239,11 +352,15 @@ src/
                    + evalExpr() —— expr 的输入来自 SQL、输出在 JS 里算
     lint.ts        ★ 结构诊断的**唯一判据**：欠约束 / expr 引用 / join / order / chart
                    + lintSpec() + unpinnedMeaningDims()
+                   + PERIODTYPE_UNKNOWN：口径名必须是注册过的（与 semantic/query.ts 的 allowedPeriods 同源）。
+                     ★ 判例（2026-10-01 实测）：把「本年累计」写成形近的「本年度累计」，parseSpec 放行、
+                     lint 一条不报，而那一格从 **66826 静默变成 null** —— 写进报送表像「这一项本月没有数」。
                    ⚠️ 禁止另写一份判据 —— 漂移会表现为"说没问题、保存却被拒"
     compile.ts     ★ DIMENSIONS 白名单 + compileBlock() → 参数化 SQL
                    + runCompiled()（expr 参与计算）+ planOf()（坐标预览，不含金额）
     template.ts    模板结构读取：表头/行标签/合并区/定义名称/公式行
                    + readTemplateSchema() / readRegion() / textAt()（数字在类型层面没出口）
+                   + usesDate1904()：读 xl/workbook.xml 的 workbookPr —— 1904 系统的工作簿不许进接入层
     infer.ts       ★ 模板 → spec 草稿（铁律 15）
                    + 每个轴带 source（template=读到的 / guessed=猜的）+ evidence（依据）
                    + 公式行先排除再判维；判维要求全部标签命中
@@ -259,9 +376,24 @@ src/
                    + quoteFormulas()（公式注入防护）
     chart.ts       ★ toEChartsOption()（含数值，只给浏览器）
                    + chartShape()（只含结构与标签、不含数据点，可给 agent）
+  server.ts        ★ **Web 入口**（零框架 node:http；给"人"）—— 三个入口之一
+                   + `audience` 写死 human 并**无条件覆盖**请求体里的同名字段（铁律 10）
+                   + 接入路径路由 `/api/ingest/{specs,lint,upload,dry-run,run,save}`：
+                     upload 只落盘（不解析不落库，落点必须过 `resolveSource`）；
+                     specs 顺带回 YAML 文本（**枚举出来的路径**，不另开一个路径判据）；
+                     其余五条与 MCP 工具共用 `diagnoseIngest` / `runIngest`，不写新判据
+                   ★ 退场守卫：旧 `/api/import/*` 路由**已删**，e2e 钉着「POST 一律 404」
+  web/             ★ Web 界面（零前端框架、零构建；`app.js` + `index.html` + `style.css`）
+    app.js         数据导入 / 看板查询 / 报表报送三块；**页面不写判据**，只把服务端结论摆给人看
+                   + 接入向导：上传源 → 挑/改接入规格 → 边打字诊断 → 干跑 → 待确认拍板 → 落库
+                   + `source:` 由人点按钮改（改完在编辑器里可见）—— 不开"运行时覆盖 source"的第二条真相
   mcp/
-    tools.ts       ★ 七个工具（list_metrics / get_template_schema / lint_spec /
-                   render_report / diff_report / generate_spec）
+    tools.ts       ★ 12 个工具
+                   看现状：get_catalog（★ 按需下钻；零金额；把「现在有什么」交给 agent）
+                   报表侧：list_metrics / get_template_schema / lint_spec / preview_spec /
+                           render_report / diff_report / generate_spec
+                   接入侧：look_at_source（★ 数字格只回 {num:true}）/ lint_ingest /
+                           dry_run_ingest / run_ingest
                    + callTool()：★ 金额兜底（铁律 13）+ 审计（只记字段名）
                    + findAmountLike()（递归找 ≥ AMOUNT_TRIPWIRE 的数字，给 e2e 复用）
                    + previewSpec() ★ 不查库 —— 坐标纯从 spec 的 order 长度 + 锚点推出
@@ -275,8 +407,9 @@ data/              ⚠️ 真实财务数据，永不提交
   audit/           MCP 审计日志（JSONL，只记字段名不记值）
 ```
 
-**数据流**：Excel 长表 →（`import/`，不经 LLM）→ DuckDB →（`spec/` 编译成 SQL，本地执行）
-→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
+**数据流**：Excel（任意形态）→（`land/` 着陆 → `ingest/` 按接入规格展开，不经 LLM）→ DuckDB
+→（`spec/` 编译成 SQL，本地执行）→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
+*（旧长表路径 `import/` 已于 2026-10-01 **整体**退场：longtable.ts 删了、resolve.ts 搬进 `ingest/`。）*
 **agent 只参与产出 spec，从不接触数值。**
 
 **两条"给 agent 看不给数值"的对称设计**（新增返回数据的接口时照这个套路）：
@@ -293,18 +426,29 @@ data/              ⚠️ 真实财务数据，永不提交
 | 1. 导入闭环 | ✅ **完成**（服务端 960 行/320–380ms + Web 导入向导 + Parquet 归档） |
 | 2. 语义层 + 查询 | ✅ **完成**（`queryMetrics` 受众分级 / 反推防护 / 注入防护 + Web 看板查询页） |
 | 3. 规格引擎 | ✅ **完成**（Excel 模板填充 + ECharts 两个 renderer + Web 报表预览/导出） |
-| 4. agent 入口 | ✅ **完成**（MCP 七工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
+| 4. agent 入口 | ✅ **完成**（MCP 11 工具，零依赖 stdio；e2e 用**真实 MCP 客户端**验收） |
 | 5. 模板 → spec 自动生成 | ✅ **完成**（`template.ts` + `infer.ts` + `generate_spec` + Web 上传模板出草稿） |
 | R1. 主数据对齐 | ✅ **完成**（`resolve.ts` 两档归并 + `dim_alias` 表 + 两阶段 commit + Web 待确认卡片，铁律 16） |
 | §7.2 路径 2 | ✅ **完成**（`dims.ts` / `expr.ts` / `lint.ts` 挡住欠约束 + `lint_spec` 工具 + Web 边打字边诊断，铁律 17） |
+| CLI 入口 | 🚧 **引擎侧 + 物料侧已落地**（`src/cli.ts` + `bin`：`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show`。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出**。`validate` / `skill export` 也已挂（§7.1 的命令面走完了）—— 见 `docs/开发计划.md` §7） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**231 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
-第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐）守着。
+**365 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
+（含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
+第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。
 
 **下一步（尚未开始）**：
-- `fact_business_line` 表 —— 运营指标（合同、业务线）独立成表，见铁律 8。
-- §10 **R8**：Parquet 小文件 compaction（归档批次多了以后）。
+- ~~`src/import/` 退场~~ → **已完成（2026-10-01，三片全绿）**：`longtable.ts`、三条 `/api/import/*` 路由、
+  旧导入页与旧断言都删了，并补了**退场守卫**（旧路由必须 404、首页不许留旧控件）。
+  第 26 阶段的对拍改为对**冻结快照**（`test/expected/集团导出长表-960行.json`）。
+  ⚠️ `resolve.ts` 同轮搬进了 `src/ingest/`，`src/import/` 目录随之消失 —— 旧路径至此**零残留**。
+- ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
+  1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
+- ⏸ **已推后（用户 2026-10-01 拍板，见 `docs/开发计划.md` §6「已定（不再讨论）」）**：生成器侧
+  `bilite plan/apply`（P2）、SCD2、`fact_business_line`（它没东西可填 —— 要写进业务线事实表得先把
+  「目标表」变成声明，而那正是被推后的生成器那部分）、§10 R8 Parquet compaction（按每月一批算两年
+  ≈ 24 个 ~7.7KB 文件，无可观察到的问题）。**不要把它们当待办捡起来。**
 
 **§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
 真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），
@@ -359,19 +503,26 @@ R1 交付后 e2e **186 项全绿**，但把人真的会走的路径在浏览器�
 
 - **当前只有假数据。** 用户明确指示：*「测试都用假数据测，生产环境会有不同的数据导入格式，先跑通」*。
   因此：**不要为了让某个断言过关而把导入层写死成假数据的列名。**
-- **导入层必须对格式差异宽容**，这是 R1（主数据对齐）的核心。当前 `readLongTable()` 已支持
-  表头别名（`财务期/月份/期间/fin_month` 等）与多种月份写法（`2026-06` / `2026/6` / `2026年6月` / `Date`），
-  **但这是它最容易翻车的地方** —— 真实集团导出的列名、口径写法很可能超出这份别名表。
-  新增别名时**同时考虑**：公司名/指标名的别名（`dim_company.alias` / `dim_metric.alias` 已在用）。
+- **生产接入规格（`ingest/*.yaml`）的 `source:` 必须指向稳定位置**：`data/` 下的正式文件，
+  或人在向导里上传后落下的 `data/uploads/...`。**不许指向探针/临时目录**（如 `data/probe-run/`）——
+  那种路径清一次调试残留就断；更坏的是探针重跑会在**同一个路径**生成另一份文件，
+  规格从此换个数据源而**没有任何提示**。
+  （判例：`ingest/月度经营接入.yaml` 曾经指在 `data/probe-run/`，2026-10-01 挪到 `data/月度经营接入源.xlsx`。）
+- **接入层必须对格式差异宽容**，这是 R1（主数据对齐）的核心。现在**形状只有一处声明**：接入规格 YAML
+  （旧的 `readLongTable()` 与它那份"列名别名表"已随退场一起删除 —— 那正是"两份实现"的代价）。
+  期数认 `2026-06` / `2026/6` / `2026年6月` / `202606` 与**完整日期**；
+  **日期格要声明**：`keys: [{ col, as: period, type: date }]` —— 不声明就报 `PERIOD_CELL_NOT_TEXT`（引擎不猜，见 §4 备忘 12）。
+  新增容忍度时**同时考虑**：公司名/指标名的别名（`dim_company.alias` / `dim_metric.alias` 已在用）。
 - **未识别的主数据必须报给人确认，不得静默自动建维。** 这件事**已实现**（铁律 16）：
   Tier 1（纯格式差异）自动归并且**在 `issues` 里留痕**；Tier 2（去壳/包含/相似）
-  只给候选、由人在 Web 上「并入已有 / 新建」二选一，或经 `commit({decisions})` 传入；
-  有歧义时整体不落库（HTTP 200 + `pendingConfirm`）。
-  **`commit({autoCreateDims: true})` 仍会新建无候选的名字** —— 那是给"确实是新公司"用的，
+  只给候选（带 `why`）、由人在 Web 上「并入已有 / 新建」二选一，或经 `runIngest({decisions})` 传入；
+  有歧义时整体不落库（返回 `needsDecision`，**一行都没写** —— 那是待办，不是失败）。
+  **`unknownMaster: create` 仍会新建无候选的名字** —— 那是给"确实是新公司"用的，
   不是用来跳过确认的。名字有候选时它**照样会拦下来**。
-  `stage()` 输出的 `unknownCompanies` / `unknownMetrics` / `unknownPeriodTypes` 继续保留给人看。
+  干跑输出里的 `unmatched` 继续保留给人看（"这批名字里有多少是见过的"）。
   **不做主数据对齐，三个月后数据全是孤儿行。**
-- 新增校验规则 → 加到 `stage()` 的 `issues`，并同步加进 `test/e2e.ts` 第 2 阶段。
+- 新增校验规则 → 加到接入层的 `lintIngest()` / `dryRunIngest()` 的 `issues`，并同步加进 `test/e2e.ts` 第 2 阶段。
+- **改了断言 → 同步 §3 / §6 里的条数**（它会漂：231 与 247 对不上过一次，根因就是没人管它）。
 - 安全相关的断言（第 9 阶段）**只许增加，不许删除**。
 - 版式保真的断言（第 6 阶段）包含 **styles.xml 防膨胀** 四项 —— 这是铁律 4 的回归防线。
 

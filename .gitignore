@@ -18,6 +18,16 @@ output/
 *.报送.xlsx
 *.已填.xlsx
 
+# archify 生成的架构图 / 截图 / 校验证据（本地渲染产物）
+.archify/
+
+# 设计输入，中间产物 —— 明确不是要对齐的规范（docs/开发计划.md 卷首"文档关系"）。
+# 进 .gitignore 是为了让它不会被下一次 `git add -A` 顺手带进库、进而被当成规范读。
+bi-architecture-design.md
+
+# 一次性诊断脚本（probe-*）。留着现场供查，但不进版本库。
+probe-*.ts
+
 # Node
 node_modules/
 npm-debug.log*
