@@ -1,6 +1,6 @@
 
 id: 月度经营接入
-source: data/probe-run/月度经营接入源.xlsx
+source: data/月度经营接入源.xlsx
 onConflict: reject
 unknownMaster: create
 onEmptyMeasure: skip
