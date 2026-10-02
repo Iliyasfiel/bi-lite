@@ -3207,6 +3207,119 @@ log('\n════════ 31. 运营事实表 fact_business_line（target 
     dry2.issues.map((i) => `${i.level}:${i.code}`).join(',') || '无');
 }
 
+// ============ 32. 维度版本行（SCD2 类型 2）：历史挂在侧表 ============
+log('\n════════ 32. 维度版本行 SCD2（历史侧表 + 时点查询）════════');
+{
+  // ★ 这一阶段守的是 ④ 的**验收线**（`docs/开发计划.md` §6 的推后理由反面）：
+  //   "上了它，每个既有查询与 spec 编译都得带 is_current，是纯成本" ——
+  //   所以本阶段的判据是：**维度属性变了之后，当前态查询的数字逐个不变**，
+  //   而"当时那一版"能通过显式时点查询（dimAsOf）拿到。
+  //   形态选择：历史挂**侧表**（`dim_company_hist`），`dim_company` 仍是当前态的唯一真相 ——
+  //   既有查询一个字都不用改（零回归是结构性的，不靠"记得补 is_current"）。
+  const scd = await import('../src/db/scd2.ts');
+  const { queryMetrics } = await import('../src/semantic/query.ts');
+  const { versionCount, setDimAttributes, dimAsOf, dimHistory, scdProblems } = scd;
+
+  // —— ① 历史表由声明长出来；而且**此刻不变量已经成立** ——
+  const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
+  const histTables = await db.query<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'
+      AND table_name IN ('dim_company_hist', 'dim_metric_hist') ORDER BY 1`,
+  );
+  const problems0 = await scdProblems();
+  check('★ 历史侧表由声明长出来（`_model` 里有它），且**接入层建维时写的首版**让不变量当即成立',
+    Number(modelRows[0]!.n) === 8 && histTables.length === 2 && problems0.length === 0,
+    `_model=${modelRows[0]!.n} 历史表=${histTables.length} 不变量问题=${problems0.join(' | ') || '无'}`);
+
+  // —— ② 首版的生效日 = **本批最早的期数**（不是 now()，重放才确定）——
+  const one = (await db.query<{ id: string; name: string; group_name: string | null }>(
+    `SELECT c.id, c.name, c.group_name FROM dim_company c
+      WHERE EXISTS (SELECT 1 FROM fact_finance f WHERE f.company_id = c.id)
+      ORDER BY c.name LIMIT 1`,
+  ))[0]!;
+  const firstVersion = (await dimHistory('company', one.id))[0]!;
+  check('★★ 首版的生效日用的是**期数首日**（2026-01-01，长表那批覆盖 12 个月）——不是 now()',
+    String(firstVersion.valid_from) === '2026-01-01' && firstVersion.valid_to === null &&
+      firstVersion.is_current === true,
+    `${one.name}: valid_from=${String(firstVersion.valid_from)} ~ ${String(firstVersion.valid_to)}`);
+
+  // —— ③ "零回归"的基线：改属性**之前**先把真实查询结果记下来 ——
+  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const };
+  const before = JSON.stringify(await queryMetrics(probe));
+
+  // —— ④ 属性没变 → **不产生新版本**（否则历史会被"每次导入"刷满）——
+  const n0 = await versionCount('company', one.id);
+  const same = await setDimAttributes('company', one.id, { group_name: one.group_name });
+  check('★ 属性没变 → 不产生新版本（幂等；历史不会被每次导入刷满）',
+    same.changed === false && (await versionCount('company', one.id)) === n0, `${same.note} / 版本数 ${n0}`);
+
+  // —— ⑤ 属性变了 → 关旧版 + 开新版 + 当前态跟上 ——
+  const late = await setDimAttributes('company', one.id, { group_name: '新能源板块' }, { effectiveFrom: '2026-07-01' });
+  const hist = await dimHistory('company', one.id);
+  const cur = (await db.query<{ group_name: string }>(`SELECT group_name FROM dim_company WHERE id = '${one.id}'`))[0]!;
+  check('★★ 属性变了 → 旧版关闭（valid_to = 新版生效日）、新版生效、当前态维表同步成新值',
+    late.changed === true && hist.length === n0 + 1 &&
+      String(hist[0]!.valid_to) === '2026-07-01' && hist[0]!.is_current === false &&
+      hist[1]!.is_current === true && hist[1]!.valid_to === null &&
+      String(hist[1]!.group_name) === '新能源板块' && cur.group_name === '新能源板块',
+    `版本 ${hist.length} 条：${hist.map((h) => `${String(h.valid_from)}~${h.valid_to === null ? '现在' : String(h.valid_to)}`).join(' / ')}`);
+
+  // —— ⑥ 时点查询：历史真的能回答"那一期是什么" ——
+  const asOfJun = await dimAsOf('company', one.id, '2026-06-01');
+  const asOfAug = await dimAsOf('company', one.id, '2026-08-01');
+  check('★★ 时点查询（半开区间）：2026-06 拿到旧板块、2026-08 拿到新板块 —— 历史不是摆设',
+    asOfJun !== null && String(asOfJun.group_name ?? '') === String(one.group_name ?? '') &&
+      asOfAug !== null && String(asOfAug.group_name) === '新能源板块',
+    `06 → ${String(asOfJun?.group_name)} / 08 → ${String(asOfAug?.group_name)}`);
+
+  // —— ⑦ ★ 零回归：改完属性，同一批当前态查询**逐格**不变 ——
+  //    比的是"标签 + 每格的值"（不是整包 JSON）：哪天返回体多了个 asOf/计时字段，
+  //    这条断言不该因为那种无关差异变红 —— 那样它就从"守数字"退化成"守序列化格式"。
+  const after = JSON.stringify(await queryMetrics(probe));
+  const bj = JSON.parse(before) as { columns: unknown[]; groups: Array<{ label: string; cells: unknown[] }> };
+  const aj = JSON.parse(after) as typeof bj;
+  //    ⚠️ 分组顺序比不了：GROUP BY 不带 ORDER BY 时 DuckDB 不保证行序（实测两次调用顺序不同）。
+  //       那就**按标签排序后**再逐格比 —— 要守的是"每个格子的数字没变"，不是"行的顺序没变"。
+  const keyed = (groups: typeof bj.groups) =>
+    [...groups].sort((x, y) => JSON.stringify(x.values).localeCompare(JSON.stringify(y.values)));
+  const bg = keyed(bj.groups);
+  const ag = keyed(aj.groups);
+  const cellDiff = bg.findIndex((g, i) => JSON.stringify(g) !== JSON.stringify(ag[i]));
+  check('★★ **零回归**：维度属性变了，当前态查询的**每一格数字与标签都逐字未变**（这是 ④ 的验收线）',
+    cellDiff === -1 && JSON.stringify(bj.columns) === JSON.stringify(aj.columns),
+    cellDiff === -1
+      ? `${bg.length} 组逐格相同`
+      : `第 ${cellDiff} 组变了：${JSON.stringify(bg[cellDiff])} → ${JSON.stringify(ag[cellDiff])}`);
+
+  // —— ⑧ 生效日不晚于当前版本起点 → 拒绝（否则两个版本同时"生效中"）——
+  let overlap = '';
+  try {
+    await setDimAttributes('company', one.id, { group_name: '更早的板块' }, { effectiveFrom: '2026-07-01' });
+  } catch (e) { overlap = (e as Error).message; }
+  check('★ 生效日不晚于当前版本起点 → 抛错（不许造出重叠区间：那会让两版同时生效）',
+    /重叠|不晚于/.test(overlap), overlap.slice(0, 80));
+
+  // —— ⑨ 守卫**真的会抓**：绕过 setDimAttributes 只改维表 → scdProblems() 报 ② ——
+  await db.execute(`UPDATE dim_company SET group_name = '偷偷改的' WHERE id = '${one.id}'`);
+  const caught2 = (await scdProblems()).filter((p) => p.includes('②'));
+  check('★★ 守卫真的会抓：绕过接口直改维表 → ② "与它的开放版本不一致"',
+    caught2.length === 1 && caught2[0]!.includes(one.id), caught2[0] ?? '（一条都没报 —— 守卫形同虚设）');
+  await db.execute(`UPDATE dim_company SET group_name = '新能源板块' WHERE id = '${one.id}'`);
+
+  // —— ⑩ 孤儿版本（历史里有、当前态没有）也要报 ——
+  await db.execute(
+    `INSERT INTO dim_company_hist (id, valid_from, valid_to, is_current, name) VALUES ('c_孤儿', '2026-07-01'::DATE, NULL, TRUE, '不存在的公司')`,
+  );
+  const caught3 = (await scdProblems()).filter((p) => p.includes('③'));
+  check('★ 孤儿版本（历史里有、当前态没有）→ ③ 报出来',
+    caught3.length === 1, caught3[0] ?? '（没报）');
+  await db.execute(`DELETE FROM dim_company_hist WHERE id = 'c_孤儿'`);
+
+  check('★ 收尾：所有操作之后，历史与当前态仍然一致（不变量为空）', (await scdProblems()).length === 0,
+    (await scdProblems()).slice(0, 2).join(' | '));
+}
+
+// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——

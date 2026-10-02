@@ -1,0 +1,31 @@
+# 指标维度的历史版本行（与 dim_company_hist 同一套设计，见那边的长注释）
+kind: dimension
+title: 指标维度历史（SCD2 版本行）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    refs: dim_metric
+    semantic: metric
+  - name: valid_from
+    type: date
+    key: true
+    notNull: true
+    semantic: valid
+  - name: valid_to
+    type: date
+    semantic: valid
+  - name: is_current
+    type: boolean
+    default: 'TRUE'
+  - name: name
+    type: varchar
+    semantic: metric
+  - name: category
+    type: varchar
+  - name: unit
+    type: varchar
+    comment: 元 / 万元 / % —— 改了它，历史报表的口径就变了
+  - name: direction
+    type: varchar

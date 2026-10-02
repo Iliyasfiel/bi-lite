@@ -21,6 +21,7 @@ import { execute, exportParquet, query, queryWriter } from '../db/index.ts';
 import { findRawFile, landRawFile } from '../land/raw.ts';
 import { rawWorkbook } from '../land/read.ts';
 import { registerMeta } from '../meta/columns.ts';
+import { writeFirstVersion } from '../db/scd2.ts';
 import { resolveSource } from '../paths.ts';
 import type { ReadableWorkbook } from '../spec/template.ts';
 import {
@@ -436,6 +437,10 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
        VALUES (${lit(batchId)}, ${lit(spec.source)}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}`)})`,
     );
 
+    // ★ 版本行的生效日 = **本批最早的期数**（不是 now()）：重放要确定性 ——
+    //   同一份 raw 今天跑与下个月跑，"这一版从哪天生效"必须一样（db/scd2.ts 文件头纪律 ①）。
+    const batchFrom = [...new Set(rows.map((r) => r.period))].sort()[0]!;
+
     // 先建维度，再登记别名 —— 别名可以指向**本批同时新建**的实体
     for (const { kind, raw } of toCreate.values()) {
       const id = entityId(kind, raw);
@@ -444,11 +449,15 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
           `INSERT INTO dim_company (id, name, parent_id, level, group_name, alias) VALUES (${lit(id)}, ${lit(raw)}, NULL, 2, NULL, ARRAY[]::VARCHAR[])`,
         );
         createdCompanies.push(raw);
+        // ★ 建维的**同一个事务**里写首版：否则"当前态有这行、历史里没有"是个结构性不一致
+        //   （scdProblems() ① 会报）。两件事一起发生，才有"不漂"的前提。
+        await writeFirstVersion('company', id, batchFrom);
       } else {
         await execute(
           `INSERT INTO dim_metric (id, name, category, unit, direction, alias) VALUES (${lit(id)}, ${lit(raw)}, NULL, NULL, 'positive', ARRAY[]::VARCHAR[])`,
         );
         createdMetrics.push(raw);
+        await writeFirstVersion('metric', id, batchFrom);
       }
     }
 

@@ -36,7 +36,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 421 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 431 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -304,7 +304,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 421 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 431 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -352,7 +352,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，421 项断言
+npm run e2e        # ★ 唯一门禁，431 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -376,7 +376,8 @@ npm run bench      # ⚠️ 未实现
 | 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
 | R1. 主数据对齐 | ✅ 两档归并（Tier 1 自动 / Tier 2 人拍板）+ `dim_alias` 表 + Web 待确认卡片 |
 | §7.2 路径 2 | ✅ 自然语言 → spec：靠"spec 语言挡住欠约束"实现（`lint_spec` + 边打字边诊断） |
-| CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `validate` · `skill export` |
+| CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `compact` · `plan` / `apply` · `validate` · `skill export` |
+| 维度版本行（SCD2） | ✅ 历史挂侧表 `dim_*_hist`；`dimAsOf` 时点查询；**当前态查询零回归** |
 
 ### 已知限制
 
@@ -401,7 +402,7 @@ npm run bench      # ⚠️ 未实现
 
 - [`docs/需求与架构.md`](docs/需求与架构.md) —— **唯一的规范文本**（需求、数据模型、spec 语言、安全设计、风险、落地顺序）
 - [`docs/tech-research-excel-template-and-duckdb.md`](docs/tech-research-excel-template-and-duckdb.md) —— Excel 保真与 DuckDB 的实测原始记录
-- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（18 条铁律）
+- [`AGENTS.md`](AGENTS.md) —— 给 AI 编码代理的开发规约（19 条铁律）
 
 ## License
 
