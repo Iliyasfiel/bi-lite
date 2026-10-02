@@ -16,6 +16,7 @@
  *   返回的 `shape`（形状）可以原样给 agent；`IngestRunResult` 里没有任何金额字段。
  */
 import { existsSync, mkdirSync } from 'node:fs';
+import { PARQUET_ROOT, PART_FILE } from '../db/compact.ts';
 import { execute, exportParquet, query, queryWriter } from '../db/index.ts';
 import { findRawFile, landRawFile } from '../land/raw.ts';
 import { rawWorkbook } from '../land/read.ts';
@@ -514,12 +515,12 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   // Parquet 归档：留着溯源（铁律 11 —— 主实例 enable_external_access=false，只能走 exportParquet 的短命只读实例）
   // ★ 放在 COMMIT **之后**：归档要另开实例拿库的锁，事务未提交时拿不到。
   try {
-    const dir = `data/parquet/fact_finance/batch=${batchId}`;
+    const dir = `${PARQUET_ROOT}/fact_finance/batch=${batchId}`;
     mkdirSync(dir, { recursive: true });
     await exportParquet(
-      `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)}) TO '${dir}/part.parquet' (FORMAT parquet)`,
+      `COPY (SELECT * FROM fact_finance WHERE batch_id = ${lit(batchId)}) TO '${dir}/${PART_FILE}' (FORMAT parquet)`,
       // ★ 写完读回来数一遍：归档曾经"静默写出空文件"而 archived 还报 true（§4 备忘 13）。
-      { path: `${dir}/part.parquet`, rows: inserted },
+      { path: `${dir}/${PART_FILE}`, rows: inserted },
     );
   } catch (e) {
     // 归档失败**不影响落库**（查询不依赖 Parquet），但绝不静默 —— 回传 archived=false 并留痕

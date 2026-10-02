@@ -5,6 +5,7 @@
  * 导入与查询用**不同连接**，靠 MVCC 让读不被写阻塞。
  */
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
+import { PARQUET_ROOT } from './compact.ts';
 import { DDL } from './schema.ts';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,8 +28,8 @@ export async function open(dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb') {
   if (instance) return;
   openedPath = dbPath;
 
-  // 确保归档目录存在
-  fs.mkdirSync(path.join('data/parquet'), { recursive: true });
+  // 确保归档目录存在（路径常量只有一份，见 db/compact.ts）
+  fs.mkdirSync(path.join(PARQUET_ROOT), { recursive: true });
 
   instance = await DuckDBInstance.create(dbPath, {
     // 财务数据敏感：禁用外部访问，避免 SQL 里意外读到任意文件

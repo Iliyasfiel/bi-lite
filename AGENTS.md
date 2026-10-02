@@ -150,7 +150,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，386 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，395 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -159,7 +159,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   （条数以实跑输出为准）：模板指纹 → **CLI 解析层与命令表** → 开库 → 接入规格干跑 → 落库 →
   spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 → 语义层 →
   图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，§8.2 ④）** → **skill export 与手册对拍（§8.2 ①）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -270,13 +270,15 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
     对不上就抛错、`archived` 置 false。
     **推论（比这条本身重要）**：`exportParquet()` 是**跨进程也会改变库状态边界**的操作。
     "同进程内、只读、用完即弃"这套说辞（备忘 5 末尾的"唯一例外"）**不成立** —— 别再照着它推理。
+    **对照（2026-10-02 补）**：`db/compact.ts` 的归档合并开的是 `:memory:` 实例 —— 它**不打开库文件**，
+    所以既不需要 `reattach()`，也不会把锁弄丢。**要碰库文件才需要上面那套舞蹈；不需要碰就别碰。**
 
 ## 5. 架构地图
 
 ```
 src/
   cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §7）
-                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · validate · skill export
+                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · validate · skill export
                    （`scanArgs` 是唯一的参数扫描器）
                    ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`（顶层有没有 source）
                    ★ 解析层 parseCliArgs() 是纯函数 —— 不启动任何东西即可覆盖整个命令面
@@ -317,6 +319,11 @@ src/
                    + exportParquet()（★ 只读实例写归档 → **归档后重开主实例把库锁拿回来**（`reattach()`）
                      → **写完读回来数一遍**；见铁律 11 与 §4 备忘 13）
                    —— 单进程双连接；query() 已处理 BigInt 与 JSON 解析
+    compact.ts     ★ Parquet 归档的小文件合并（R8）：只按**文件大小**挑候选（≥ 2 个才动手 —— 否则会来回重写）
+                   + **先逐 batch_id 对拍、再删源文件**；对不上就抛错，一个源文件都不删
+                   + 0 行的归档残骸**不动它**、单独报出来（那是过去某次归档失败的证据，不是垃圾）
+                   ★ 它开的是 `:memory:` 实例 —— **不碰库文件、也不碰库锁**，服务端在跑时也能合并
+                     （与 exportParquet() 的锁舞蹈刻意不同：那边必须碰库，这边一个字节都不读库）
   ingest/          ★ 接入层：源 Excel（任意形态）→ 星型表。YAML 由 agent 产出，这里只确定性执行
     types.ts       IngestSpec 类型 + parseIngestSpec() + lintIngest() + diagnoseIngest()
                    ★ 判据只有一份（与 spec/lint.ts 同理）；口径从调用方注入，不 import PERIOD_TYPES
@@ -435,7 +442,7 @@ data/              ⚠️ 真实财务数据，永不提交
 | CLI 入口 | 🚧 **引擎侧 + 物料侧已落地**（`src/cli.ts` + `bin`：`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show`。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出**。`validate` / `skill export` 也已挂（§7.1 的命令面走完了）—— 见 `docs/开发计划.md` §7） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**386 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**395 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
 （含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
 第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。
@@ -447,10 +454,10 @@ data/              ⚠️ 真实财务数据，永不提交
   ⚠️ `resolve.ts` 同轮搬进了 `src/ingest/`，`src/import/` 目录随之消失 —— 旧路径至此**零残留**。
 - ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
   1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
-- ⏸ **已推后（用户 2026-10-01 拍板，见 `docs/开发计划.md` §6「已定（不再讨论）」）**：生成器侧
-  `bilite plan/apply`（P2）、SCD2、`fact_business_line`（它没东西可填 —— 要写进业务线事实表得先把
-  「目标表」变成声明，而那正是被推后的生成器那部分）、§10 R8 Parquet compaction（按每月一批算两年
-  ≈ 24 个 ~7.7KB 文件，无可观察到的问题）。**不要把它们当待办捡起来。**
+- ⏸ ~~已推后（用户 2026-10-01 拍板）~~ → **2026-10-02 用户重新拍板：这四项重新开工**
+  （见 `docs/开发计划.md` §6 与 §17）。① **§10 R8 Parquet compaction 已落**（`src/db/compact.ts` +
+  `bilite compact`，第 29 阶段 8 条断言）；② 生成器 `bilite plan/apply`（P2）、③ `fact_business_line`
+  （依赖 ② 的声明层）、④ SCD2 —— 依次进行中。
 
 **§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
 真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），

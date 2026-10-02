@@ -70,6 +70,15 @@ export type Invocation =
     }
   | { kind: 'catalog-dump'; format: 'json' | 'prompt' }
   | { kind: 'catalog-show'; object: string }
+  | {
+      kind: 'compact';
+      /** 空的 = 归档里**所有**表（`data/parquet/` 下的目录名） */
+      tables: string[];
+      /** null = 用模块自己的默认值（默认值只允许有一份，在 `db/compact.ts`） */
+      maxBytes: number | null;
+      minFiles: number | null;
+      dryRun: boolean;
+    }
   | { kind: 'validate'; specFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
@@ -99,6 +108,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'render') return parseRenderArgs(tokens.slice(1));
   if (first === 'query') return parseQueryArgs(tokens.slice(1));
   if (first === 'catalog') return parseCatalogArgs(tokens.slice(1));
+  if (first === 'compact') return parseCompactArgs(tokens.slice(1));
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
@@ -248,6 +258,46 @@ function parseCatalogArgs(tokens: readonly string[]): Invocation {
 }
 
 /**
+ * `compact` —— 合并 Parquet 归档里的小文件（架构 §10 R8）。
+ *
+ * ★ 它不是"库的命令"：归档目录不是库，合并只碰 `data/parquet/**`，用内存实例读它们，
+ *   **既不打开 `.duckdb` 文件、也不碰库锁** —— 所以服务端正在跑时也能跑（e2e 钉着"不碰库"）。
+ * ★ 表名判据**不在这里**：`--table` 的形状由 `compact.ts` 的 `assertSafeTableName()` 说了算，
+ *   这里只负责"给了几个"与"数字长得对不对"（判据只有一份，铁律 17）。
+ */
+function parseCompactArgs(tokens: readonly string[]): Invocation {
+  const hint = 'bilite compact --help';
+  if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'compact' };
+
+  const args = scanArgs(tokens, ['--table', '--max-bytes', '--min-files'], ['--dry-run'], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`compact 不接受位置参数（收到 ${args.positionals[0]}）—— 表名用 --table 给`, hint);
+  }
+
+  const positiveInt = (flag: string, min: number): number | null | Invocation => {
+    const raw = args.values[flag]?.[0];
+    if (raw === undefined) return null; // 交给模块自己的默认值
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < min) return usage(`${flag} 要写成 ≥ ${min} 的整数（收到 ${raw}）`, hint);
+    return n;
+  };
+  const maxBytes = positiveInt('--max-bytes', 1);
+  // ⚠️ `typeof null === 'object'` —— 少了 `!== null` 这一半，缺选项时会直接把 null 当 Invocation 返回
+  if (maxBytes !== null && typeof maxBytes === 'object') return maxBytes;
+  const minFiles = positiveInt('--min-files', 2);
+  if (minFiles !== null && typeof minFiles === 'object') return minFiles;
+
+  return {
+    kind: 'compact',
+    tables: args.values['--table'] ?? [],
+    maxBytes,
+    minFiles,
+    dryRun: '--dry-run' in args.values,
+  };
+}
+
+/**
  * `validate <yaml>` —— §8.2 的第 ④ 条接口：**可执行、带修复建议**的校验。
  *
  * ★ 它**不写新判据**。判据仍是那两份（接入规格 `diagnoseIngest` / 报表规格 `diagnoseSpec`），
@@ -374,6 +424,7 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'query',
   'catalog-dump',
   'catalog-show',
+  'compact',
   'validate',
   'skill-export',
 ];
@@ -644,6 +695,61 @@ export const COMMANDS: CliCommand[] = [
       jsonTo(io, o);
       io.err(`bilite catalog show: ${o.name}（${o.columns.length} 列 / ${o.rowCount ?? '?'} 行）\n`);
       return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'compact',
+    name: 'compact',
+    summary: 'Parquet 归档的小文件合并（R8）：先逐批次对拍再删源文件；不碰库、不碰库锁',
+    usage: 'bilite compact [--table <表名>]... [--max-bytes <n>] [--min-files <n>] [--dry-run]',
+    async run(inv, io) {
+      if (inv.kind !== 'compact') throw new Error('命令表与 Invocation 不匹配');
+      const { compactParquet, listArchiveTables, assertSafeTableName, suspectInputs } = await import('./db/compact.ts');
+
+      // 不给 --table 就是"归档里的所有表" —— 定期 compaction 就是 `bilite compact`
+      const tables = inv.tables.length > 0 ? inv.tables : listArchiveTables();
+      const results = [];
+      for (const t of tables) {
+        assertSafeTableName(t); // 判据在模块里，这里只是调用点
+        results.push(
+          await compactParquet(t, {
+            maxBytes: inv.maxBytes ?? undefined,
+            minFiles: inv.minFiles ?? undefined,
+            dryRun: inv.dryRun,
+          }),
+        );
+      }
+      const suspects = results.flatMap(suspectInputs);
+      jsonTo(io, {
+        dryRun: inv.dryRun,
+        tables,
+        results,
+        suspects,
+        note: inv.dryRun
+          ? 'dry-run：计划给你看，一个字节都没写。'
+          : '合并产物已逐批次对拍通过，源文件已删；没有候选的表是正常结果，不是失败。',
+      });
+      io.err(
+        `bilite compact: ` +
+          (results.length === 0
+            ? '归档里一张表都没有（data/parquet 是空的）\n'
+            : results
+                .map(
+                  (r) =>
+                    `${r.table} ` +
+                    (r.sources.length > 1
+                      ? inv.dryRun
+                        ? `会合并 ${r.sources.length} 个小文件`
+                        : `${r.sources.length} 个小文件 → 1`
+                      : '无候选'),
+                )
+                .join(' / ') + '\n') +
+          (suspects.length > 0
+            ? `⚠️ ${suspects.length} 个 0 行残骸没动（那多半是过去某次归档失败的证据）：${suspects.join('、')}\n`
+            : ''),
+      );
+      // 0 行残骸不是"合并成功"该有的样子 —— 让脚本能看见（铁律 12：不许安静）
+      return suspects.length > 0 ? EXIT.FAILED : EXIT.OK;
     },
   },
   {

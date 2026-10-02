@@ -103,6 +103,12 @@ log('\n════════ 0.5 CLI（解析层与命令表）════�
     [['ingest', 'lint', 'x.yaml', '--decisions', 'd.json'], 'usage-error'],
     [['ingest', 'lint', 'x.yaml', '--strict'], 'usage-error'],
     [['ingest', 'run', 'x.yaml', '--nope'], 'usage-error'],
+    [['compact'], 'compact'],
+    [['compact', '--dry-run'], 'compact'],
+    [['compact', '--table', 'fact_finance', '--max-bytes', '1024'], 'compact'],
+    [['compact', '--max-bytes', 'abc'], 'usage-error'],
+    [['compact', '--min-files', '1'], 'usage-error'],
+    [['compact', 'x'], 'usage-error'],
   ];
   const wrong = cases.filter(([argv, want]) => parseCliArgs(argv).kind !== want);
   check('★ parseCliArgs 是纯函数，命令面全覆盖', wrong.length === 0,
@@ -154,18 +160,25 @@ log('\n════════ 0.5 CLI（解析层与命令表）════�
   const os = await import('node:os');
   const pathMod = await import('node:path');
   const tmp = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'bilite-cli-'));
-  let helpOut = '';
-  let helpCode = 0;
-  try {
-    helpOut = execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), '--help'], {
-      cwd: tmp, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (e) {
-    helpCode = (e as { status?: number }).status ?? -1;
-  }
-  check('★ 子进程 `bilite --help` 在空目录里跑通', helpCode === 0 && helpOut.includes('用法'),
-    `code=${helpCode}`);
-  check('★ --help 不碰库（空目录里没生出 data/）', !fs.existsSync(pathMod.join(tmp, 'data')));
+  const cliOut = (args: string[]) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [pathMod.resolve('src/cli.ts'), ...args], {
+        cwd: tmp, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }) };
+    } catch (e) {
+      return { code: (e as { status?: number }).status ?? -1, out: '' };
+    }
+  };
+  const help = cliOut(['--help']);
+  // `compact` 合并的是**归档目录**，不是库 —— 所以空目录里它也跑得通，
+  //   而且同样不该生出 data/（它连 open() 都不需要，见 db/compact.ts 头部）。
+  const compact = cliOut(['compact', '--dry-run']);
+  check('★ 子进程 `bilite --help` 在空目录里跑通', help.code === 0 && help.out.includes('用法'),
+    `code=${help.code}`);
+  check('★ `bilite compact --dry-run` 在空归档上跑通：没有候选是**正常结果**，不是失败',
+    compact.code === 0 && (JSON.parse(compact.out) as { results: unknown[] }).results.length === 0,
+    `code=${compact.code}`);
+  check('★ --help 与 compact 都不碰库（空目录里没生出 data/）', !fs.existsSync(pathMod.join(tmp, 'data')));
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
@@ -2779,6 +2792,112 @@ log('\n════════ 28. CLI ingest dry-run / run（真读源、真�
   const d1904 = await cli(['ingest', 'run', 'test/fixtures/接入-日期格1904.yaml']);
   check('★ 引擎的响亮拒绝映射成退出码 1（不是"安静的 ok"），stderr 给出原因',
     d1904.code === 1 && /1904/.test(d1904.err), d1904.err.trim().slice(0, 60));
+}
+
+// ============ 29. Parquet 归档的小文件合并（R8 compaction）============
+log('\n════════ 29. Parquet 归档 compaction（R8）════════');
+{
+  // ★ 这一段守的是 R8：归档层是**只增不减**的 KB 级碎片（1000 行 ≈ 5KB，实测）。
+  //   合并本身不难，难的是"删源文件"那一步 —— 所以本阶段的判据重心全在**守卫**上：
+  //   ① 合并后逐 batch_id 与**合并前独立记下的行数**对上（不是只比总数：总数相等会掩盖"某个源是 0 行"）；
+  //   ② 对拍不过 → 抛错，**一个源文件都不删**、半个产物都不留；
+  //   ③ 没有候选是**正常结果**（退 0），不是失败；
+  //   ④ 0 行的残骸不动它、单独报出来、并让脚本看见（退 1）—— 它是过去某次归档失败的证据。
+  const cmp = await import('../src/db/compact.ts');
+  const { main } = await import('../src/cli.ts');
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+  interface OneResult {
+    table: string; merged: string | null; sources: string[]; rows: number;
+    perBatch: Record<string, number>; skipped: Array<{ dir: string; reason: string }>; note: string;
+  }
+  type CliOut = { tables: string[]; results: OneResult[]; suspects: string[] };
+  const snap = () => cmp.listArchiveDirs('fact_finance').map((d) => `${d.name}:${d.bytes}`).join('|');
+
+  const before = cmp.listArchiveDirs('fact_finance');
+  check('前置：磁盘上有 ≥ 2 个小归档目录（否则这一阶段什么都没验）', before.length >= 2, `${before.length} 个`);
+
+  // ★ 合并前先把"每个源文件里有多少行"独立记下来 —— 源文件马上就会被删掉，
+  //   而**对拍必须跟删除之前的事实比**（拿删除之后的磁盘去比是在自证）。
+  const preCounts = await cmp.countPerBatch(before.map((d) => d.file));
+  const preTotal = Object.values(preCounts).reduce((a, b) => a + b, 0);
+
+  // —— ① dry-run：计划给你看，一个字节都不动 ——
+  const beforeSnap = before.map((d) => `${d.name}:${d.bytes}`).join('|');
+  const dry = await runCli(['compact', '--dry-run']);
+  const dj = JSON.parse(dry.out) as CliOut;
+  check('★ `compact --dry-run` 报出候选与行数，但磁盘一个字节都没动',
+    dry.code === 0 && dj.results[0]!.sources.length === before.length &&
+      dj.results[0]!.rows === preTotal && dj.results[0]!.merged === null && snap() === beforeSnap,
+    `${dj.results[0]!.sources.length} 个候选 / ${dj.results[0]!.rows} 行 / 磁盘未变`);
+
+  // —— ② 真跑：合并 + 逐批次对拍 + 删源 ——
+  const real = await runCli(['compact']);
+  const rj = JSON.parse(real.out) as CliOut;
+  const res0 = rj.results[0]!;
+  const left = cmp.listArchiveDirs('fact_finance');
+  check('★ 合并成功：产物存在、源目录已删、只剩一个归档目录',
+    real.code === 0 && res0.merged !== null && fs.existsSync(`${res0.merged}/part.parquet`) &&
+      res0.sources.every((s) => !fs.existsSync(s)) && left.length === 1,
+    `${res0.sources.length} 个小文件 → 1（${left[0]?.name}）`);
+
+  const gotPairs = Object.entries(res0.perBatch).sort();
+  const wantPairs = Object.entries(preCounts).filter(([, n]) => n > 0).sort();
+  check('★★ 逐批次对拍：产物的 batch_id → 行数与**合并前独立记下的**那一份完全相同',
+    JSON.stringify(gotPairs) === JSON.stringify(wantPairs) && res0.rows === preTotal,
+    `产物 ${gotPairs.length} 个批次 / ${res0.rows} 行 vs 合并前 ${wantPairs.length} 个批次 / ${preTotal} 行`);
+
+  // —— ②' 再加一道**真独立**的算法：库里的同一批还在的，行数必须与产物一致 ——
+  const ids = gotPairs.map(([b]) => `'${b}'`).join(', ');
+  const fromDb = await db.query<{ batch_id: string; n: number }>(
+    `SELECT batch_id, count(*) AS n FROM fact_finance WHERE batch_id IN (${ids}) GROUP BY 1`,
+  );
+  const dbMap = new Map(fromDb.map((r) => [r.batch_id, Number(r.n)]));
+  const disagreed = [...dbMap].filter(([b, n]) => (res0.perBatch[b] ?? 0) !== n);
+  check('★★ 产物与**库**对拍（独立算法：直接 SQL 数事实行；历史上被 DELETE 过的批次不在库里，自动跳过）',
+    disagreed.length === 0 && dbMap.size > 0,
+    `${dbMap.size} 个仍在库里的批次逐一对上`);
+
+  // —— ③ 幂等：再跑就没有候选（而且这不是失败）——
+  const again = await runCli(['compact']);
+  const aj = JSON.parse(again.out) as CliOut;
+  check('★ 幂等：没有候选时 merged=null 且退 0（"没有可合并的"是正常结果）',
+    again.code === 0 && aj.results[0]!.merged === null && snap() === left.map((d) => `${d.name}:${d.bytes}`).join('|'),
+    aj.results[0]!.note);
+
+  // —— ④ ★ 守卫真的会抓：喂错的期望值 → 抛错，且一个源文件都不删、半个产物都不留 ——
+  const probe = 'data/parquet/_probe';
+  fs.mkdirSync(`${probe}/batch=g1`, { recursive: true });
+  fs.mkdirSync(`${probe}/batch=g2`, { recursive: true });
+  for (const g of ['g1', 'g2']) fs.copyFileSync(`${res0.merged}/part.parquet`, `${probe}/batch=${g}/part.parquet`);
+  const srcs = cmp.listArchiveDirs('_probe');
+  let guardErr = '';
+  try {
+    await cmp.mergeArchives(`${probe}/compacted=guard`, srcs, { g1: 1, g2: 1 }); // 故意错的期望值
+  } catch (e) { guardErr = (e as Error).message; }
+  check('★ 合并的守卫真的会抓：逐批次对不上 → 抛错，源一个不删、半个产物也不留',
+    /对不上/.test(guardErr) && srcs.length === 2 && srcs.every((s) => fs.existsSync(s.file)) &&
+      !fs.existsSync(`${probe}/compacted=guard`),
+    guardErr.slice(0, 70));
+  fs.rmSync(probe, { recursive: true, force: true });
+
+  // —— ⑤ 0 行残骸：不动它、报出来、退 1（R13 那种"安静的失败"要能被看见）——
+  //    造法是真的：用一条恒假的查询导出一份 0 行归档 —— 与过去那次失败留下的东西一模一样。
+  const EMPTY = 'data/parquet/fact_finance/batch=zz-empty';
+  fs.mkdirSync(EMPTY, { recursive: true });
+  await db.exportParquet(
+    `COPY (SELECT * FROM fact_finance WHERE 1 = 0) TO '${EMPTY}/part.parquet' (FORMAT parquet)`,
+  );
+  const sus = await runCli(['compact']);
+  const sj = JSON.parse(sus.out) as CliOut;
+  check('★ 0 行残骸：不参与合并、不被删、单独报出来，并且**退 1**（安静的残骸是最坏的那种）',
+    sus.code === 1 && sj.suspects.length === 1 && sj.suspects[0] === EMPTY &&
+      fs.existsSync(`${EMPTY}/part.parquet`),
+    `${sj.suspects.length} 个残骸 | code=${sus.code} | ${sus.err.trim().slice(0, 50)}`);
+  fs.rmSync(EMPTY, { recursive: true, force: true });
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——

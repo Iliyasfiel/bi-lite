@@ -6,7 +6,7 @@
 **两个方向**：Excel →（**接入规格**）→ 本地 DuckDB 星型库 →（**报表规格**）→ 按模板渲染的报送 Excel / 图表。
 **三个入口**：**MCP + skill**（agent 与你对话，把模糊模板敲成规格）、**Web**（浏览器三个页签）、
 **CLI**（`bilite`，给人与脚本：`ingest lint|dry-run|run` · `render` · `query` · `catalog dump|show` ·
-`validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
+`compact` · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
 
 财务数据**不以明文进入 LLM 上下文**——这不是靠过滤，是靠架构：agent 根本没有 SQL 权限，
 它只能产出**规格（spec）**，数值第一次出现是在你自己的浏览器里。
@@ -36,7 +36,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 386 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 395 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -304,7 +304,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 386 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 395 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -350,7 +350,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，386 项断言
+npm run e2e        # ★ 唯一门禁，395 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
