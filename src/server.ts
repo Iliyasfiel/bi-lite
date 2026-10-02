@@ -16,7 +16,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import * as db from './db/index.ts';
 import type { DimDecision } from './ingest/types.ts';
-import { normalizeName, type DimKind } from './import/resolve.ts';
+import { normalizeName, type DimKind } from './ingest/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
@@ -157,7 +157,7 @@ const routes: Record<string, Handler> = {
 
   /** 别名映射清单（§10 R1）—— 人确认过一次的写法，下月自动命中 */
   'GET /api/aliases': async (_req, res) => {
-    const { listAliases } = await import('./import/resolve.ts');
+    const { listAliases } = await import('./ingest/resolve.ts');
     json(res, 200, await listAliases());
   },
 
@@ -174,7 +174,7 @@ const routes: Record<string, Handler> = {
     if (kind !== 'company' && kind !== 'metric') return json(res, 400, { error: 'kind 必须是 company 或 metric' });
     if (!raw || !targetId) return json(res, 400, { error: '缺少 raw 或 targetId' });
 
-    const { registerAlias, loadEntities } = await import('./import/resolve.ts');
+    const { registerAlias, loadEntities } = await import('./ingest/resolve.ts');
     // 目标必须真实存在 —— 否则会造出一条指向虚空的别名，将来更难查
     const target = (await loadEntities(kind)).find((e) => e.id === targetId);
     if (!target) return json(res, 400, { error: `目标主数据不存在: ${targetId}` });

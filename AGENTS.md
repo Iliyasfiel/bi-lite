@@ -110,7 +110,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
     判维要求**全部标签命中**某维度，不许"半数像就算"。
     公式行必须**先排除、再判维**（首版顺序反了，导致「合计」行的标签被送去匹配指标表而失败）。
 16. **主数据归并分两档；不确定就停下问人，绝不"按相似度自动合并"。**
-    立场（`src/import/resolve.ts` 头部）：**合并两家公司比不合并危险得多** ——
+    立场（`src/ingest/resolve.ts` 头部）：**合并两家公司比不合并危险得多** ——
     不合并时数字明显不对（少了一半），人会来查；错合并时两家的钱被静默加在一起，
     **报表看起来完全正常，没人会来查**。因此：
     - **Tier 1 自动**：仅 `normalizeName()` 后完全相同（全角/空白/括号/大小写 = **格式噪音**），
@@ -333,15 +333,14 @@ src/
                    ★ 阶段 2 的全部库写包在 **BEGIN/COMMIT** 里（Parquet 归档在 COMMIT 之后 ——
                      它另开实例拿锁，事务里拿不到）。中途失败整体回滚，不留半个批次
                    ★ `dimIdOf()` 取不到维度 id 当场抛 —— 否则 lit(undefined) 会写出 `'undefined'` 脏 id
-    normalize.ts   toHalfWidth/normalizeName/stemCompany（从 import/resolve.ts 搬来，判重与归并共用）
-    master.ts      masterCatalog()：主数据快照的唯一实现（MCP 工具与 Web 路由共用，防判据漂移）
-  import/          ⚠ 只剩一个文件（旧长表导入已退场：longtable.ts 与三条 /api/import/* 路由都删了）
-    resolve.ts     ★ 两档主数据归并（铁律 16）
+    normalize.ts   toHalfWidth/normalizeName/stemCompany（判重与归并共用）
+    resolve.ts     ★ 两档主数据归并（铁律 16）—— 原在 import/，2026-10-01 搬进接入层
                    + normalizeName()（去格式噪音，Tier 1 判据）
                    + stemCompany()（剥公司形式后缀，仅用于生成候选）
                    + buildResolver() / candidates()（候选必带 why）
                    + registerAlias() / listAliases() / describeUnresolved()
                    + 立场：合并两家公司比不合并危险得多
+    master.ts      masterCatalog()：主数据快照的唯一实现（MCP 工具与 Web 路由共用，防判据漂移）
   spec/
     types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
                    + parseSpecLenient()（解析但不校验，给诊断用）
@@ -410,7 +409,7 @@ data/              ⚠️ 真实财务数据，永不提交
 
 **数据流**：Excel（任意形态）→（`land/` 着陆 → `ingest/` 按接入规格展开，不经 LLM）→ DuckDB
 →（`spec/` 编译成 SQL，本地执行）→ 结果矩阵 →（`render/`）→ 报送 Excel 或 ECharts option。
-*（旧长表路径 `import/longtable.ts` 已于 2026-10-01 退场；`import/resolve.ts` 保留 —— 接入层在用它。）*
+*（旧长表路径 `import/` 已于 2026-10-01 **整体**退场：longtable.ts 删了、resolve.ts 搬进 `ingest/`。）*
 **agent 只参与产出 spec，从不接触数值。**
 
 **两条"给 agent 看不给数值"的对称设计**（新增返回数据的接口时照这个套路）：
@@ -443,7 +442,7 @@ data/              ⚠️ 真实财务数据，永不提交
 - ~~`src/import/` 退场~~ → **已完成（2026-10-01，三片全绿）**：`longtable.ts`、三条 `/api/import/*` 路由、
   旧导入页与旧断言都删了，并补了**退场守卫**（旧路由必须 404、首页不许留旧控件）。
   第 26 阶段的对拍改为对**冻结快照**（`test/expected/集团导出长表-960行.json`）。
-  ⚠️ `src/import/resolve.ts` **保留**（接入层在用它）—— 要搬进 `src/ingest/` 是**另一刀**。
+  ⚠️ `resolve.ts` 同轮搬进了 `src/ingest/`，`src/import/` 目录随之消失 —— 旧路径至此**零残留**。
 - ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
   1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
 - ⏸ **已推后（用户 2026-10-01 拍板，见 `docs/开发计划.md` §6「已定（不再讨论）」）**：生成器侧

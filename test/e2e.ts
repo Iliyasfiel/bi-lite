@@ -1481,7 +1481,7 @@ sheets:
 // ============ 15. 主数据对齐（§10 R1）============
 log('\n════════ 15. 主数据对齐（R1）════════');
 {
-  const R = await import('../src/import/resolve.ts');
+  const R = await import('../src/ingest/resolve.ts');
   const { parseIngestSpec } = await import('../src/ingest/types.ts');
   const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
   const { runIngest } = await import('../src/ingest/run.ts');

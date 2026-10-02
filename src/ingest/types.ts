@@ -18,7 +18,7 @@
  */
 import { parse as parseYaml } from 'yaml';
 import { DIM_NAMES, isRegisteredDim } from '../spec/dims.ts';
-import type { DimKind } from '../import/resolve.ts';
+import type { DimKind } from './resolve.ts';
 
 // ---------------- 列号工具（Excel 列字母 ↔ 序号） ----------------
 

@@ -28,7 +28,7 @@ import {
   normalizeName,
   type DimKind,
   type UnresolvedName,
-} from '../import/resolve.ts';
+} from './resolve.ts';
 import { dryRunIngest, type IngestFactRow, type IngestShape, type MasterCatalog } from './dryrun.ts';
 import type { DimDecision, IngestIssue, IngestSpec } from './types.ts';
 

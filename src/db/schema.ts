@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS fact_contract (
 -- ---------- 主数据别名映射（§10 R1）----------
 -- 人确认过一次的写法记在这里，下个月自动命中，不再问第二遍。
 -- normalized 是 normalizeName() 的结果（只去格式噪音，不改语义）——
--- 见 src/import/resolve.ts 的注释：合并比不合并危险得多，所以只有规范化相等才自动归并。
+-- 见 src/ingest/resolve.ts 的注释：合并比不合并危险得多，所以只有规范化相等才自动归并。
 CREATE TABLE IF NOT EXISTS dim_alias (
   kind       VARCHAR NOT NULL,   -- company / metric
   normalized VARCHAR NOT NULL,   -- 规范化后的写法（命中键）
