@@ -35,7 +35,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 960 行长表）
-npm run e2e             # ★ 247 项断言全流程验收
+npm run e2e             # ★ 370 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -338,7 +338,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，231 项断言，15 个阶段
+npm run e2e        # ★ 唯一门禁，370 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```

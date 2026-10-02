@@ -176,6 +176,42 @@ fs.rmSync('data/parquet', { recursive: true, force: true });
 await db.open('data/bi.duckdb');
 check('DuckDB 打开 + 建表', true);
 
+// —— 自包含守卫：本测试跑用到的接入规格，**规格与它的源文件都必须真的在** ——
+//    （都在 test/fixtures/ 下，由 `npm run fixtures` 生成；`test/fixtures/` 是 gitignore 的生成物。）
+//    ★ 判例（2026-10-02）：第 19 阶段曾借**生产规格** `ingest/月度经营接入.yaml`，
+//      而它的 source 是 gitignored 的真实数据 —— 作者本机全绿、**干净克隆 364/1**。
+//      公开仓库的验收脚本不该有"作者本机才有那份数据"这种前置条件。
+{
+  const { parseIngestSpec: parseFixture } = await import('../src/ingest/types.ts');
+  const fixtureSpecs = [
+    'test/fixtures/月度经营接入.yaml',
+    'test/fixtures/集团导出长表.yaml',
+    'test/fixtures/接入-对齐1.yaml',
+    'test/fixtures/接入-对齐2.yaml',
+    'test/fixtures/接入-对齐3.yaml',
+    'test/fixtures/接入-对齐4.yaml',
+    'test/fixtures/接入-对齐5.yaml',
+    'test/fixtures/接入-日期格.yaml',
+    'test/fixtures/接入-日期格1904.yaml',
+  ];
+  const bad = fixtureSpecs.filter(
+    (y) => !fs.existsSync(y) || !fs.existsSync(parseFixture(fs.readFileSync(y, 'utf8')).source),
+  );
+  check('★ e2e 用的夹具规格都自包含（规格与它的源都在 —— 不借 data/ 里的私有数据）',
+    bad.length === 0, bad.length ? `缺：${bad.join('、')}` : `${fixtureSpecs.length} 份都齐`);
+
+  // 再钉一条：本文件里**不许**出现「读 `ingest/` 下的规格去跑」的写法。
+  //   上一条只保证"我列的那几份夹具齐"；这一条挡的是"又有人新借一份生产规格"——
+  //   对 `ingest/` 的使用只许停在 lint / validate / 列表（那几件事都不读源文件）。
+  const selfText = fs.readFileSync('test/e2e.ts', 'utf8');
+  const borrows = /readFileSync\(\s*['"]ingest\//.test(selfText);
+  check('★ e2e 不把生产规格（ingest/ 下的）当运行输入（只许 lint / validate / 列表）',
+    !borrows,
+    borrows
+      ? '本文件里仍有「读 ingest/ 下的规格」的写法 —— 那种规格的源在 data/ 里，干净克隆跑不通'
+      : '对 ingest/ 只用 lint / validate / 列表（那几件事都不读源文件）');
+}
+
 // ============ 2. 接入规格：干跑（形状与判定，一次库都不写）============
 log('\n════════ 2. 接入规格（干跑）════════');
 // ★ 种子数据改由**新接入路径**灌（原来是旧长表路径的 `stage()` / `commit()`）。
@@ -1858,7 +1894,12 @@ log('\n════════ 19. 装载事务化（不留半个批次）═�
   const { runIngest } = await import('../src/ingest/run.ts');
   const { parseIngestSpec } = await import('../src/ingest/types.ts');
   const { masterCatalog } = await import('../src/ingest/master.ts');
-  const spec = parseIngestSpec(fs.readFileSync('ingest/月度经营接入.yaml', 'utf8'));
+  // ★ 用**夹具规格**，不是 `ingest/月度经营接入.yaml` —— 那份是生产规格，源在 data/ 里、不在库里。
+  //   判例（2026-10-02；第 17 阶段当时改对了，这里漏了）：借生产规格时，**干净克隆里这一阶段根本不抛错** ——
+  //   源文件不存在 → `runIngest` 在关卡 0 就返回 SOURCE_NOT_FOUND，走不到阶段 2 的抛点，
+  //   于是「中途失败确实抛错」在作者本机绿、在干净克隆红（364/1）。
+  //   **测试借生产数据 = 门禁依赖作者本机**，公开仓库不该这样。
+  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8'));
   const counts = async () => {
     const one = async (t: string) =>
       Number((await db.query<{ n: number }>(`SELECT count(*) AS n FROM ${t}`))[0]!.n);
@@ -2606,22 +2647,25 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
-//   ★ 这一条把一条**人工纪律**变成断言：`AGENTS.md` §3/§6 与 `docs/需求与架构.md` §11.1
-//     都写着条数，而"改了断言要同步条数"这条规矩在本项目里**漂过两次**
-//     （231 与 247 对不上过一次，根因就是没人管它）。现在改了断言却忘同步，e2e 自己会红，
-//     失败信息直接把三处该改成多少告诉你。
+//   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
+//     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 那两处一直没人管**：
+//     2026-10-02 我在这条断言里加进 README 时，它还写着 247 与「231 项断言，15 个阶段」。
+//     根因就是"没人管"—— 所以交给门禁：改了断言却忘同步，红的是 e2e，并告出五处各是多少。
 {
   const actual = pass + fail + 1; // +1 = 这一条本身（先算进来，否则每次都比实际少 1）
-  const readNum = (file: string, re: RegExp) => {
-    const m = re.exec(fs.readFileSync(file, 'utf8'));
-    return m ? Number(m[1]) : null;
-  };
-  const at3 = readNum('AGENTS.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/);
-  const at6 = readNum('AGENTS.md', /\*\*(\d+) 项 e2e 断言\*\*/);
-  const atArch = readNum('docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/);
-  check('★ 三处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
-    at3 === actual && at6 === actual && atArch === actual,
-    `实际 ${actual}；AGENTS §3=${at3}、AGENTS §6=${at6}、需求与架构 §11.1=${atArch}`);
+  const spots: Array<[file: string, re: RegExp, label: string]> = [
+    ['AGENTS.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/, 'AGENTS §3'],
+    ['AGENTS.md', /\*\*(\d+) 项 e2e 断言\*\*/, 'AGENTS §6'],
+    ['docs/需求与架构.md', /\*\*(\d+) 项断言全通过\*\*/, '需求与架构 §11.1'],
+    ['README.md', /npm run e2e\s+#[^\n]*?(\d+) 项断言/, 'README 快速开始'],
+    ['README.md', /唯一门禁，(\d+) 项断言/, 'README 命令表'],
+  ];
+  const got = spots.map(([f, re, label]) => {
+    const m = re.exec(fs.readFileSync(f, 'utf8'));
+    return `${label}=${m ? Number(m[1]) : '（没匹配到）'}`;
+  });
+  check('★ 五处文档写的断言条数与实际一致（把"改了断言要同步条数"这条纪律变成断言）',
+    got.every((s) => s.endsWith(`=${actual}`)), `实际 ${actual}；${got.join('、')}`);
 }
 
 // ============ 汇总 ============
