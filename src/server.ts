@@ -115,7 +115,16 @@ async function diagIngest(text: string) {
   };
 }
 
-const routes: Record<string, Handler> = {
+/**
+ * 路由表 —— 唯一的"这个服务有哪些入口"清单。
+ *
+ * ★ 导出是为了让它**可断言**：e2e 拿它跟 `src/web/app.js` 里 fetch 的路径对一遍，
+ *   保证"页面调的每个路径都真的存在"。加这一条是因为一次真实事故：删旧路由时我用行号
+ *   切注释块，把 `GET /api/specs` 连注释一起切没了（未闭合的 `/**` 把它注释掉了）——
+ *   `node --check` 通过、e2e 全绿，最后是**浏览器里那个 404** 喊出来的。
+ *   现在那条洞从"页面这一侧"被堵上（见 e2e 第 12 阶段）。
+ */
+export const routes: Record<string, Handler> = {
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
   'GET /api/catalog': async (_req, res) => {
     json(res, 200, await catalog());
