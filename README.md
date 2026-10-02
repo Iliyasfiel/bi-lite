@@ -65,13 +65,20 @@ npm start               # 打开 http://127.0.0.1:4319
 ### 导入
 
 从公司平台导出的长表，表头是 `财务期 | 公司名称 | 指标名称 | 口径 | 金额`。
-上传后先做 STAGED 校验（**不写库**），确认无误再提交：
+先上传源文件，再按一份**接入规格**干跑（**不写库**）、确认无误后落库：
 
 ```bash
-# e2e 里就是这么调的（Web 界面同理，只是走浏览器）
-curl -X POST http://127.0.0.1:4319/api/import/stage \
+# 1. 上传源文件（只落盘，不解析不落库）
+curl -X POST http://127.0.0.1:4319/api/ingest/upload \
   -H "x-filename: $(python3 -c 'import urllib.parse;print(urllib.parse.quote("集团导出长表.xlsx"))')" \
   --data-binary @test/fixtures/集团导出长表.xlsx
+
+# 2. 干跑：只回形状与主数据判定，一次库都不写
+curl -s -X POST http://127.0.0.1:4319/api/ingest/dry-run \
+  -H 'content-type: application/json' \
+  -d '{"yaml":"id: 试跑\nsource: test/fixtures/集团导出长表.xlsx\nsheets: []"}'
+
+# 3. 落库（Web 向导同理，只是走浏览器点按钮）
 ```
 
 > 上传不用 multipart（省依赖）：原始二进制 body + `X-Filename` 头。
@@ -90,21 +97,23 @@ curl -X POST http://127.0.0.1:4319/api/import/stage \
 | **Tier 2** 需确认 | 去壳后字号相同 / 名称互相包含 / 写法相近 | 只给**候选 + 判断依据**，由人拍板 |
 
 ```bash
-# 看看这批名字里哪些需要人决定（不写库）
-curl -s -X POST http://127.0.0.1:4319/api/import/suggest \
+# 看看这批名字里哪些需要人决定（干跑，一次库都不写）
+curl -s -X POST http://127.0.0.1:4319/api/ingest/dry-run \
   -H 'content-type: application/json' \
-  -d '{"names":[{"kind":"company","raw":"华东分公司"}]}'
-# → 候选：华东子公司（字号相同（剥掉「有限公司」「集团」等形式后缀后一致））
+  -d '{"yaml":"...接入规格 YAML..."}'
+# → needsDecision：[{ kind: company, raw: 华东分公司, candidates: [...] }]
 
-# 人确认一次，永久记住
+# 人确认一次，永久记住（手工登记一条别名；目标必须真实存在）
 curl -s -X POST http://127.0.0.1:4319/api/aliases \
   -H 'content-type: application/json' \
   -d '{"kind":"company","raw":"华东分公司","targetId":"c_xxx","note":"2026-06 起改名"}'
+
+# 落库时把决定带上：POST /api/ingest/run { yaml, decisions: [{ kind, raw, action: "merge", targetId }] }
 ```
 
 **为什么不是"按相似度自动合并"**：不合并时数字明显不对（少了一半），人会来查；
 **错合并时两家的钱被静默加在一起，报表看起来完全正常，没人会来查**。
-所以宁可停下问人。有歧义时接口返 **HTTP 200 + `pendingConfirm: true`**，一行都不落库 ——
+所以宁可停下问人。有歧义时落库返回 **HTTP 200 + `needsDecision`**（待确认清单），一行都不落库 ——
 那是待办，不是失败；Web 导入页会把待确认的名字渲染成卡片，选「并入已有」或「确认是新建」。
 
 ### 写一条报送规格
