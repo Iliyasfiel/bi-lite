@@ -1,5 +1,5 @@
 /**
- * 维度版本行（SCD2 之二的 **类型 2**）—— `docs/需求与架构.md` §4.1、`docs/开发计划.md` §20。
+ * 维度版本行（SCD2 之二的 **类型 2**）—— `docs/需求与架构.md` §4.1、`docs/开发计划.md` §1.3。
  *
  * ★ 形状：**历史挂在侧表**（`dim_company_hist` / `dim_metric_hist`），`dim_company` / `dim_metric`
  *   仍然是**当前态的唯一真相**。为什么不把版本行塞进维表本身（PK 改成 `(id, valid_from)`）：

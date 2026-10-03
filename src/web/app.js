@@ -41,7 +41,7 @@ window.addEventListener('hashchange', hashTab);
 // ═══════════════ 1. 数据导入 ═══════════════
 //
 // **只有一条路**：接入规格（`src/ingest/`）—— 形状写在 YAML 里，换一份表不用改代码。
-// （旧的"长表导入"页与它背后的 `src/import/longtable.ts` 已退场，见 docs/开发计划.md §10。）
+// （旧的"长表导入"页与它背后的 `src/import/longtable.ts` 已退场，见 docs/开发计划.md §1.1。）
 // 前端**不做任何判据** —— 诊断、干跑、落库都调服务端那几条路由，它们又都调
 // `diagnoseIngest` / `runIngest`。页面只负责把结论摆清楚，否则判据就漂了（铁律 17）。
 
