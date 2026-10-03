@@ -35,10 +35,11 @@
  * 因此它的诊断结果可以安全地进 LLM 上下文（铁律 1）。
  */
 import type { Spec, Block, SheetSpec } from './types.ts';
-import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
+import { DIMENSIONS, DIM_NAMES, dimAvailableOn, isRegisteredDim, type DimName } from './dims.ts';
 import { exprRefs, ExprError, parseExpr } from './expr.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { lintAnchorGeometry } from './geometry.ts';
+import type { DeclaredFact } from '../gen/ir.ts';
 
 export type LintLevel = 'error' | 'warn';
 
@@ -59,7 +60,9 @@ export interface LintIssue {
     | 'ANCHOR_MISSING'
     | 'ANCHOR_BAD'
     | 'SHEET_NO_BLOCK'
-    | 'NO_ID_OR_SHEET';
+    | 'NO_ID_OR_SHEET'
+    | 'FACT_UNKNOWN'
+    | 'DIM_NOT_ON_FACT';
   /** 出问题的位置，人能直接对着 YAML 找（如 `sheets[0].blocks[1]`） */
   at: string;
   message: string;
@@ -140,8 +143,31 @@ function checkFilter(
   }
 }
 
-/** 诊断单个 block */
-function lintBlock(b: Block, at: string, out: LintIssue[]) {
+/**
+ * 诊断单个 block。
+ *
+ * `fact` 是**已解析的目标表声明**（spec.fact 在 models 里找到的那份；null = 缺省 fact_finance 形状）；
+ * `shapeKnown` 为 true 才做"按目标表形状"的检查（维度可用性、量纲维豁免）——
+ * 它要求：调用方注入了 facts，且 spec.fact 解析成功（未写 fact 也算解析成功=缺省表）。
+ * shapeKnown=false 时退回老判据（全量量纲维、不查可用性）：解析层不读盘，
+ * 没注入 facts 就没有资格对目标表形状下结论 —— 白名单的硬墙在 compile/query 的编译期。
+ */
+function lintBlock(b: Block, at: string, out: LintIssue[], fact: DeclaredFact | null, shapeKnown: boolean) {
+  const factLabel = fact?.name ?? 'fact_finance（缺省）';
+  /** 维度在目标表上不可用的统一文案（轴与 scope.filter 共用） */
+  const notOnFact = (dim: DimName, issueAt: string) =>
+    out.push({
+      level: 'error',
+      code: 'DIM_NOT_ON_FACT',
+      at: issueAt,
+      message: `目标表 ${factLabel} 没有「${dim}」这个维度。`,
+      hint:
+        dim === 'period_type'
+          ? '这张表没有口径列 —— 运营事实表没有财务的"本年累计/单月"这套口径体系（铁律 8）。'
+            + '去掉 period_type 轴/filter，或把 spec.fact 换成带口径列的事实表。'
+          : `目标表由 spec.fact 声明，可用的维度随表走（${factLabel} 的声明里没有这一列）。`,
+    });
+
   // ★ 锚点判据只有一份（geometry.ts 的 lintAnchorGeometry）—— 接入侧 lintIngest 调的是同一个
   for (const i of lintAnchorGeometry(b.anchor, at, { named: true })) out.push(i);
 
@@ -165,6 +191,9 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
         message: `未注册的维度「${spec.dim}」。`,
         hint: `只能取 ${DIM_NAMES.join(' / ')}。写成已注册的名字，否则查询会报错。`,
       });
+    } else if (shapeKnown && !dimAvailableOn(spec.dim, fact)) {
+      // 维度注册了，但目标表的声明里没有这一列（如财务表配 business_line 轴、运营表配口径轴）
+      notOnFact(spec.dim, `${at}.${axis}.dim`);
     }
     // order 是显式清单 —— 留空会退化成"整张表"，数字会随数据增长而变化
     const order = spec.order ?? [];
@@ -212,7 +241,11 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
   }
 
   // ---- 量纲维必须被钉住（本模块存在的主要理由，见文件头 ①）----
-  for (const dim of MEANING_DIMS) {
+  // ★ 注入 facts 时集合随**目标表的形状**走：没有口径列的表（运营事实，铁律 8）只要求钉住
+  //   指标 —— 否则每个运营报表都得假装有一个不存在的口径维。
+  //   没注入时保持老判据（metric + period_type 全查）—— finance 规格的静默加总照样拦。
+  const meaning = shapeKnown ? MEANING_DIMS.filter((d) => dimAvailableOn(d, fact)) : MEANING_DIMS;
+  for (const dim of meaning) {
     if (isPinned(b, dim)) continue;
     const axisHint =
       dim === 'metric'
@@ -303,6 +336,10 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
         });
         continue;
       }
+      if (shapeKnown && !dimAvailableOn(dim, fact)) {
+        notOnFact(dim, `${at}.scope.filter.${dim}`);
+        continue;
+      }
       checkFilter(f, dim, `${at}.scope.filter.${dim}`, out);
     }
   }
@@ -331,9 +368,35 @@ function lintBlock(b: Block, at: string, out: LintIssue[]) {
  * 返回值按 level 排序（error 在前），方便人先看要紧的。
  * `parseSpec` 只在有 error 时抛；这个函数的完整清单给 lint_spec 工具与 Web 诊断面板用
  * —— 人需要看到"哪些是提醒、哪些是必须改"。
+ *
+ * `opts.facts` 是调用方注入的**声明过的事实表**（`gen/parse.ts` 的 declaredFactsOf()，
+ * 与接入侧 diagnoseIngest 的 facts 注入同一条纪律 —— 本模块不读盘）。
+ * 不注入时跳过"按目标表形状"的检查（FACT_UNKNOWN / DIM_NOT_ON_FACT）：
+ * lint 是参谋，白名单的硬墙在 compile/query 的编译期 —— 解析期读盘会把纯函数变成 IO。
  */
-export function lintSpec(spec: Spec): LintIssue[] {
+export function lintSpec(spec: Spec, opts: { facts?: DeclaredFact[] } = {}): LintIssue[] {
   const out: LintIssue[] = [];
+
+  // ---- 目标表声明化：spec.fact 必须是声明过的事实表 ----
+  // ★ 注入了 facts 才做声明校验与形状检查（shapeKnown）——解析层不读盘，
+  //   这是调用方的纪律（server/tools/cli 的入口都注入了 declaredFactsOf()）。
+  const facts = opts.facts;
+  let fact: DeclaredFact | null = null;
+  let factUnknown = false;
+  if (facts && typeof spec?.fact === 'string' && spec.fact.trim() !== '') {
+    fact = facts.find((f) => f.name === spec.fact) ?? null;
+    if (!fact) {
+      factUnknown = true;
+      out.push({
+        level: 'error',
+        code: 'FACT_UNKNOWN',
+        at: 'fact',
+        message: `目标表未声明：${spec.fact}。表名会原样拼进 SQL（铁律 2），只接受 models/*.yml 里声明过的事实表（kind: fact）。`,
+        hint: `已声明的事实表：${facts.map((f) => f.name).join(' / ')}。`,
+      });
+    }
+  }
+  const shapeKnown = !!facts && !factUnknown;
 
   if (!spec?.id) out.push({ level: 'error', code: 'NO_ID_OR_SHEET', at: 'id', message: '缺少 id。', hint: 'id 是保存时的文件名，也是报表的标识。' });
   if (!Array.isArray(spec?.sheets) || spec.sheets.length === 0) {
@@ -354,7 +417,7 @@ export function lintSpec(spec: Spec): LintIssue[] {
       });
       return;
     }
-    sheet.blocks.forEach((b, j) => lintBlock(b, `${sat}.blocks[${j}]`, out));
+    sheet.blocks.forEach((b, j) => lintBlock(b, `${sat}.blocks[${j}]`, out, fact, shapeKnown));
   });
 
   // 模板路径：定了 anchor 为定义名称却没有模板 → 解析不出坐标

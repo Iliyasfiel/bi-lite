@@ -433,3 +433,60 @@ sheets:
 );
 console.log(`✅ 业务线接入源: ${BL_SRC}（${BL_ROWS.length} 行 → ${BL_ROWS.length} 条运营事实）`);
 console.log(`✅ 业务线接入规格: ${BL_SPEC}（target: fact_business_line，无口径列）`);
+
+// ============ 业务线报表（查询侧目标表声明化：spec.fact 由声明裁决）============
+// ★ 查询侧的另一半：阶段 31 守「写得进去」，这一份守「读得出来」。
+//   spec.fact 指向 fact_business_line —— 表名只从 models 的声明里取（铁律 2 的报表侧半句）；
+//   运营表没有口径列（铁律 8），量纲维只剩指标：行=业务线（行内退化列），列=指标。
+const BL_TPL = 'test/fixtures/业务线月报模板.xlsx';
+const BL_REPORT = 'test/fixtures/报表-业务线.yaml';
+
+const wbBlr = new ExcelJS.Workbook();
+const blrs = wbBlr.addWorksheet('月报');
+blrs.mergeCells('A1:C1');
+blrs.getCell('A1').value = '业务线月报（2026年6月）';
+blrs.getCell('A1').font = { bold: true, size: 14 };
+// 列标签预置（模拟真实模板）
+blrs.getCell('A3').value = '业务线';
+blrs.getCell('A3').font = { bold: true };
+blrs.getCell('B3').value = '签约额';
+blrs.getCell('B3').font = { bold: true };
+blrs.getCell('C3').value = '交付台数';
+blrs.getCell('C3').font = { bold: true };
+// 行标签预置 —— 数据从 B4 开始
+blrs.getCell('A4').value = '工业';
+blrs.getCell('A5').value = '消费';
+for (let r = 4; r <= 5; r++) {
+  for (let c = 2; c <= 3; c++) blrs.getCell(r, c).numFmt = '#,##0.00';
+}
+blrs.getColumn(1).width = 14;
+[2, 3].forEach((c) => (blrs.getColumn(c).width = 16));
+wbBlr.definedNames.add('月报!$B$4', 'BL_DATA_START');
+await wbBlr.xlsx.writeFile(BL_TPL);
+
+fs.writeFileSync(
+  BL_REPORT,
+  `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **运营事实表的报表夹具**。
+# ★ 与财务报表最大的差别：报表侧的目标表声明指向 fact_business_line（铁律 2：
+#   表名只能从 models 的声明里取）。运营表没有口径列（铁律 8），
+#   量纲维只剩指标：行=业务线（行内退化列），列=指标。
+id: 业务线月报-夹具
+fact: fact_business_line
+template: ${BL_TPL}
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: { name: BL_DATA_START }
+        rows:
+          dim: business_line
+          order: [工业, 消费]
+        cols:
+          dim: metric
+          order: [签约额, 交付台数]
+        value:
+          measure: amount
+          format: '#,##0.00'
+`,
+);
+console.log(`✅ 业务线报表模板: ${BL_TPL}`);
+console.log(`✅ 业务线报表规格: ${BL_REPORT}（fact: fact_business_line）`);

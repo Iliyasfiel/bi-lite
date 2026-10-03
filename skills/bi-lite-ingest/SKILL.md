@@ -143,6 +143,7 @@ get_template_schema  →  generate_spec  →  lint_spec  →  preview_spec  → 
 - 期数是**读**出来的（模板 B 列/年月列），不是猜的；`period: null` 说明模板里没有，`params` 里的 year/month 是默认值，**要把这件事说出来**。
 - `draftValid: false` 时草稿不能当定稿用：**先解决 issues 再保存**（`/api/specs/save` 与 `parseSpec` 用同一份判据，改不动的东西保存一定失败）。
 - 量纲维（`metric` / `period_type`）必须被钉住：`rows: company / cols: period_type` 却没有指标约束时，那一格会把多个指标的金额加成一个数（判例：返回 67283，真值 65198——同量级、格式正常、人不会怀疑）。
+- 报表规格可带顶层 `fact:`（目标表，缺省 `fact_finance`）：名字必须已在 `models/*.yml` 声明过（kind: fact），否则 lint 报 `FACT_UNKNOWN`；无口径列的表（如 `fact_business_line`）不能配 `period_type` 轴或口径参数（`DIM_NOT_ON_FACT` / `PERIOD_TYPE_NOT_ON_FACT`）。
 
 ## 6. 不许绕过的事
 

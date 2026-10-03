@@ -20,6 +20,7 @@ import { normalizeName, type DimKind } from './ingest/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
+import { declaredFactsOf } from './gen/parse.ts';
 import { renderTemplate, type RenderBlock } from './render/excel.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
 import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
@@ -75,13 +76,14 @@ function safeName(name: string): string {
 
 function listSpecs() {
   if (!fs.existsSync('specs')) return [];
+  const facts = declaredFactsOf(); // specs 里可能存着业务线报表（fact: fact_business_line），解析判据要带上声明
   return fs
     .readdirSync('specs')
     .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
     .map((f) => {
       const full = path.join('specs', f);
       try {
-        const spec = parseSpec(fs.readFileSync(full, 'utf8'));
+        const spec = parseSpec(fs.readFileSync(full, 'utf8'), { facts });
         return { file: full, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length };
       } catch (e) {
         return { file: full, id: f, title: f, sheets: 0, error: (e as Error).message };
@@ -143,7 +145,7 @@ export const routes: Record<string, Handler> = {
   'POST /api/query': async (req, res) => {
     const body = await readJson<Partial<MetricsQuery>>(req);
     try {
-      const result = await queryMetrics({ ...(body as MetricsQuery), audience: 'human' });
+      const result = await queryMetrics({ ...(body as MetricsQuery), audience: 'human' }, (sql) => db.query(sql), declaredFactsOf());
       json(res, 200, result);
     } catch (e) {
       if (e instanceof QueryRefused) return json(res, 200, { refused: true, reason: e.reason, message: e.message });
@@ -155,7 +157,7 @@ export const routes: Record<string, Handler> = {
   'POST /api/chart': async (req, res) => {
     const body = await readJson<{ query: MetricsQuery; chart?: Partial<ChartSpec> }>(req);
     const chart: ChartSpec = { type: 'bar', ...(body.chart ?? {}) };
-    const metrics = await queryMetrics({ ...body.query, audience: 'human' });
+    const metrics = await queryMetrics({ ...body.query, audience: 'human' }, (sql) => db.query(sql), declaredFactsOf());
     const input = chartInputFromMetrics(metrics);
     json(res, 200, {
       option: toEChartsOption(chart, input),
@@ -256,7 +258,7 @@ export const routes: Record<string, Handler> = {
       text = fs.readFileSync(specFile, 'utf8');
     }
     if (!text) return json(res, 400, { error: '需要 yaml 或 specFile' });
-    const d = diagnoseSpec(text);
+    const d = diagnoseSpec(text, { facts: declaredFactsOf() });
     json(res, 200, {
       ok: !d.willBeRejected,
       willBeRejected: d.willBeRejected,
@@ -274,7 +276,7 @@ export const routes: Record<string, Handler> = {
     // ★ 定稿前必须过校验 —— 拒绝把"声明了 params 却没用"这类静默算错的 spec 写进仓库
     let spec;
     try {
-      spec = parseSpec(yaml);
+      spec = parseSpec(yaml, { facts: declaredFactsOf() });
     } catch (e) {
       return json(res, 400, { error: (e as Error).message });
     }
@@ -406,7 +408,7 @@ export const routes: Record<string, Handler> = {
   /** 报表预览：出坐标计划（不含金额）+ 矩阵（含数值，给浏览器） */
   'POST /api/report/preview': async (req, res) => {
     const { specFile, params } = await readJson<{ specFile: string; params?: Record<string, string | number> }>(req);
-    const spec = parseSpec(fs.readFileSync(specFile, 'utf8'));
+    const spec = parseSpec(fs.readFileSync(specFile, 'utf8'), { facts: declaredFactsOf() });
     const p = { ...(spec.params ?? {}), ...(params ?? {}) };
 
     const results = [];
@@ -414,7 +416,7 @@ export const routes: Record<string, Handler> = {
     for (const sheet of spec.sheets) {
       const blocks = [];
       for (const b of sheet.blocks) {
-        const compiled = compileBlock(b, p);
+        const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
         const result = await runCompiled(compiled, (sql) => db.query(sql));
         blocks.push({ anchor: b.anchor, chart: b.chart, ...result });
         results.push({ sheet: sheet.name, anchor: String(typeof b.anchor === 'object' ? b.anchor.name : b.anchor), rowLabels: result.rowLabels, colLabels: result.colLabels });
@@ -443,7 +445,7 @@ export const routes: Record<string, Handler> = {
       specFile: string; params?: Record<string, string | number>; output?: string;
     }>(req);
 
-    const spec = parseSpec(fs.readFileSync(specFile, 'utf8'));
+    const spec = parseSpec(fs.readFileSync(specFile, 'utf8'), { facts: declaredFactsOf() });
     const p = { ...(spec.params ?? {}), ...(params ?? {}) };
     if (!spec.template) return json(res, 400, { error: 'spec 未声明 template' });
     if (!fs.existsSync(spec.template)) return json(res, 400, { error: `模板不存在: ${spec.template}` });
@@ -451,7 +453,7 @@ export const routes: Record<string, Handler> = {
     const blocks: RenderBlock[] = [];
     for (const sheet of spec.sheets) {
       for (const b of sheet.blocks) {
-        const compiled = compileBlock(b, p);
+        const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
         const result = await runCompiled(compiled, (sql) => db.query(sql));
         blocks.push({
           sheet: sheet.name,

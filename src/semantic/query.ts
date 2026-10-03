@@ -12,9 +12,10 @@
  *     - audience='agent'（LLM）→ 只返回分档值（"12.3亿"）+ 最小单元格阈值
  *   把阈值一刀切加在查询上会毁掉 Web 看板（人就是要看单月单指标的数）。
  */
-import { DIMENSIONS, isRegisteredDim, type DimName } from '../spec/compile.ts';
+import { DIMENSIONS, dimAvailableOn, isRegisteredDim, type DimName } from '../spec/compile.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { query } from '../db/index.ts';
+import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
 
 // ---------------- 元数据（无金额，可安全给 agent 与前端） ----------------
 
@@ -43,6 +44,7 @@ const DIM_LABELS: Record<DimName, string> = {
   period_type: '口径',
   month: '月份',
   year: '年份',
+  business_line: '业务线',
 };
 
 /** 完整目录（含 DB 里的公司/指标主数据）—— 只有元数据，不含任何金额 */
@@ -60,12 +62,19 @@ export async function catalog(): Promise<Catalog> {
 
 export interface MeasureRef {
   metric: string;                                               // 指标名（值，非标识符）
-  periodType: string;                                           // 口径
+  /** 口径 —— 只有带口径列的事实表需要（fact_finance）；运营事实表没有口径体系（铁律 8） */
+  periodType?: string;
   agg?: 'sum' | 'avg' | 'max' | 'min' | 'count';
 }
 
 export interface MetricsQuery {
   measures: MeasureRef[];
+  /**
+   * 目标事实表 —— 省略 = 缺省表（gen/ir.ts 的 DEFAULT_TARGET）。
+   * 必须已在 models/*.yml 声明（kind: fact），compileMetrics 白名单硬校验：
+   * 表名会原样拼进 SQL（铁律 2），能进 FROM 的名字永远来自声明，不是调用方的裸字符串。
+   */
+  fact?: string;
   groupBy?: string[];                                           // 只能取 DIMENSIONS 的键
   filter?: Record<string, string | string[]>;
   limit?: number;
@@ -121,16 +130,42 @@ const AGGS = new Set(['sum', 'avg', 'max', 'min', 'count']);
 /**
  * 把 MetricsQuery 编译成参数化 SQL。
  * 标识符（维度名）走白名单，值（指标名/口径/过滤值）走 q() 转义。
+ *
+ * 目标表声明化（与 compile.ts 同一堵墙）：
+ *   - `mq.fact` 省略 = 缺省表；有值就必须在 `facts`（declaredFactsOf() 注入）里，否则 FACT_UNKNOWN；
+ *   - 能进 FROM 的表名永远来自声明（fact.name），不是调用方的裸字符串（铁律 2）；
+ *   - 维度（groupBy/filter）必须真的长在目标表上（dimAvailableOn），否则 DIM_NOT_ON_FACT；
+ *   - 目标表没有口径列时：measures 只要 metric（periodType 可选）；
+ *     多给的 periodType 报 PERIOD_TYPE_NOT_ON_FACT —— 与接入侧 TARGET_NO_PERIOD_TYPE 同一个理由：
+ *     静默忽略会让写的人以为条件在起作用。
  */
-export function compileMetrics(mq: MetricsQuery): { sql: string; columns: MetricsResult['columns'] } {
+export function compileMetrics(
+  mq: MetricsQuery,
+  facts?: DeclaredFact[],
+): { sql: string; columns: MetricsResult['columns'] } {
   if (!Array.isArray(mq.measures) || mq.measures.length === 0) {
     throw new QueryRefused('measures 不能为空', 'EMPTY_MEASURES');
   }
+
+  // ---- 目标表解析 ----
+  const factName = mq.fact && mq.fact.trim() !== '' ? mq.fact : undefined;
+  const fact: DeclaredFact | null = factName ? (facts ?? []).find((f) => f.name === factName) ?? null : null;
+  if (factName && !fact) {
+    throw new QueryRefused(
+      `目标表未声明: ${factName} —— 表名会原样拼进 SQL（铁律 2），只接受 models/*.yml 里声明过的事实表（kind: fact）。`,
+      'FACT_UNKNOWN',
+    );
+  }
+  const tableName = fact?.name ?? DEFAULT_TARGET;
+  const hasPT = fact ? fact.periodTypeColumn !== null : true; // 缺省表带口径列
 
   const groupBy = mq.groupBy ?? [];
   for (const d of groupBy) {
     if (!isRegisteredDim(d)) {
       throw new QueryRefused(`未注册的维度: ${d}（只允许 ${Object.keys(DIMENSIONS).join(' / ')}）`, 'UNKNOWN_DIMENSION');
+    }
+    if (!dimAvailableOn(d as DimName, fact)) {
+      throw new QueryRefused(`目标表 ${tableName} 没有「${d}」这个维度。`, 'DIM_NOT_ON_FACT');
     }
   }
 
@@ -148,10 +183,17 @@ export function compileMetrics(mq: MetricsQuery): { sql: string; columns: Metric
   const colExprs = mq.measures.map((m, i) => {
     const agg = m.agg ?? 'sum';
     if (!AGGS.has(agg)) throw new QueryRefused(`不支持的聚合: ${agg}`, 'BAD_AGG');
-    if (!m.metric || !m.periodType) {
-      throw new QueryRefused(`measures[${i}] 需要 metric 与 periodType`, 'BAD_MEASURE');
+    if (!m.metric) throw new QueryRefused(`measures[${i}] 需要 metric`, 'BAD_MEASURE');
+    if (hasPT && !m.periodType) {
+      throw new QueryRefused(`measures[${i}] 需要 periodType（口径）`, 'BAD_MEASURE');
     }
-    if (!allowedPeriods.has(m.periodType)) {
+    if (m.periodType && !hasPT) {
+      throw new QueryRefused(
+        `目标表 ${tableName} 没有口径列，measures[${i}].periodType 无处安放 —— 运营事实表没有口径体系（铁律 8）。`,
+        'PERIOD_TYPE_NOT_ON_FACT',
+      );
+    }
+    if (m.periodType && !allowedPeriods.has(m.periodType)) {
       throw new QueryRefused(
         `未注册的口径: ${m.periodType}（只允许 ${[...allowedPeriods].join(' / ')}）`,
         'UNKNOWN_PERIOD_TYPE',
@@ -159,13 +201,21 @@ export function compileMetrics(mq: MetricsQuery): { sql: string; columns: Metric
     }
     columns.push({
       key: `m${i}`,
-      label: m.periodType === '单月' || m.periodType === '单月同比' ? `${m.metric}·${m.periodType}` : `${m.metric}（${m.periodType}）`,
+      label: m.periodType
+        ? m.periodType === '单月' || m.periodType === '单月同比'
+          ? `${m.metric}·${m.periodType}`
+          : `${m.metric}（${m.periodType}）`
+        : m.metric,
       metric: m.metric,
-      periodType: m.periodType,
+      periodType: m.periodType ?? '',
       agg,
     });
-    const cond = `dim_metric.name = ${q(m.metric)} AND f.period_type = ${q(m.periodType)}`;
-    return `${agg}(CASE WHEN ${cond} THEN f.amount END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
+    // 没有口径列的表：度量就是指标本身，条件里没有 period_type 可言
+    const cond = m.periodType
+      ? `dim_metric.name = ${q(m.metric)} AND f.period_type = ${q(m.periodType)}`
+      : `dim_metric.name = ${q(m.metric)}`;
+    const measureCol = fact?.measureColumn ?? 'amount';
+    return `${agg}(CASE WHEN ${cond} THEN f.${measureCol} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
   });
 
   // join（去重）
@@ -181,6 +231,9 @@ export function compileMetrics(mq: MetricsQuery): { sql: string; columns: Metric
     // 过滤的键是个「维度名.字段名」或裸字段名？统一按已注册维度处理：键必须是维度名
     if (!isRegisteredDim(col)) {
       throw new QueryRefused(`过滤字段未注册: ${col}（只允许 ${Object.keys(DIMENSIONS).join(' / ')}）`, 'UNKNOWN_FILTER');
+    }
+    if (!dimAvailableOn(col as DimName, fact)) {
+      throw new QueryRefused(`目标表 ${tableName} 没有「${col}」这个维度。`, 'DIM_NOT_ON_FACT');
     }
     const dim = DIMENSIONS[col as DimName];
     const ref = dim.table ? `${dim.table}.${dim.labelCol}` : dim.labelCol;
@@ -198,7 +251,7 @@ export function compileMetrics(mq: MetricsQuery): { sql: string; columns: Metric
   const sql = [
     groupExprs.length ? `SELECT ${groupExprs.join(', ')},` : 'SELECT',
     '  ' + colExprs.join(',\n  '),
-    'FROM fact_finance f',
+    'FROM ' + tableName + ' f',
     ...[...joins],
     where.length ? 'WHERE ' + where.join(' AND ') : '',
     groupExprs.length ? 'GROUP BY ALL' : '',
@@ -239,9 +292,10 @@ export function band(value: number | null): string | null {
 export async function queryMetrics(
   mq: MetricsQuery,
   run: (sql: string) => Promise<Record<string, unknown>[]> = query,
+  facts?: DeclaredFact[],
 ): Promise<MetricsResult> {
   const limits = THRESHOLDS[mq.audience];
-  const { sql, columns } = compileMetrics(mq);
+  const { sql, columns } = compileMetrics(mq, facts);
 
   const raw = await run(sql);
   const groupCount = (mq.groupBy ?? []).length;

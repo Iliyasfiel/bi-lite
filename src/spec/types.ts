@@ -7,11 +7,20 @@
 import { parse as parseYaml } from 'yaml';
 import { lintSpec, type LintIssue } from './lint.ts';
 import type { AnchorRef, ReportAxisGeometry, ReportBlockGeometry } from './geometry.ts';
+import type { DeclaredFact } from '../gen/ir.ts';
 
 export interface Spec {
   id: string;
   title?: string;
   template?: string;          // Excel 模板路径（版式来源）
+  /**
+   * 目标事实表（查询侧目标表声明化，与接入侧 `IngestSpec.target` 同一思路）。
+   * ★ 省略时 = 缺省表 `fact_finance`（`gen/ir.ts` 的 DEFAULT_TARGET）—— 现有 specs 一行不用改。
+   * ★ 表名必须已在 `models/*.yml` 声明（kind: fact）：compile/query 编译期白名单硬校验，
+   *   lint 给 FACT_UNKNOWN —— 表名会**原样拼进 SQL**（铁律 2），绝不取未声明的名字。
+   * ★ 字面量，不参与 {{参数}} 替换（substitutableStrings 刻意不含它）：标识符不做模板。
+   */
+  fact?: string;
   /**
    * 兼容读：执行参数（CLI `--param` / MCP、HTTP 的 `params`）永远覆盖这里的值。
    * params 是执行参数（架构 §8.1），存进 YAML 的只是**默认值**。
@@ -79,9 +88,17 @@ export interface ValueSpec {
 }
 
 /** 解析 YAML 文本为 spec */
-export function parseSpec(yamlText: string): Spec {
+/**
+ * 解析并校验一份 spec。
+ *
+ * `opts.facts`（declaredFactsOf()）注入后，lint 才做"按目标表形状"的检查
+ * （业务线规格的口径豁免、DIM_NOT_ON_FACT 等）—— 解析层不读盘，
+ * 注入是调用方的纪律（server/tools/cli 的入口都注入了）。
+ * 不注入时按老判据（全量量纲维 + 不查维度可用性）—— 现有 finance 规格不受影响。
+ */
+export function parseSpec(yamlText: string, opts: { facts?: DeclaredFact[] } = {}): Spec {
   const raw = parseYaml(yamlText) as Spec;
-  validateSpec(raw);
+  validateSpec(raw, opts);
   return raw;
 }
 
@@ -113,8 +130,11 @@ export class SpecError extends Error {}
  *
  * ★ 判据只有一份：结构诊断来自 `lintSpec`，与"保存时拒绝"用的是同一个函数。
  *   两份判据一定会漂移 —— 工具说没问题、保存却被拒，是最难查的那类 bug。
+ *
+ * `opts.facts` 透传给 lintSpec：注入声明过的事实表后，才做"按目标表形状"的检查
+ * （FACT_UNKNOWN / DIM_NOT_ON_FACT）。与接入侧 diagnoseIngest 的 facts 注入同一条纪律。
  */
-export function diagnoseSpec(yamlText: string): {
+export function diagnoseSpec(yamlText: string, opts: { facts?: DeclaredFact[] } = {}): {
   spec: Spec | null;
   parseError: string | null;
   issues: LintIssue[];
@@ -134,7 +154,7 @@ export function diagnoseSpec(yamlText: string): {
       errors: [parseError ?? 'YAML 解析失败'],
     };
   }
-  const issues = lintSpec(spec);
+  const issues = lintSpec(spec, { facts: opts.facts });
   const unusedParams = findUnusedParams(spec);
   const errors = issues.filter((i) => i.level === 'error').map((i) => `${i.at}: ${i.message}`);
   if (unusedParams.length) {
@@ -203,8 +223,8 @@ export function findUnusedParams(s: Spec): string[] {
  * warn 级放到诊断面板里给人看，不挡住保存 —— 一条"order 为空"的提醒
  * 不该让人连草稿都存不下来。
  */
-function validateSpec(s: Spec) {
-  const issues = lintSpec(s);
+function validateSpec(s: Spec, opts: { facts?: DeclaredFact[] } = {}) {
+  const issues = lintSpec(s, opts);
   const errs = issues.filter((i) => i.level === 'error');
 
   // 「声明了 params 却从未引用」保持独立 —— 它关心的是 params 与引用的**关系**，

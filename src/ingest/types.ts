@@ -20,6 +20,7 @@ import { parse as parseYaml } from 'yaml';
 import { DIM_NAMES, isRegisteredDim } from '../spec/dims.ts';
 import { lintAnchorGeometry } from '../spec/geometry.ts';
 import type { DeclaredFact } from '../gen/ir.ts';
+import { DEFAULT_TARGET } from '../gen/ir.ts';
 import type { DimKind } from './resolve.ts';
 
 // ---------------- 列号工具（Excel 列字母 ↔ 序号） ----------------
@@ -314,8 +315,8 @@ export function parseDecisions(raw: unknown): DimDecision[] | undefined {
 export const REQUIRED_COORDS = ['company', 'metric', 'period', 'period_type'] as const;
 export type RequiredCoord = (typeof REQUIRED_COORDS)[number];
 
-/** 默认目标表 —— 与声明的默认一致（`IngestSpec.target` 不写时就是它） */
-export const DEFAULT_TARGET = 'fact_finance';
+/** 默认目标表 —— 唯一定义在声明层（`gen/ir.ts`），这里 re-export 保住既有 import 点 */
+export { DEFAULT_TARGET };
 
 /**
  * 一次给全的**必需坐标** —— 由目标表的**声明**决定，不是写死的四个。
