@@ -6,11 +6,16 @@
  */
 import { parse as parseYaml } from 'yaml';
 import { lintSpec, type LintIssue } from './lint.ts';
+import type { AnchorRef, ReportAxisGeometry, ReportBlockGeometry } from './geometry.ts';
 
 export interface Spec {
   id: string;
   title?: string;
   template?: string;          // Excel 模板路径（版式来源）
+  /**
+   * 兼容读：执行参数（CLI `--param` / MCP、HTTP 的 `params`）永远覆盖这里的值。
+   * params 是执行参数（架构 §8.1），存进 YAML 的只是**默认值**。
+   */
   params?: Record<string, string | number>;
   sheets: SheetSpec[];
 }
@@ -20,9 +25,12 @@ export interface SheetSpec {
   blocks: Block[];
 }
 
-export interface Block {
-  /** 数据写入位置。字符串坐标 "B4"，或 {name: "定义名称"} 优先于坐标 */
-  anchor: string | { name: string };
+/**
+ * block = 模板几何（ReportBlockGeometry：anchor + 行/列各绑哪个维度）
+ *       + 报表侧 overlay（order/filter/value/scope/chart —— 实例字面量与语义细节）。
+ * 几何子集的定义在 `src/spec/geometry.ts`（架构 §8.1：两层架构的模板层）。
+ */
+export interface Block extends ReportBlockGeometry {
   rows: AxisSpec;
   cols: AxisSpec;
   value: ValueSpec;
@@ -55,8 +63,8 @@ export interface Block {
   };
 }
 
-export interface AxisSpec {
-  dim: string;
+/** 轴 = 几何（绑哪个维度）+ overlay（过滤与实例清单） */
+export interface AxisSpec extends ReportAxisGeometry {
   filter?: Record<string, string | string[]>;
   order?: string[];
 }

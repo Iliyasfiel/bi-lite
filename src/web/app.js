@@ -81,7 +81,8 @@ function igSyncRun() {
   btn.textContent = n > 0 ? `还有 ${n} 个名称待确认` : `确认无误，落库（${igWillWrite(igPlan).toLocaleString()} 行）`;
 }
 
-// —— 源文件：先落到白名单目录，再让规格的 source 指过去 ——
+// —— 源文件：先落到白名单目录；选中的文件是**执行参数**，不改规格的 YAML 文本 ——
+// （架构 §8.1：source 是执行参数 —— dry-run / run 的请求体里带 `source`，YAML 保持原样）
 $('igPick').addEventListener('click', () => $('igFile').click());
 $('igFile').addEventListener('change', (e) => { if (e.target.files[0]) igUploadSource(e.target.files[0]); });
 {
@@ -120,22 +121,19 @@ async function igUploadSource(file) {
 }
 
 /**
- * 把规格顶层的 `source:` 指向刚上传的文件。
+ * 「指定给这份规格」—— 现在**只选中**，不改写 YAML。
  *
- * ★ 只认**顶层**那一行（不缩进的 `source:`），找不到就明说 —— 不替人凭空插一行结构。
- *   静默改写 YAML 比让人自己补一行危险得多：改错了没人看得见。
+ * ★ source 是执行参数：上传回来的路径存进 `igSource`，干跑/落库的请求体里带上它。
+ *   页面不再替人改规格文本 —— 改写 YAML 是"第二份真相"的老毛病：
+ *   规格里写着 A、真正跑的是 B，没人看得见。规格里那行 `source:`（若有）照旧兼容读，
+ *   只是变成了"默认值"，会被这里选中的文件覆盖。
  */
 $('igPoint').addEventListener('click', () => {
   const p = igSource && igSource.file;
   if (!p) return;
-  if (/^source\s*:/m.test(igYaml())) {
-    $('igYaml').value = igYaml().replace(/^source\s*:.*$/m, `source: ${p}`);
-    $('igPointMsg').textContent = '已改 source 那一行（在下面编辑器里可见）';
-  } else {
-    $('igPointMsg').innerHTML =
-      `这份 YAML 里没有顶层的 <code>source:</code> 行，请自己加一行：<code>source: ${esc(p)}</code>`;
-  }
-  runIgLint();
+  $('igPointMsg').innerHTML =
+    `已选中 <code>${esc(p)}</code> 作为本次执行的源文件（执行参数，规格文本没动）。` +
+    `直接点「干跑」或「落库」即可。`;
 });
 
 // —— 规格：载入已定稿的，或自己写 ——
@@ -235,7 +233,7 @@ $('igDryRun').addEventListener('click', async () => {
     const res = await api('/api/ingest/dry-run', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ yaml: igYaml(), decisions: [] }),
+      body: JSON.stringify({ yaml: igYaml(), decisions: [], source: igSource?.file }),
     });
     igPlan = res;
     renderIgPlan(res);
@@ -432,7 +430,7 @@ $('igRun').addEventListener('click', async () => {
     const res = await api('/api/ingest/run', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ yaml: igYaml(), decisions: Object.values(igDecisions) }),
+      body: JSON.stringify({ yaml: igYaml(), decisions: Object.values(igDecisions), source: igSource?.file }),
     });
 
     // 服务端可能回一个「还需要人拍板」的中间态（HTTP 200，不是错误）：

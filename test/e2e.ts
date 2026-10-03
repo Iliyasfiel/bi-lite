@@ -2168,9 +2168,15 @@ log('\n════════ 23. CLI validate（§8.2 第 ④ 条接口）═
 
   const ing = await run(['validate', 'ingest/月度经营接入.yaml']);
   const rep = await run(['validate', 'specs/月度保送表.yaml']);
-  check('★ 自动判别用哪份判据：接入规格（有 source）走 diagnoseIngest，报表规格走 diagnoseSpec',
+  // ★ 判别按模板几何（geometry.ts 的 looksLikeIngestDoc），不按"有没有 source"——
+  //   source 是执行参数，没有它的一份接入规格也得被认出来是接入规格
+  const { looksLikeIngestDoc } = await import('../src/spec/geometry.ts');
+  const noSourceIngest = { id: '无源的接入规格', sheets: [{ name: 's', blocks: [{ anchor: 'D2', rows: [{ col: 'A', dim: 'company' }], values: { columns: ['B'] } }] }] };
+  const reportDoc = { sheets: [{ blocks: [{ anchor: 'B4', rows: { dim: 'metric' }, cols: { dim: 'period_type' }, value: {} }] }] };
+  check('★ 自动判别用哪份判据：按模板几何判（接入规格走 diagnoseIngest，报表规格走 diagnoseSpec；没 source 的接入规格也认得出）',
     (JSON.parse(ing.out) as { kind: string }).kind === 'ingest' &&
-      (JSON.parse(rep.out) as { kind: string }).kind === 'report');
+      (JSON.parse(rep.out) as { kind: string }).kind === 'report' &&
+      looksLikeIngestDoc(noSourceIngest) === true && looksLikeIngestDoc(reportDoc) === false);
   check('两份都判为可保存（退出码 0），摘要走 stderr',
     ing.code === 0 && rep.code === 0 && ing.err.includes('接入规格') && rep.err.includes('报表规格'),
     `${ing.err.trim()} | ${rep.err.trim()}`);
@@ -2356,9 +2362,11 @@ sheets:
       removesUploads(`fs.unlinkSync(path.join('data/uploads', name))`));
 
     // —— ④ 干跑：形状说清楚，且**一次库都不写** ——
-    const yaml = baseYaml.replace(/^source\s*:.*$/m, `source: ${upl.file}`);
+    //    ★ 这一步顺带验收"source 是执行参数"：body 里给 source（选文件那条路），
+    //      覆盖规格里写的 source —— YAML 文本一个字都不用改。
+    const yaml = baseYaml;
     const before4 = await facts();
-    const dry = await post2('/api/ingest/dry-run', { yaml, decisions: [] });
+    const dry = await post2('/api/ingest/dry-run', { yaml, decisions: [], source: upl.file });
     check('④ ★ 干跑一次库都不写（也不归档）',
       (await facts()) === before4 && dry.inserted === 0 && dry.archived === false &&
         typeof dry.note === 'string' && dry.note.includes('可以落库'),

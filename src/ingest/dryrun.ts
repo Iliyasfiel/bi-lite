@@ -84,6 +84,11 @@ export interface IngestFactRow {
 
 export interface IngestDryRunOptions {
   catalog: MasterCatalog;
+  /**
+   * **源文件（执行参数）**—— 覆盖规格里的 `source:`；规格没写 source 时它就是唯一的来源。
+   * 两者都没有 → `SOURCE_MISSING` error（ dry-run 与落库同一份判据）。
+   */
+  source?: string;
   /** 读到多少行就停（防误指一个百万行的文件）；默认 20000。撞到会上报，不静默截断 */
   maxRows?: number;
   /**
@@ -239,10 +244,12 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
     issues.push({ level: 'warn', code, at, message, hint });
 
   const blocks: IngestBlockShape[] = [];
+  // ★ source 是执行参数：调用方给的覆盖规格里写的（架构 §8.1）
+  const effSource = opts.source ?? spec?.source ?? '';
   const shape: IngestShape = {
     spec: {
       id: spec?.id ?? '',
-      source: spec?.source ?? '',
+      source: effSource,
       onConflict: spec?.onConflict ?? 'reject',
       unknownMaster: spec?.unknownMaster ?? 'confirm',
     },
@@ -260,8 +267,15 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
   }
 
   let abs: string;
+  if (!effSource) {
+    err('SOURCE_MISSING', 'source',
+      '这份接入规格没有 source，调用方也没有给 —— 引擎不知道读哪份源文件。',
+      'CLI 用 `--source <文件>`；MCP dry_run_ingest / run_ingest、HTTP dry-run / run 传 `source` 参数。' +
+        '源文件必须在白名单目录内（src/paths.ts）。');
+    return shape;
+  }
   try {
-    abs = resolveSource(spec.source);
+    abs = resolveSource(effSource);
   } catch (e) {
     err('SOURCE_OUTSIDE_ROOTS', 'source', (e as Error).message);
     return shape;
@@ -269,7 +283,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
   // ★ 有 `openBook`（值从 raw 来）时**不再要求源文件还在** —— 那正是"源文件删了也能重放"。
   //   没有它才要求文件在：那时值只能从工作簿来，文件没了就没得读。
   if (!opts.openBook && !fs.existsSync(abs)) {
-    err('SOURCE_NOT_FOUND', 'source', `源文件不存在：${spec.source}（解析为 ${abs}）。`);
+    err('SOURCE_NOT_FOUND', 'source', `源文件不存在：${effSource}（解析为 ${abs}）。`);
     return shape;
   }
 
@@ -297,7 +311,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
     sheetSpec.blocks.forEach((block, bi) =>
       blocks.push(
         readBlockShape(sheet, block, {
-          source: spec.source,
+          source: effSource,
           si,
           bi,
           maxRows,

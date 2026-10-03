@@ -364,21 +364,22 @@ export const routes: Record<string, Handler> = {
   },
 
   'POST /api/ingest/dry-run': async (req, res) => {
-    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    // ★ source 是执行参数（架构 §8.1）：前端"选文件"选的是它，不改写规格 YAML 文本
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[]; source?: string }>(req);
     const t = loadIngestText(body);
     if ('error' in t) return json(res, 400, t);
     const { cat, d, errors } = await diagIngest(t.text);
     if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
-    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, planOnly: true, decisions: body.decisions }));
+    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, planOnly: true, decisions: body.decisions, source: body.source }));
   },
 
   'POST /api/ingest/run': async (req, res) => {
-    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[] }>(req);
+    const body = await readJson<{ yaml?: string; specFile?: string; decisions?: DimDecision[]; source?: string }>(req);
     const t = loadIngestText(body);
     if ('error' in t) return json(res, 400, t);
     const { cat, d, errors } = await diagIngest(t.text);
     if (d.willBeRejected) return json(res, 200, { ok: false, refused: true, errors });
-    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, decisions: body.decisions }));
+    json(res, 200, await runIngest(parseIngestSpec(t.text, { periodTypes: cat.periodTypes, facts: cat.facts }), { catalog: cat, decisions: body.decisions, source: body.source }));
   },
 
   /** 定稿接入规格。与 /api/specs/save 同一纪律：**先校验再落盘**（拒绝把跑不了的规格写进仓库） */

@@ -29,6 +29,7 @@ import fs from 'node:fs';
 //    （`type` 修饰符只在 import 语句里合法，解构里不认）。而且 `import type` 会被完全擦除，
 //    所以 "help / lint 不加载 xlsx-populate" 这条性质不受影响。
 import type { RenderBlock } from './render/excel.ts';
+import { looksLikeIngestDoc } from './spec/geometry.ts';
 
 // ---------------- IO（可注入，便于 e2e 在进程内跑而不杀测试进程） ----------------
 
@@ -59,8 +60,8 @@ export type Invocation =
   | { kind: 'help'; command: string | null }
   | { kind: 'version' }
   | { kind: 'ingest-lint'; specFile: string }
-  | { kind: 'ingest-dry-run'; specFile: string; decisionsPath: string | null }
-  | { kind: 'ingest-run'; specFile: string; decisionsPath: string | null; strict: boolean }
+  | { kind: 'ingest-dry-run'; specFile: string; decisionsPath: string | null; source: string | null }
+  | { kind: 'ingest-run'; specFile: string; decisionsPath: string | null; strict: boolean; source: string | null }
   | { kind: 'render'; specFile: string; params: Record<string, string>; out: string | null }
   | {
       kind: 'query';
@@ -196,24 +197,29 @@ function parseIngestArgs(tokens: readonly string[]): Invocation {
   const rest = tokens.slice(1);
   if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: `ingest ${sub}` };
 
-  const args = scanArgs(rest, ['--decisions'], ['--strict'], subHint);
+  const args = scanArgs(rest, ['--decisions', '--source'], ['--strict'], subHint);
   if (args.problem) return usage(args.problem.message, args.problem.hint);
 
   const strict = '--strict' in args.values;
   const decisions = args.values['--decisions']?.[0] ?? null;
+  // ★ source 是执行参数（架构 §8.1）：命令行上选文件，不改规格文本
+  const source = args.values['--source']?.[0] ?? null;
 
   // ★ 同铁律 14 的思路：**给了却用不上就报错**，不静默忽略
   if (strict && sub !== 'run') return usage(`--strict 只对「ingest run」有意义（${sub} 不落库）`, subHint);
   if (decisions !== null && sub === 'lint') {
     return usage('--decisions 对「ingest lint」没有意义（静态诊断不比对主数据）', subHint);
   }
+  if (source !== null && sub === 'lint') {
+    return usage('--source 对「ingest lint」没有意义（静态诊断不读源文件）', subHint);
+  }
 
   const specFile = onePositional(args, '接入规格文件（如 ingest/华东子公司.yaml）', subHint);
   if (typeof specFile !== 'string') return specFile;
 
   if (sub === 'lint') return { kind: 'ingest-lint', specFile };
-  if (sub === 'dry-run') return { kind: 'ingest-dry-run', specFile, decisionsPath: decisions };
-  return { kind: 'ingest-run', specFile, decisionsPath: decisions, strict };
+  if (sub === 'dry-run') return { kind: 'ingest-dry-run', specFile, decisionsPath: decisions, source };
+  return { kind: 'ingest-run', specFile, decisionsPath: decisions, strict, source };
 }
 
 function parseRenderArgs(tokens: readonly string[]): Invocation {
@@ -326,8 +332,10 @@ function parseGenArgs(cmd: 'plan' | 'apply', tokens: readonly string[]): Invocat
  * `validate <yaml>` —— §8.2 的第 ④ 条接口：**可执行、带修复建议**的校验。
  *
  * ★ 它**不写新判据**。判据仍是那两份（接入规格 `diagnoseIngest` / 报表规格 `diagnoseSpec`），
- *   这里只做一件它们没做的事：**判别该用哪一份** —— 靠顶层有没有 `source`
- *   （接入规格必有：它得说清"这份 Excel 从哪来"）。判别本身也是判据，所以只有这一处。
+ *   这里只做一件它们没做的事：**判别该用哪一份** —— 按**模板几何**判
+ *   （`looksLikeIngestDoc`：接入块的 rows 是「列 → 维」数组，报表块是带 dim 的轴对象）。
+ *   不再按"有没有 source"判 —— source 已经是执行参数，没有 source 的接入规格是合法的。
+ *   判别本身也是判据，所以只有这一处。
  */
 function parseValidateArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite validate --help';
@@ -519,7 +527,7 @@ export const COMMANDS: CliCommand[] = [
     invocation: 'ingest-dry-run',
     name: 'ingest dry-run',
     summary: '真读源文件，只出形状与主数据判定 —— 一行都不写库',
-    usage: 'bilite ingest dry-run <规格.yaml> [--decisions <decisions.json>]',
+    usage: 'bilite ingest dry-run <规格.yaml> [--source 源.xlsx] [--decisions <decisions.json>]',
     async run(inv, io) {
       if (inv.kind !== 'ingest-dry-run') throw new Error('命令表与 Invocation 不匹配');
       const { diagnoseIngest, parseIngestSpec, parseDecisions } = await import('./ingest/types.ts');
@@ -550,6 +558,7 @@ export const COMMANDS: CliCommand[] = [
         catalog: cat,
         planOnly: true,
         decisions: parseDecisions(await loadDecisions(inv.decisionsPath)),
+        source: inv.source ?? undefined,
       });
       jsonTo(io, { from: inv.specFile, planOnly: true, ...r });
       io.err(
@@ -572,7 +581,7 @@ export const COMMANDS: CliCommand[] = [
     invocation: 'ingest-run',
     name: 'ingest run',
     summary: '真正落库：源 Excel → 星型表（唯一会写库的接入命令）',
-    usage: 'bilite ingest run <规格.yaml> [--decisions <decisions.json>] [--strict]',
+    usage: 'bilite ingest run <规格.yaml> [--source 源.xlsx] [--decisions <decisions.json>] [--strict]',
     async run(inv, io) {
       if (inv.kind !== 'ingest-run') throw new Error('命令表与 Invocation 不匹配');
       const { diagnoseIngest, parseIngestSpec, parseDecisions } = await import('./ingest/types.ts');
@@ -602,6 +611,7 @@ export const COMMANDS: CliCommand[] = [
         catalog: cat,
         decisions: parseDecisions(await loadDecisions(inv.decisionsPath)),
         strict: inv.strict,
+        source: inv.source ?? undefined,
       });
       jsonTo(io, { from: inv.specFile, ...r });
       io.err(
@@ -875,8 +885,9 @@ export const COMMANDS: CliCommand[] = [
       } catch {
         doc = null; // 语法错交给下面的 diagnose 去报（它们对"解析失败"有专门的措辞）
       }
-      const looksIngest =
-        doc !== null && typeof doc === 'object' && Object.hasOwn(doc as object, 'source');
+      // ★ 判别按模板几何（geometry.ts 的唯一实现），不按"有没有 source"——
+      //   source 是执行参数，没有它的一份接入规格也是接入规格
+      const looksIngest = doc !== null && looksLikeIngestDoc(doc);
 
       const count = (issues: Array<{ level: string }>) => ({
         errors: issues.filter((i) => i.level === 'error').length,

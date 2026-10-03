@@ -37,6 +37,11 @@ import { DEFAULT_TARGET, type DimDecision, type IngestIssue, type IngestSpec } f
 export interface IngestRunOptions {
   /** 主数据快照（来自 `catalog()`，调用方注入 → 本模块可脱库测试） */
   catalog: MasterCatalog;
+  /**
+   * **源文件（执行参数）**—— 覆盖规格里的 `source:`（架构 §8.1）。
+   * 传给 dryRunIngest 的是同一个值，所以干跑与落库不会各读各的源。
+   */
+  source?: string;
   /** 人对未识别名称的处置决定（覆盖自动判定；merge 的会写进 dim_alias） */
   decisions?: DimDecision[];
   /** 是否允许为新实体建维（默认 true）。"看起来像已有实体"的名字不受它保护，照样要人拍板 */
@@ -141,17 +146,20 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   //  · **源文件不在了也照样能从 raw 重放**：raw 按内容 hash 定位，而 `raw_source`
   //    记着"这个路径上次对应哪份 raw"（`findRawFile` 的 ②）。源文件是最容易丢的东西，
   //    重放不该依赖它还在。
+  //  · source 是执行参数：调用方给的覆盖规格里写的，干跑与落库用同一个值。
+  const effSource = opts.source ?? spec.source;
   let openBook: ((absPath: string) => Promise<ReadableWorkbook>) | undefined;
-  if (landableSource(spec.source) && !opts.planOnly) {
-    const landed = await landRawFile(spec.source);
+  if (landableSource(effSource) && !opts.planOnly) {
+    const landed = await landRawFile(effSource);
     openBook = () => rawWorkbook(landed.fileHash);
   } else {
-    const hash = await findRawFile(spec.source);
+    const hash = effSource ? await findRawFile(effSource) : undefined;
     if (hash) openBook = () => rawWorkbook(hash);
   }
 
   const shape = await dryRunIngest(spec, {
     catalog: opts.catalog,
+    source: opts.source,
     maxRows: opts.maxRows,
     openBook,
     // ★ 只有这里传 onRow：金额在这条路径上唯一一次离开读取循环
@@ -434,7 +442,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   try {
     await execute(
       `INSERT INTO import_batch (batch_id, source_file, row_count, imported_at, status, note)
-       VALUES (${lit(batchId)}, ${lit(spec.source)}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}`)})`,
+       VALUES (${lit(batchId)}, ${lit(effSource ?? '')}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}`)})`,
     );
 
     // ★ 版本行的生效日 = **本批最早的期数**（不是 now()）：重放要确定性 ——
