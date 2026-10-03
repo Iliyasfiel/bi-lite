@@ -309,7 +309,8 @@ src/
   cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §7）
                    命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · plan|apply · validate · skill export
                    （`scanArgs` 是唯一的参数扫描器）
-                   ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`（顶层有没有 source）
+                   ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`
+                     （按模板几何判：`spec/geometry.ts` 的 `looksLikeIngestDoc`，不按"有没有 source"）
                    ★ 解析层 parseCliArgs() 是纯函数 —— 不启动任何东西即可覆盖整个命令面
                    ★ handler 惰性 import（--help / lint 不加载 duckdb）；数据走 stdout、日志走 stderr
                    ★ 命令表自检：注册了却没 handler → 启动即报错（别让它静默空转）
@@ -373,6 +374,8 @@ src/
   ingest/          ★ 接入层：源 Excel（任意形态）→ 星型表。YAML 由 agent 产出，这里只确定性执行
     types.ts       IngestSpec 类型 + parseIngestSpec() + lintIngest() + diagnoseIngest()
                    ★ 判据只有一份（与 spec/lint.ts 同理）；口径从调用方注入，不 import PERIOD_TYPES
+                   ★ `source` 是**执行参数**（可选）：CLI `--source`、MCP/HTTP 的 `source` 参数覆盖它；
+                     都没有 → 执行期 SOURCE_MISSING（静态诊断不拦）。锚点判据调 geometry.ts 那一份
     dryrun.ts      展开网格 → 事实行（只出形状与计数；onRow 回调是金额唯一一次离开读取循环）
                    openBook? 决定「值从哪来」：默认开 xlsx，已着陆则换成 raw（src/land/read.ts）
                    ⚠️ 有 openBook 时**不要求源文件还在** —— 否则「删了源文件也能重放」到不了这一步
@@ -409,6 +412,9 @@ src/
                    + findUnusedParams()（★ 防"声明了 params 却没用"的静默算错，铁律 14）
     dims.ts        ★ 维度角色表：哪些是「量纲维」、哪些是「筛选维」（铁律 17）
                    + DIMENSIONS 的单一来源（compile.ts 从这里 re-export）
+    geometry.ts    ★ 模板几何（架构 §8.1 的模板层公共子集）：anchor/行键/值格列/dims 角色，
+                   不含实例字面量、不含 source；lintAnchorGeometry 是两侧共用的锚点判据
+                   （lintSpec 与 lintIngest 都调它）；looksLikeIngestDoc 按**几何**判别两份判据该用哪份
     expr.ts        ★ 派生表达式求值器（手写 tokenizer/parser，**不是 eval**）
                    + evalExpr() —— expr 的输入来自 SQL、输出在 JS 里算
     lint.ts        ★ 结构诊断的**唯一判据**：欠约束 / expr 引用 / join / order / chart
@@ -447,7 +453,8 @@ src/
   web/             ★ Web 界面（零前端框架、零构建；`app.js` + `index.html` + `style.css`）
     app.js         数据导入 / 看板查询 / 报表报送三块；**页面不写判据**，只把服务端结论摆给人看
                    + 接入向导：上传源 → 挑/改接入规格 → 边打字诊断 → 干跑 → 待确认拍板 → 落库
-                   + `source:` 由人点按钮改（改完在编辑器里可见）—— 不开"运行时覆盖 source"的第二条真相
+                   + 选中的源文件是**执行参数**（请求体带 `source`，不改写规格 YAML 文本）；
+                     规格里那行 `source:`（若有）只是默认值，兼容读
   mcp/
     tools.ts       ★ 12 个工具
                    看现状：get_catalog（★ 按需下钻；零金额；把「现在有什么」交给 agent）

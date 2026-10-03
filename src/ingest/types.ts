@@ -18,6 +18,7 @@
  */
 import { parse as parseYaml } from 'yaml';
 import { DIM_NAMES, isRegisteredDim } from '../spec/dims.ts';
+import { lintAnchorGeometry } from '../spec/geometry.ts';
 import type { DeclaredFact } from '../gen/ir.ts';
 import type { DimKind } from './resolve.ts';
 
@@ -123,7 +124,12 @@ export interface ValueColumnsSpec {
   measure?: string;
 }
 
-export interface IngestBlock {
+/**
+ * 接入块 = 模板几何（IngestBlockGeometry：anchor + 行标签列绑哪个维 + 行键）
+ *        + 接入侧 overlay（values 的口径映射与 skip、facts、drop —— 实例字面量与语义细节）。
+ * 几何子集的定义在 `src/spec/geometry.ts`（架构 §8.1）。
+ */
+export interface IngestBlock extends IngestBlockGeometry {
   /** 数据区左上角（第一个值格），如 "D2" —— 与报表规格同一个概念 */
   anchor: string;
   /** 行方向：哪些列是行标签。可以多列（如 A 列公司 + C 列指标） */
@@ -163,8 +169,17 @@ export interface IngestSheet {
 export interface IngestSpec {
   id: string;
   title?: string;
-  /** 源 Excel 路径（相对仓库根；必须在允许的根目录内） */
-  source: string;
+  /**
+   * 源 Excel 路径（相对仓库根；必须在允许的根目录内）。
+   *
+   * ★ **可选** —— source 是**执行参数**，不是模板几何（架构 §8.1）：
+   *   同一份几何可以对着任何一份形状相同的源跑。执行时三处给：
+   *   CLI `--source`、MCP `dry_run_ingest` / `run_ingest` 的 `source` 参数、
+   *   HTTP `/api/ingest/dry-run` / `run` 的 `source` 字段；都不给且这里也没有
+   *   → 执行期报 `SOURCE_MISSING`（静态诊断不拦 —— 静态诊断时源文件还没选）。
+   *   旧 YAML 写着 `source:` 照样兼容读 —— 它就是"这份规格的默认源"。
+   */
+  source?: string;
   /**
    * **写进哪张事实表**。默认 `fact_finance`。
    *
@@ -477,8 +492,8 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
   if (!spec.id || typeof spec.id !== 'string') {
     err('NO_ID', 'id', '接入规格必须有 id（批次记录要用它追溯"这份数是谁按哪份规格接进来的"）。');
   }
-  if (!spec.source || typeof spec.source !== 'string') {
-    err('NO_SOURCE', 'source', '必须声明 source：要接入的源 Excel 路径。');
+  if (spec.source !== undefined && (typeof spec.source !== 'string' || spec.source.trim() === '')) {
+    err('SOURCE_BAD', 'source', `source（若有）必须是源 Excel 的路径字符串，收到 ${JSON.stringify(spec.source)}。`);
   }
   if (spec.onConflict !== undefined && spec.onConflict !== 'reject' && spec.onConflict !== 'replace') {
     err('ONCONFLICT_BAD', 'onConflict', `onConflict 只能是 reject 或 replace，收到 ${JSON.stringify(spec.onConflict)}。`);
@@ -503,9 +518,9 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
     }
     sheet.blocks.forEach((block, bi) => {
       const at = `${sAt}.blocks[${bi}]`;
-      // --- 锚点 ---
-      if (!/^[A-Za-z]{1,3}[0-9]+$/.test(String(block?.anchor ?? ''))) {
-        err('ANCHOR_BAD', `${at}.anchor`, `anchor 必须是数据区左上角的单元格坐标（如 "D2"），收到 ${JSON.stringify(block?.anchor)}。`);
+      // --- 锚点（判据只有一份：geometry.ts 的 lintAnchorGeometry，报表侧同款） ---
+      for (const i of lintAnchorGeometry(block?.anchor, `${at}.anchor`, { named: false })) {
+        err(i.code, i.at, i.message);
       }
       // --- 行标签 ---
       if (!Array.isArray(block?.rows) || block.rows.length === 0) {

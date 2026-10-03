@@ -38,6 +38,7 @@ import type { Spec, Block, SheetSpec } from './types.ts';
 import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
 import { exprRefs, ExprError, parseExpr } from './expr.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
+import { lintAnchorGeometry } from './geometry.ts';
 
 export type LintLevel = 'error' | 'warn';
 
@@ -56,6 +57,7 @@ export interface LintIssue {
     | 'PERIODTYPE_UNKNOWN'
     | 'VALUE_MISSING'
     | 'ANCHOR_MISSING'
+    | 'ANCHOR_BAD'
     | 'SHEET_NO_BLOCK'
     | 'NO_ID_OR_SHEET';
   /** 出问题的位置，人能直接对着 YAML 找（如 `sheets[0].blocks[1]`） */
@@ -140,9 +142,8 @@ function checkFilter(
 
 /** 诊断单个 block */
 function lintBlock(b: Block, at: string, out: LintIssue[]) {
-  if (!b.anchor) {
-    out.push({ level: 'error', code: 'ANCHOR_MISSING', at, message: '缺少 anchor（数据写入位置）。' });
-  }
+  // ★ 锚点判据只有一份（geometry.ts 的 lintAnchorGeometry）—— 接入侧 lintIngest 调的是同一个
+  for (const i of lintAnchorGeometry(b.anchor, at, { named: true })) out.push(i);
 
   // ---- 维度名必须是白名单里的 ----
   for (const [axis, spec] of [['rows', b.rows], ['cols', b.cols]] as const) {

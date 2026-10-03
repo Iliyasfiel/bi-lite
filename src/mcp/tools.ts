@@ -589,7 +589,7 @@ async function lintIngestTool(args: { spec?: string; specFile?: string }) {
 }
 
 /** 2.8 dry_run_ingest —— 干跑：形状 + 主数据判定，一次库都不写 */
-async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown }) {
+async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; source?: string }) {
   const { text, from } = loadIngestSpecText(args);
   const cat = await masterCatalog();
   const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
@@ -604,12 +604,12 @@ async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisi
     };
   }
   const spec = parseIngestSpec(text, lintCtx);
-  const r = await runIngest(spec, { catalog: cat, planOnly: true, decisions: parseDecisions(args.decisions) });
+  const r = await runIngest(spec, { catalog: cat, planOnly: true, decisions: parseDecisions(args.decisions), source: args.source });
   return { from, planOnly: true, ...r };
 }
 
 /** 2.9 run_ingest —— 真正落库（源 Excel → 星型表）。这是唯一会写库的接入工具 */
-async function runIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean }) {
+async function runIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean; source?: string }) {
   const { text, from } = loadIngestSpecText(args);
   const cat = await masterCatalog();
   const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
@@ -628,6 +628,7 @@ async function runIngestTool(args: { spec?: string; specFile?: string; decisions
     catalog: cat,
     decisions: parseDecisions(args.decisions),
     strict: args.strict === true,
+    source: args.source,
   });
   return { from, ...r };
 }
@@ -816,6 +817,7 @@ export const TOOLS: ToolDef[] = [
       properties: {
         spec: { type: 'string', description: '接入规格 YAML 文本' },
         specFile: { type: 'string', description: '接入规格文件路径（与 spec 二选一）' },
+        source: { type: 'string', description: '源 Excel 路径（执行参数，覆盖规格里的 source；规格没写 source 时必给）' },
         decisions: {
           type: 'array',
           description: '人对未识别主数据的处置（可选）：{kind: company|metric, raw, action: merge|create, targetId?, note?}',
@@ -824,7 +826,7 @@ export const TOOLS: ToolDef[] = [
       },
       additionalProperties: false,
     },
-    handler: (a) => dryRunIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown }),
+    handler: (a) => dryRunIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; source?: string }),
   },
   {
     name: 'run_ingest',
@@ -837,6 +839,7 @@ export const TOOLS: ToolDef[] = [
       properties: {
         spec: { type: 'string', description: '接入规格 YAML 文本' },
         specFile: { type: 'string', description: '接入规格文件路径（与 spec 二选一）' },
+        source: { type: 'string', description: '源 Excel 路径（执行参数，覆盖规格里的 source；规格没写 source 时必给）' },
         decisions: {
           type: 'array',
           description: '人对未识别主数据的处置：{kind: company|metric, raw, action: merge|create, targetId?, note?}',
@@ -846,7 +849,7 @@ export const TOOLS: ToolDef[] = [
       },
       additionalProperties: false,
     },
-    handler: (a) => runIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean }),
+    handler: (a) => runIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean; source?: string }),
   },
   {
     name: 'get_catalog',
