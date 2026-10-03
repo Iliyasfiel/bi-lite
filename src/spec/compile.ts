@@ -6,12 +6,13 @@
  */
 import type { Block, Spec, SheetSpec } from './types.ts';
 import { substitute } from './types.ts';
-import { DIMENSIONS, DIM_NAMES, isRegisteredDim, type DimName } from './dims.ts';
+import { DIMENSIONS, DIM_NAMES, dimAvailableOn, isRegisteredDim, type DimName } from './dims.ts';
 import { evalExpr, type ExprScope } from './expr.ts';
+import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
 
 // 白名单已抽到 ./dims.ts（lint.ts 与 grammar.ts 也要用，放在这里会成环）。
 // 下面转出去，保持 `from './compile.ts'` 的既有调用点不用改。
-export { DIMENSIONS, DIM_NAMES, isRegisteredDim };
+export { DIMENSIONS, DIM_NAMES, isRegisteredDim, dimAvailableOn };
 export type { DimName };
 
 /** SQL 字面量转义（单引号双写）—— 值来自 spec，仍需防御 */
@@ -61,16 +62,48 @@ function filterRef(dim: DimName, col: string): string {
 /**
  * 把一个 block 编译成「行标签 × 列口径」的透视 SQL。
  * 用条件聚合而不是 PIVOT 关键字，因为列数由 spec 决定、需要稳定可控。
+ *
+ * 目标表声明化（查询侧与接入侧同一思路）：
+ *   - `opts.factName` 是 spec.fact 的原样透传（缺省/空 = DEFAULT_TARGET，见 gen/ir.ts）；
+ *   - `opts.facts` 是调用方注入的 models 声明（declaredFactsOf()）。
+ * 表名会**原样拼进 SQL**（铁律 2），所以这里是最硬的墙：
+ *   factName 有值但声明里找不到 → 直接 throw，绝不把 spec 里的裸字符串放进 FROM；
+ *   能进 SQL 的表名永远来自 `models/*.yml` 的声明（fact.name），不是 spec 的输入。
+ * 轴/过滤用到的维度也必须真的长在目标表上（dimAvailableOn）——
+ * 运营事实表没有口径列，配 period_type 轴在这里就报错，而不是跑出恒 0 的表。
  */
 export function compileBlock(
   block: Block,
   params: Record<string, string | number> = {},
-  opts: { maxRows?: number } = {},
+  opts: { maxRows?: number; factName?: string; facts?: DeclaredFact[] } = {},
 ): CompiledQuery {
+  // ---- 目标表解析：factName 有值就必须声明过（fail-closed），否则落缺省表 ----
+  const factName = opts.factName && opts.factName.trim() !== '' ? opts.factName : undefined;
+  const fact: DeclaredFact | null = factName ? (opts.facts ?? []).find((f) => f.name === factName) ?? null : null;
+  if (factName && !fact) {
+    throw new Error(
+      `目标表未声明: ${factName} —— 表名会原样拼进 SQL（铁律 2），只接受 models/*.yml 里声明过的事实表（kind: fact）。`,
+    );
+  }
+  const tableName = fact?.name ?? DEFAULT_TARGET;
+
+  // 维度必须长在目标表上（可用性判据只有一份：dims.ts 的 dimAvailableOn）
+  const needDim = (d: DimName, at: string) => {
+    if (!dimAvailableOn(d, fact)) {
+      throw new Error(
+        d === 'period_type'
+          ? `目标表 ${tableName} 没有口径列（运营事实表没有口径体系，铁律 8），不能配 period_type ${at}`
+          : `维度 ${d} 在目标表 ${tableName} 的声明里不存在，不能用作 ${at}`,
+      );
+    }
+  };
+
   const rowsDim = ident(block.rows.dim);
   const colsDim = ident(block.cols.dim);
+  needDim(rowsDim, 'rows.dim');
+  needDim(colsDim, 'cols.dim');
   const agg = block.value.agg ?? 'sum';
-  const measure = block.value.measure ?? 'amount';
+  const measure = block.value.measure ?? fact?.measureColumn ?? 'amount';
 
   const rowLabels = (block.rows.order ?? []).map((r) => substitute(String(r), params));
   const colLabels = (block.cols.order ?? []).map((c) => substitute(String(c), params));
@@ -99,6 +132,7 @@ export function compileBlock(
   const where: string[] = [];
   const addFilter = (dim: DimName, filter?: Record<string, string | string[]>) => {
     if (!filter) return;
+    needDim(dim, '过滤');
     for (const [col, val] of Object.entries(filter)) {
       if (!/^[a-z_][a-z0-9_]*$/i.test(col)) throw new Error(`非法过滤字段: ${col}`);
       const ref = filterRef(dim, col);
@@ -140,7 +174,7 @@ export function compileBlock(
   const sql = [
     `SELECT ${rowExpr} AS row_label,`,
     '  ' + colExprs.join(',\n  '),
-    'FROM fact_finance f',
+    `FROM ${tableName} f`,
     ...[...joins],
     where.length ? 'WHERE ' + where.join(' AND ') : '',
     `GROUP BY 1`,

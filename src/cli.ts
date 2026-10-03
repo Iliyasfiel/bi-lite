@@ -632,10 +632,11 @@ export const COMMANDS: CliCommand[] = [
       const db = await import('./db/index.ts');
       const { parseSpec } = await import('./spec/types.ts');
       const { compileBlock, runCompiled } = await import('./spec/compile.ts');
+      const { declaredFactsOf } = await import('./gen/parse.ts');
       const { renderTemplate } = await import('./render/excel.ts');
 
       if (!fs.existsSync(inv.specFile)) throw new Error(`报表规格文件不存在：${inv.specFile}`);
-      const spec = parseSpec(fs.readFileSync(inv.specFile, 'utf8'));
+      const spec = parseSpec(fs.readFileSync(inv.specFile, 'utf8'), { facts: declaredFactsOf() });
       if (!spec.template) throw new Error('这份规格没有声明 template，没法出 Excel');
       if (!fs.existsSync(spec.template)) throw new Error(`模板不存在：${spec.template}`);
 
@@ -646,7 +647,7 @@ export const COMMANDS: CliCommand[] = [
       for (const sheet of spec.sheets) {
         for (const b of sheet.blocks) {
           // ↓ 数值只在本地变量里停留，绝不进返回值（与 MCP 的 render_report 同一条纪律）
-          const compiled = compileBlock(b, p);
+          const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
           const result = await runCompiled(compiled, (sql) => db.query(sql));
           blocks.push({
             sheet: sheet.name,
@@ -689,16 +690,22 @@ export const COMMANDS: CliCommand[] = [
     async run(inv, io) {
       if (inv.kind !== 'query') throw new Error('命令表与 Invocation 不匹配');
       const { queryMetrics } = await import('./semantic/query.ts');
+      const { declaredFactsOf } = await import('./gen/parse.ts');
+      const db = await import('./db/index.ts');
       await openDb();
 
-      const r = await queryMetrics({
-        measures: inv.measures,
-        groupBy: inv.groupBy,
-        filter: inv.filter,
-        // ★ 铁律 10：受众由**入口**钉死。CLI 是人的入口 → human（精确值、无阈值）。
-        //   这里写死，不留任何可被参数覆盖的分支 —— 与 Web 入口同一套纪律。
-        audience: 'human',
-      });
+      const r = await queryMetrics(
+        {
+          measures: inv.measures,
+          groupBy: inv.groupBy,
+          filter: inv.filter,
+          // ★ 铁律 10：受众由**入口**钉死。CLI 是人的入口 → human（精确值、无阈值）。
+          //   这里写死，不留任何可被参数覆盖的分支 —— 与 Web 入口同一套纪律。
+          audience: 'human',
+        },
+        (sql) => db.query(sql),
+        declaredFactsOf(),
+      );
 
       jsonTo(io, r);
       io.err(
@@ -915,7 +922,8 @@ export const COMMANDS: CliCommand[] = [
       }
 
       const { diagnoseSpec } = await import('./spec/types.ts');
-      const d = diagnoseSpec(text);
+      const { declaredFactsOf } = await import('./gen/parse.ts');
+      const d = diagnoseSpec(text, { facts: declaredFactsOf() });
       const c = count(d.issues);
       jsonTo(io, {
         kind: 'report',

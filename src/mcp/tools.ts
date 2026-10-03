@@ -22,6 +22,7 @@ import * as db from '../db/index.ts';
 import { catalog } from '../semantic/query.ts';
 import { parseSpec, expandBlock, diagnoseSpec, type Spec } from '../spec/types.ts';
 import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
+import { declaredFactsOf } from '../gen/parse.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
 import { readTemplateSchema, textAt } from '../spec/template.ts';
 import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
@@ -142,9 +143,9 @@ async function getTemplateSchema(args: { template?: string }) {
 function loadSpec(args: { spec?: string; specFile?: string }): { spec: Spec; from: string } {
   if (args.specFile) {
     if (!fs.existsSync(args.specFile)) throw new Error(`spec 文件不存在: ${args.specFile}`);
-    return { spec: parseSpec(fs.readFileSync(args.specFile, 'utf8')), from: args.specFile };
+    return { spec: parseSpec(fs.readFileSync(args.specFile, 'utf8'), { facts: declaredFactsOf() }), from: args.specFile };
   }
-  if (args.spec) return { spec: parseSpec(args.spec), from: '(内联 YAML)' };
+  if (args.spec) return { spec: parseSpec(args.spec, { facts: declaredFactsOf() }), from: '(内联 YAML)' };
   throw new Error('需要 spec（YAML 文本）或 specFile（路径）');
 }
 
@@ -172,7 +173,7 @@ async function lintSpecTool(args: { spec?: string; specFile?: string }) {
     throw new Error('需要 spec（YAML 文本）或 specFile（路径）');
   }
 
-  const d = diagnoseSpec(yamlText);
+  const d = diagnoseSpec(yamlText, { facts: declaredFactsOf() });
   const byLevel = (lv: 'error' | 'warn') => d.issues.filter((i) => i.level === lv);
 
   return {
@@ -281,7 +282,7 @@ async function renderReport(args: {
   for (const sheet of spec.sheets) {
     for (const b of sheet.blocks) {
       // ↓ 数值只在本地变量里停留，绝不进返回值
-      const compiled = compileBlock(b, p);
+      const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
       const result = await runCompiled(compiled, (sql) => db.query(sql));
       renderBlocks.push({
         sheet: sheet.name,
@@ -427,7 +428,7 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
   let draftValid = true;
   let draftError: string | null = null;
   try {
-    parseSpec(r.yaml);
+    parseSpec(r.yaml, { facts: declaredFactsOf() });
   } catch (e) {
     draftValid = false;
     draftError = (e as Error).message;

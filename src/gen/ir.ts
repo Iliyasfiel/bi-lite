@@ -12,6 +12,13 @@
  */
 import { createHash } from 'node:crypto';
 
+/**
+ * 缺省目标事实表。放声明层只此一份：接入侧（`spec.target`）与报表侧（`spec.fact`）
+ * 省略目标表时都落到它 —— 谁在别处再写一个 'fact_finance' 字面量，谁就造了第二个默认值。
+ * （查询侧的两处 FROM 已改为从声明解析 —— `spec/compile.ts` / `semantic/query.ts`。）
+ */
+export const DEFAULT_TARGET = 'fact_finance';
+
 /** 列在语义层扮演的角色 —— 与架构 §7.2 的五个取值一一对应（唯一一份定义，`meta/columns.ts` 从这里 re-export） */
 export type MetaRole = 'pk' | 'dim_fk' | 'measure' | 'degenerate' | 'provenance';
 

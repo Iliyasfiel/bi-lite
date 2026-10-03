@@ -48,6 +48,8 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
      这是自觉的路线分歧，不要因为"别人都这么做"而改。
 2. **维度白名单是唯一 SQL 入口。** `spec/compile.ts` 的 `DIMENSIONS` 是唯一的维度注册表。
    `rows.dim` / `cols.dim` 必须过 `isRegisteredDim()`，**未注册直接抛错**。
+   报表侧的目标表 `spec.fact` 同理：只从 `models/*.yml` 声明过的事实表（kind: fact）里取名字，
+   compile/query 编译期硬校验、lint 报 FACT_UNKNOWN（缺省 `fact_finance`）。
    不要在别处拼接用户可控的表名或列名。过滤字段名须匹配 `/^[a-z_][a-z0-9_]*$/i`，
    字符串字面量一律走 `q()` 转义。
 3. **模板优先，绝不覆盖模板的既有格式。** 见 §5.3.4 坑 7 与 §4 环境备忘。
@@ -171,7 +173,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
     - 区间是**半开** `[valid_from, valid_to)`：`valid_to` = 下一版生效日，NULL = 生效中；
       不允许造出重叠区间（`setDimAttributes` 会拒绝，`scdProblems()` 会报）。
     - **改属性只能走 `setDimAttributes()`**（关旧版 → 开新版 → 更新当前态，三步同序），
-      直改维表会被 `scdProblems()` ② 抓出来 —— 它是这两个表示不漂的**唯一**机制（e2e 第 32 阶段钉着）。
+      直改维表会被 `scdProblems()` ② 抓出来 —— 它是这两个表示不漂的**唯一**机制（e2e 第 33 阶段钉着）。
     - 事实行仍然只记**业务键**：要"按事实期取当时那一版"必须显式 as-of join（`dimAsOf`）。
       把它变成默认行为 = 版本键进事实表（类型 2 的代理键），那是一次跨全链路切换，**不在本轮**。
 
@@ -179,7 +181,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，433 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，446 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -188,7 +190,9 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   （条数以实跑输出为准）：模板指纹 → **CLI 解析层与命令表** → 开库 → 接入规格干跑 → 落库 →
   spec 编译查询 → Excel 渲染 → 版式保真 → 读回 → 换口径出第二张表 → 安全边界 → 语义层 →
   图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
-  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，P4）** → **skill export 与手册对拍（P4）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **生成器 P2（两种写法同一份 IR / plan 只读 / apply 幂等 / 加列不重写数据 / 删列被拦）** → **运营事实表（target 由声明决定 / 无口径列也能落库 / 退化列进主键 / 只进目标表）** → **维度版本行（SCD2：历史侧表 / 生效日用期首日 / 时点查询 / 零回归 / 不变量守卫会抓）** → **agent 侧物料对拍（手册 + 配置 prompt 走同一份 `skillProblems()`）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
+  **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，P4）** → **skill export 与手册对拍（P4）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **生成器 P2（两种写法同一份 IR / plan 只读 / apply 幂等 / 加列不重写数据 / 删列被拦）** → **运营事实表（target 由声明决定 / 无口径列也能落库 / 退化列进主键 / 只进目标表）** → **维度版本行（SCD2：历史侧表 / 生效日用期首日 / 时点查询 / 零回归 / 不变量守卫会抓）** →
+  **业务线报表（报表侧目标表声明化：`spec.fact` 从声明白名单取 / 无口径表拒口径轴 / 运营指标可出报表与看板）** →
+  **agent 侧物料对拍（手册 + 配置 prompt 走同一份 `skillProblems()`）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
 - `test/fixtures/` 与 `test/output/` 是**生成物**，可随时删了重跑 `npm run fixtures`。
@@ -406,12 +410,13 @@ src/
                    + 立场：合并两家公司比不合并危险得多
     master.ts      masterCatalog()：主数据快照的唯一实现（MCP 工具与 Web 路由共用，防判据漂移）
   spec/
-    types.ts       Spec 类型 + parseSpec()（YAML → 校验过的 Spec）+ SpecError
+    types.ts       Spec 类型（含 fact：报表侧目标表，缺省 fact_finance）+ parseSpec()（YAML → 校验过的 Spec）+ SpecError
                    + parseSpecLenient()（解析但不校验，给诊断用）
                    + diagnoseSpec()（★ 一次给全所有问题，lint/Web/HTTP 共用）
                    + findUnusedParams()（★ 防"声明了 params 却没用"的静默算错，铁律 14）
     dims.ts        ★ 维度角色表：哪些是「量纲维」、哪些是「筛选维」（铁律 17）
                    + DIMENSIONS 的单一来源（compile.ts 从这里 re-export）
+                   + dimAvailableOn(dim, fact)：维在目标事实表上是否可用（compile/lint/query 三处共用，不另写）
     geometry.ts    ★ 模板几何（架构 §8.1 的模板层公共子集）：anchor/行键/值格列/dims 角色，
                    不含实例字面量、不含 source；lintAnchorGeometry 是两侧共用的锚点判据
                    （lintSpec 与 lintIngest 都调它）；looksLikeIngestDoc 按**几何**判别两份判据该用哪份
@@ -425,6 +430,8 @@ src/
                    ⚠️ 禁止另写一份判据 —— 漂移会表现为"说没问题、保存却被拒"
     compile.ts     ★ DIMENSIONS 白名单 + compileBlock() → 参数化 SQL
                    + runCompiled()（expr 参与计算）+ planOf()（坐标预览，不含金额）
+                   + compileBlock 接受 factName/facts：目标表由声明解析（缺省 gen/ir.ts 的 DEFAULT_TARGET，
+                     铁律 2），未声明即抛、维可用性过 dimAvailableOn
     template.ts    模板结构读取：表头/行标签/合并区/定义名称/公式行
                    + readTemplateSchema() / readRegion() / textAt()（数字在类型层面没出口）
                    + usesDate1904()：读 xl/workbook.xml 的 workbookPr —— 1904 系统的工作簿不许进接入层
@@ -436,6 +443,8 @@ src/
     query.ts       ★ queryMetrics()：唯一的自由查询出口
                    + staticCatalog()（元数据，零金额）+ band() 分档脱敏
                    + QueryRefused + THRESHOLDS（按 audience 分级，见 §4 备忘 7）
+                   + compileMetrics(mq, facts?)：目标表由声明解析（MetricsQuery.fact）——
+                     FACT_UNKNOWN / DIM_NOT_ON_FACT / PERIOD_TYPE_NOT_ON_FACT 三类响亮拒绝
   render/
     excel.ts       ★ renderTemplate()：xlsx-populate 模板填充
                    + readNumberFormat()（纯只读，勿改成 cell.style()）
@@ -501,10 +510,11 @@ data/              ⚠️ 真实财务数据，永不提交
 | 生成器（P2） | ✅ **完成**（`models/*.yml` → IR → `bilite plan` / `bilite apply`：业务表的 DDL 由声明长出来、`_meta_columns` 是它的投影；启动时不自动改结构，见铁律 18） |
 | 维度版本行（SCD2） | ✅ **完成**（历史挂侧表 `dim_*_hist`；`setDimAttributes` 三步同序、`dimAsOf` 半开区间时点查询、`scdProblems()` 对拍两份表示 —— 见铁律 19 与 `docs/开发计划.md` §20） |
 | 运营事实表 | ✅ **完成**（`fact_business_line` 由声明长出来，**无口径列**；接入规格的 `target:` 决定写进哪张表 —— 见铁律 18 与 `docs/开发计划.md` §19） |
+| 报表侧目标表声明化 | ✅ **完成**（`spec.fact` 从 `models/*.yml` 声明白名单取，缺省 `fact_finance`；无口径表拒口径轴 —— FACT_UNKNOWN / DIM_NOT_ON_FACT / PERIOD_TYPE_NOT_ON_FACT；运营指标可出报表与看板，e2e 第 32 阶段 13 条断言） |
 | CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §7 |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**433 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**446 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
 （含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
 第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。
@@ -520,7 +530,7 @@ data/              ⚠️ 真实财务数据，永不提交
   （见 `docs/开发计划.md` §6 与 §17/§18）。① **§10 R8 Parquet compaction 已落**（第 29 阶段 8 条断言）；
   ② **生成器 P2 已落**（`models/*.yml` → IR → plan / apply，第 30 阶段 13 条断言；业务表的 DDL 不再手写）；
   ③ **`fact_business_line` 已落**（声明 + `target:` 由声明决定，第 31 阶段 13 条断言）；
-  ④ **SCD2 已落**（历史侧表 + 时点查询 + 不变量守卫，第 32 阶段 10 条断言）。**四项全部完成。**
+  ④ **SCD2 已落**（历史侧表 + 时点查询 + 不变量守卫，第 33 阶段 10 条断言）。**四项全部完成。**
 
 **§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
 真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），

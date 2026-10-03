@@ -489,7 +489,7 @@ const { queryMetrics, compileMetrics, band, catalog, QueryRefused } = await impo
 
 const cat = await catalog();
 log(`  目录: ${cat.dimensions.length} 维度 / ${cat.periodTypes.length} 口径 / ${cat.metrics.length} 指标 / ${cat.companies.length} 公司`);
-check('目录含 5 个维度', cat.dimensions.length === 5, cat.dimensions.map((d) => d.name).join(','));
+check('目录含 6 个维度', cat.dimensions.length === 6, cat.dimensions.map((d) => d.name).join(','));
 check('目录含 5 个口径', cat.periodTypes.length === 5);
 check('目录含 5 指标 / 4 公司', cat.metrics.length === 5 && cat.companies.length === 4);
 // 目录本身不含金额
@@ -652,7 +652,7 @@ check('ECharts 本地直供（无 CDN 依赖）', vendor.status === 200 && vendo
 
 // 目录：零金额
 const webCat = await getJson('/api/catalog');
-check('GET /api/catalog 返回维度与口径', webCat.dimensions.length === 5 && webCat.periodTypes.length === 5,
+check('GET /api/catalog 返回维度与口径', webCat.dimensions.length === 6 && webCat.periodTypes.length === 5,
   `${webCat.dimensions.length} 维度 / ${webCat.periodTypes.length} 口径`);
 check('目录不含任何金额字段', !/\d{4,}/.test(JSON.stringify(webCat.companies) + JSON.stringify(webCat.metrics)));
 
@@ -938,7 +938,7 @@ try {
   // --- 1. list_metrics：纯元数据 ---
   const lm = await raw('list_metrics');
   check('list_metrics 成功', !lm.isError);
-  check('list_metrics 有维度/口径/指标/公司', lm.json.dimensions.length === 5 && lm.json.periodTypes.length === 5 && lm.json.metrics.length === 5 && lm.json.companies.length === 4);
+  check('list_metrics 有维度/口径/指标/公司', lm.json.dimensions.length === 6 && lm.json.periodTypes.length === 5 && lm.json.metrics.length === 5 && lm.json.companies.length === 4);
   check('list_metrics 不含金额', findAmountLike(lm.json).length === 0);
 
   // --- 2. get_template_schema：模板结构，且不回传数字 ---
@@ -3228,8 +3228,139 @@ log('\n════════ 31. 运营事实表 fact_business_line（target 
     dry2.issues.map((i) => `${i.level}:${i.code}`).join(',') || '无');
 }
 
-// ============ 32. 维度版本行（SCD2 类型 2）：历史挂在侧表 ============
-log('\n════════ 32. 维度版本行 SCD2（历史侧表 + 时点查询）════════');
+// ============ 32. 业务线报表：查询侧目标表声明化（spec.fact 由声明裁决）============
+log('\n════════ 32. 业务线报表（查询侧目标表声明化：无口径列表也能出表）════════');
+{
+  // ★ 阶段 31 守住了「运营事实写得进去」；这一阶段守「读得出来」：
+  //   查询侧两处 FROM（spec 编译 + 看板）原先写死 fact_finance，运营事实表建了也查不了。
+  //   现在 spec.fact / mq.fact 只从 models 的声明取表（铁律 2 的报表侧半句），
+  //   维度能不能用在目标表上由声明裁决（dims.ts 的 dimAvailableOn，编译/lint/查询三处共用一份判据）：
+  //   ① 业务线 spec 编译出的 SQL 落在 fact_business_line，数字与独立 SQL 对拍；
+  //   ② 模板渲染路径对第二张事实表同样成立；
+  //   ③ 三条负路（没声明的表 / 目标表上不存在的维度 / 无口径表配口径）全部在编译期响。
+  const { parseSpec, diagnoseSpec } = await import('../src/spec/types.ts');
+  const { compileBlock, runCompiled } = await import('../src/spec/compile.ts');
+  const { queryMetrics, compileMetrics, QueryRefused } = await import('../src/semantic/query.ts');
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+
+  const facts = declaredFactsOf();
+  const REPORT = 'test/fixtures/报表-业务线.yaml';
+  const yaml = fs.readFileSync(REPORT, 'utf8');
+  // 行首锚定替换（^fact: …）：spec.fact 只动字段那一行，不碰注释里的字面量
+  const yamlNoFact = yaml.replace(/^fact: fact_business_line$/m, 'fact: fact_nope');
+  const yamlNoDim = yaml.replace(/^          dim: business_line$/m, '          dim: period_type');
+
+  // —— ① 静态判据：规格放行；fact 指到没声明的表 / 用了目标表上不存在的维度 → 报错 ——
+  const ok = diagnoseSpec(yaml, { facts });
+  check('★ 业务线报表规格放行（lint 与编译同用一份声明判据）',
+    !ok.issues.some((i) => i.level === 'error'), ok.issues.map((i) => i.code).join(',') || '无 issue');
+  const unknown = diagnoseSpec(yamlNoFact, { facts });
+  check('★ spec.fact 指向没声明的表 → FACT_UNKNOWN（铁律 2 的报表侧半句）',
+    unknown.issues.some((i) => i.code === 'FACT_UNKNOWN'), unknown.issues.map((i) => i.code).join(','));
+  const wrongDim = diagnoseSpec(yamlNoDim, { facts });
+  check('★ 目标表上不存在的维度 → DIM_NOT_ON_FACT（判据来自声明：运营表没有口径轴）',
+    wrongDim.issues.some((i) => i.code === 'DIM_NOT_ON_FACT'), wrongDim.issues.map((i) => i.code).join(','));
+
+  // —— ② 编译：FROM 落在声明表上；两条负路在编译期响（compile 是墙）——
+  const spec = parseSpec(yaml, { facts });
+  const block = spec.sheets[0]!.blocks[0]!;
+  const cq = compileBlock(block, {}, { factName: spec.fact, facts });
+  check('★★ 编译出的 SQL 落在 fact_business_line（不再是写死的 fact_finance）',
+    cq.sql.includes('FROM fact_business_line f') && !cq.sql.includes('fact_finance'),
+    cq.sql.split('\n').find((l) => l.includes('FROM')) ?? '');
+  let unknownThrow = '';
+  try { compileBlock(block, {}, { factName: 'fact_nope', facts }); } catch (e) { unknownThrow = (e as Error).message; }
+  check('★ 编译期撞白名单墙：fact 没声明 → throw（表名会原样拼进 SQL，铁律 2）',
+    unknownThrow.includes('fact_nope') && unknownThrow.includes('铁律 2'), unknownThrow.slice(0, 80));
+  let dimThrow = '';
+  try {
+    compileBlock(parseSpec(yamlNoDim, { facts }).sheets[0]!.blocks[0]!, {}, { factName: 'fact_business_line', facts });
+  } catch (e) { dimThrow = (e as Error).message; }
+  check('★ 编译期撞形状墙：无口径列表配 period_type 轴 → throw（铁律 8）',
+    dimThrow.includes('period_type') && dimThrow.includes('铁律 8'), dimThrow.slice(0, 80));
+
+  // —— ③ 对拍：矩阵与独立 SQL 逐格相同（空格就是 null，不是 0）——
+  const result = await runCompiled(cq, (sql) => db.query(sql));
+  const want = await db.query<{ line: string; metric: string; total: number }>(
+    `SELECT f.business_line AS line, mt.name AS metric, sum(f.amount) AS total
+     FROM fact_business_line f
+     JOIN dim_metric mt ON mt.id = f.metric_id
+     GROUP BY 1, 2`,
+  );
+  const cell = (line: string, metric: string) => {
+    const v = want.find((w) => w.line === line && w.metric === metric)?.total;
+    return v === null || v === undefined ? null : Number(v);
+  };
+  check('★★ 矩阵与独立 SQL 逐格对拍（工业/消费 × 签约额/交付台数）',
+    JSON.stringify(result.matrix) === JSON.stringify([
+      { label: '工业', values: [cell('工业', '签约额'), cell('工业', '交付台数')] },
+      { label: '消费', values: [cell('消费', '签约额'), cell('消费', '交付台数')] },
+    ]),
+    JSON.stringify(result.matrix));
+  check('★ 行序与列序都来自 spec.order（不是查询碰巧返回的顺序）',
+    result.matrix.map((m) => m.label).join(',') === '工业,消费' && cq.colLabels.join(',') === '签约额,交付台数',
+    `行=${result.matrix.map((m) => m.label).join(',')} 列=${cq.colLabels.join(',')}`);
+
+  // —— ④ 渲染：模板填充路径对第二张事实表同样成立 ——
+  const blOut = '/tmp/e2e-业务线月报.xlsx';
+  const rr = await renderTemplate('test/fixtures/业务线月报模板.xlsx', blOut, [{
+    sheet: spec.sheets[0]!.name,
+    anchor: block.anchor,
+    colLabels: cq.colLabels,
+    rows: result.matrix.map((m) => ({ label: m.label, values: m.values })),
+    format: block.value.format,
+    writeRowLabels: false,
+    writeColLabels: false,
+  }]);
+  check('★ 渲染进模板：写入 3 格（消费×交付台数没有数，空格跳过）、文件落盘、预置标签不重写',
+    fs.existsSync(blOut) && rr.cellsWritten === 3, `cells=${rr.cellsWritten}`);
+  fs.rmSync(blOut, { force: true });
+
+  // —— ⑤ 看板：同一份声明白名单管住自由查询 ——
+  const blCompiled = compileMetrics(
+    { fact: 'fact_business_line', measures: [{ metric: '签约额' }], groupBy: ['business_line'], audience: 'human' },
+    facts,
+  );
+  const blq = await queryMetrics(
+    { fact: 'fact_business_line', measures: [{ metric: '签约额' }], groupBy: ['business_line'], audience: 'human' },
+    (sql) => db.query(sql), facts,
+  );
+  check('★★ 看板查询落在声明表上：无口径列 → 不带口径参数也放行，条件里没有 period_type',
+    blCompiled.sql.includes('FROM fact_business_line f') && !blCompiled.sql.includes('f.period_type') &&
+      blCompiled.sql.includes('f.business_line') &&
+      blq.groups.length === 2 && blCompiled.columns.map((c) => c.label).join(',') === '签约额',
+    blCompiled.sql.split('\n').find((l) => l.includes('FROM')) ?? '');
+  let ptRefused = '';
+  try {
+    await queryMetrics(
+      { fact: 'fact_business_line', measures: [{ metric: '签约额', periodType: '单月' }], audience: 'human' },
+      (sql) => db.query(sql), facts,
+    );
+  } catch (e) { ptRefused = e instanceof QueryRefused ? e.reason : (e as Error).message; }
+  check('★ 无口径列表硬配口径 → PERIOD_TYPE_NOT_ON_FACT（静默忽略=写的人以为在起作用）',
+    ptRefused === 'PERIOD_TYPE_NOT_ON_FACT', ptRefused);
+  let dimRefused = '';
+  try {
+    await queryMetrics(
+      { fact: 'fact_business_line', measures: [{ metric: '签约额' }], groupBy: ['period_type'], audience: 'human' },
+      (sql) => db.query(sql), facts,
+    );
+  } catch (e) { dimRefused = e instanceof QueryRefused ? e.reason : (e as Error).message; }
+  check('★ 看板 groupBy 目标表上不存在的维度 → DIM_NOT_ON_FACT',
+    dimRefused === 'DIM_NOT_ON_FACT', dimRefused);
+  let factRefused = '';
+  try {
+    await queryMetrics(
+      { fact: 'fact_nope', measures: [{ metric: '签约额' }], audience: 'human' },
+      (sql) => db.query(sql), facts,
+    );
+  } catch (e) { factRefused = e instanceof QueryRefused ? e.reason : (e as Error).message; }
+  check('★ 看板 fact 没声明 → FACT_UNKNOWN（与接入侧 TARGET_NOT_DECLARED 对偶）',
+    factRefused === 'FACT_UNKNOWN', factRefused);
+}
+
+// ============ 33. 维度版本行（SCD2 类型 2）：历史挂在侧表 ============
+log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点查询）════════');
 {
   // ★ 这一阶段守的是 ④ 的**验收线**（`docs/开发计划.md` §6 的推后理由反面）：
   //   "上了它，每个既有查询与 spec 编译都得带 is_current，是纯成本" ——
