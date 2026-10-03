@@ -7,7 +7,7 @@
 ## 0. 一分钟认知
 
 bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML 规格 → 本地 DuckDB 星型库 → 按模板出表。
-三个入口共用同一套引擎（**CLI 的引擎侧命令已落地** —— 生成器侧与物料侧按阶段挂上，见 `docs/开发计划.md` §7）：**MCP + skill** 给 agent，**Web** 给人，**CLI** 给人与脚本。
+三个入口共用同一套引擎（**CLI 命令面已走完** —— 引擎侧 / 生成器 / 物料 / 运维全挂上，见 `docs/开发计划.md` §1.5）：**MCP + skill** 给 agent，**Web** 给人，**CLI** 给人与脚本。
 
 **它不是 BI 看板。** 保送填表（把财务数据按不同给定表格形式填成 Excel 报送）是主战场，
 看板是副产品。核心抽象只有一个：`spec`（声明式规格 YAML）—— **接入规格**说"这份 Excel 怎么读"，
@@ -64,7 +64,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 7. **执行链路的每一行都不经过 LLM。** 接入规格 YAML 与报表规格 YAML **由 agent（或人）产出**，
    引擎只做**确定性执行**与**确定性拒绝**：`src/ingest/`、`src/spec/`、`src/render/` 下任何代码
    不得引用 LLM/MCP 相关模块，也不得为了"跑通"而放宽判据。
-   *（原表述是「导入链路的每一行都不经过 LLM / `src/import/`」；**长表导入已退场**（2026-10-01），见 `docs/开发计划.md` §10。*
+   *（原表述是「导入链路的每一行都不经过 LLM / `src/import/`」；**长表导入已退场**（2026-10-01），见 `docs/开发计划.md` §1.1。*
 8. **运营指标独立成表**，共享 `dim_company` / `dim_period`，**不要塞进 `fact_finance`**：
    量纲、频率、口径体系都不同（Kimball 星型）。
    现有 `fact_contract` 与 `fact_business_line`（**都已建** —— 2026-10-02 起业务表由 `models/*.yml` 声明长出来）。
@@ -310,7 +310,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 
 ```
 src/
-  cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §7）
+  cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §1.5）
                    命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · plan|apply · validate · skill export
                    （`scanArgs` 是唯一的参数扫描器）
                    ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`
@@ -508,10 +508,10 @@ data/              ⚠️ 真实财务数据，永不提交
 | R1. 主数据对齐 | ✅ **完成**（`resolve.ts` 两档归并 + `dim_alias` 表 + 两阶段 commit + Web 待确认卡片，铁律 16） |
 | §7.2 路径 2 | ✅ **完成**（`dims.ts` / `expr.ts` / `lint.ts` 挡住欠约束 + `lint_spec` 工具 + Web 边打字边诊断，铁律 17） |
 | 生成器（P2） | ✅ **完成**（`models/*.yml` → IR → `bilite plan` / `bilite apply`：业务表的 DDL 由声明长出来、`_meta_columns` 是它的投影；启动时不自动改结构，见铁律 18） |
-| 维度版本行（SCD2） | ✅ **完成**（历史挂侧表 `dim_*_hist`；`setDimAttributes` 三步同序、`dimAsOf` 半开区间时点查询、`scdProblems()` 对拍两份表示 —— 见铁律 19 与 `docs/开发计划.md` §20） |
-| 运营事实表 | ✅ **完成**（`fact_business_line` 由声明长出来，**无口径列**；接入规格的 `target:` 决定写进哪张表 —— 见铁律 18 与 `docs/开发计划.md` §19） |
+| 维度版本行（SCD2） | ✅ **完成**（历史挂侧表 `dim_*_hist`；`setDimAttributes` 三步同序、`dimAsOf` 半开区间时点查询、`scdProblems()` 对拍两份表示 —— 见铁律 19 与 `docs/开发计划.md` §1.3） |
+| 运营事实表 | ✅ **完成**（`fact_business_line` 由声明长出来，**无口径列**；接入规格的 `target:` 决定写进哪张表 —— 见铁律 18 与 `docs/开发计划.md` §1.3） |
 | 报表侧目标表声明化 | ✅ **完成**（`spec.fact` 从 `models/*.yml` 声明白名单取，缺省 `fact_finance`；无口径表拒口径轴 —— FACT_UNKNOWN / DIM_NOT_ON_FACT / PERIOD_TYPE_NOT_ON_FACT；运营指标可出报表与看板，e2e 第 32 阶段 13 条断言） |
-| CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §7 |
+| CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §1.5 |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
 **446 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
@@ -527,7 +527,7 @@ data/              ⚠️ 真实财务数据，永不提交
 - ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
   1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
 - ⏸ ~~已推后（用户 2026-10-01 拍板）~~ → **2026-10-02 用户重新拍板：这四项重新开工**
-  （见 `docs/开发计划.md` §6 与 §17/§18）。① **§10 R8 Parquet compaction 已落**（第 29 阶段 8 条断言）；
+  （见 `docs/开发计划.md` §2 与 §1.6/§1.2）。① **§10 R8 Parquet compaction 已落**（第 29 阶段 8 条断言）；
   ② **生成器 P2 已落**（`models/*.yml` → IR → plan / apply，第 30 阶段 13 条断言；业务表的 DDL 不再手写）；
   ③ **`fact_business_line` 已落**（声明 + `target:` 由声明决定，第 31 阶段 13 条断言）；
   ④ **SCD2 已落**（历史侧表 + 时点查询 + 不变量守卫，第 33 阶段 10 条断言）。**四项全部完成。**

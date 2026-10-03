@@ -67,7 +67,7 @@ export async function open(
  *     否则 `npm start` 的第一步就是"先手动 apply"。
  *  ③ **非空库 + 有结构变更 → 不落地，只**响亮报告**。**
  *     结构变更（DDL）一律要人点一次 `bilite apply` —— 这正是"plan 与 apply 是两条命令"的意义
- *     （`docs/开发计划.md` §3 P2 的验收：先见 diff 再决定落地）。自动做的话，plan 就永远看不到东西了。
+ *     （`docs/开发计划.md` §1.2：先见 diff 再决定落地）。自动做的话，plan 就永远看不到东西了。
  *     **只有不是 DDL 的变更（列契约刷新）随手做掉** —— 它不动数据、也不改结构。
  */
 async function ensureModels(): Promise<void> {

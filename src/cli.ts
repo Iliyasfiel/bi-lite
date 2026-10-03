@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * bi-lite 命令行入口（docs/开发计划.md §7）
+ * bi-lite 命令行入口（docs/开发计划.md §1.5）
  *
  * 定位：三个入口（CLI / MCP / Web）里的第三个 —— 给**人与脚本**。
- * 目前只挂了「接入」一侧的命令；生成器侧（`plan` / `apply`）与物料侧
- * （`catalog` / `validate` / `skill export`）随后按阶段挂上来。
+ * 命令面已走完：引擎侧（ingest / render / query）、生成器侧（`plan` / `apply`）、
+ * 物料侧（`catalog` / `validate` / `skill export`）与运维（`compact`）。
  *
  * 四条纪律（都有出处，改之前先读）：
  *
@@ -18,9 +18,9 @@
  *     所以 `bilite ingest lint x.yaml > report.json` 是干净的。
  *  4. **受众钉死 `human`**（铁律 10）：不提供任何能选 agent 的开关。
  *     且**不许把 CLI 的取数命令写进 agent 侧物料**（skill / `skill export`）——
- *     那等于给 agent 开一条官方泄漏路径（`docs/开发计划.md` §7.5）。
+ *     那等于给 agent 开一条官方泄漏路径（`docs/开发计划.md` §1.5）。
  *
- * 形状借鉴 DSH（`docs/开发计划.md` §7.6）：argv → **纯数据 Invocation** → 分派；
+ * 形状借鉴 DSH（`docs/开发计划.md` §1.5）：argv → **纯数据 Invocation** → 分派；
  * handler 惰性 import（`--help` / `lint` 都不加载 duckdb）；命令表自检；
  * 退出码由一处决定，不散落 `process.exit()`。
  */
@@ -311,7 +311,7 @@ function parseCompactArgs(tokens: readonly string[]): Invocation {
  * `plan` / `apply` —— 生成器侧的两条命令（P2）。
  *
  * ★ 为什么必须是**两条**命令（而不是一条带 `--yes`）：先见 diff 再决定落地，
- *   是这个生成器存在的理由（`docs/开发计划.md` §3 P2 的验收）。`plan` 一个字节都不写。
+ *   是这个生成器存在的理由（`docs/开发计划.md` §1.2 的验收）。`plan` 一个字节都不写。
  * ★ 默认目录不在这里写死：缺 `--models` 时交给 `gen/parse.ts` 的 `MODELS_DIR`
  *   （默认值只允许有一份 —— 同 `compact` 的 `--max-bytes`）。
  */
