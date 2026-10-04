@@ -82,6 +82,7 @@ export type Invocation =
     }
   | { kind: 'plan'; modelsDir: string | null; check: boolean }
   | { kind: 'apply'; modelsDir: string | null }
+  | { kind: 'rebuild'; modelsDir: string | null }
   | { kind: 'validate'; specFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
@@ -114,6 +115,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'compact') return parseCompactArgs(tokens.slice(1));
   if (first === 'plan') return parseGenArgs('plan', tokens.slice(1));
   if (first === 'apply') return parseGenArgs('apply', tokens.slice(1));
+  if (first === 'rebuild') return parseGenArgs('rebuild', tokens.slice(1));
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
@@ -308,14 +310,14 @@ function parseCompactArgs(tokens: readonly string[]): Invocation {
 }
 
 /**
- * `plan` / `apply` —— 生成器侧的两条命令（P2）。
+ * `plan` / `apply` / `rebuild` —— 生成器侧的三条命令（P2 + P3）。
  *
- * ★ 为什么必须是**两条**命令（而不是一条带 `--yes`）：先见 diff 再决定落地，
+ * ★ 为什么 plan 与 apply 必须是**两条**命令（而不是一条带 `--yes`）：先见 diff 再决定落地，
  *   是这个生成器存在的理由（`docs/开发计划.md` §1.2 的验收）。`plan` 一个字节都不写。
  * ★ 默认目录不在这里写死：缺 `--models` 时交给 `gen/parse.ts` 的 `MODELS_DIR`
  *   （默认值只允许有一份 —— 同 `compact` 的 `--max-bytes`）。
  */
-function parseGenArgs(cmd: 'plan' | 'apply', tokens: readonly string[]): Invocation {
+function parseGenArgs(cmd: 'plan' | 'apply' | 'rebuild', tokens: readonly string[]): Invocation {
   const hint = `bilite ${cmd} --help`;
   if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: cmd };
   const args = scanArgs(tokens, ['--models'], cmd === 'plan' ? ['--check'] : [], hint);
@@ -325,6 +327,7 @@ function parseGenArgs(cmd: 'plan' | 'apply', tokens: readonly string[]): Invocat
   }
   const modelsDir = args.values['--models']?.[0] ?? null;
   if (cmd === 'apply') return { kind: 'apply', modelsDir };
+  if (cmd === 'rebuild') return { kind: 'rebuild', modelsDir };
   return { kind: 'plan', modelsDir, check: '--check' in args.values };
 }
 
@@ -460,6 +463,7 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'compact',
   'plan',
   'apply',
+  'rebuild',
   'validate',
   'skill-export',
 ];
@@ -874,6 +878,35 @@ export const COMMANDS: CliCommand[] = [
       });
       io.err(`bilite apply: ${r.note}\n`);
       return r.blocked.length > 0 ? EXIT.FAILED : EXIT.OK;
+    },
+  },
+  {
+    invocation: 'rebuild',
+    name: 'rebuild',
+    summary: '全量重算聚合表（kind: aggregate）—— 聚合表是派生物，删了能回来',
+    usage: 'bilite rebuild [--models <目录>]',
+    async run(inv, io) {
+      if (inv.kind !== 'rebuild') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
+      const { rebuildAggregates } = await import('./gen/rebuild.ts');
+      const dir = inv.modelsDir ?? MODELS_DIR;
+
+      const d = diagnoseModels(dir);
+      if (!d.ir) {
+        jsonTo(io, { models: dir, ok: false, issues: d.issues });
+        io.err('bilite rebuild: 声明本身有问题，一行都没动\n');
+        return EXIT.FAILED;
+      }
+      // 生成器命令一律 models:'skip'（与 plan/apply 同理：不让 open() 抢先落地任何东西）
+      await openDb({ models: 'skip' });
+      const r = await rebuildAggregates(d.ir);
+      jsonTo(io, { models: dir, ok: true, rebuilt: r.rebuilt, sqls: r.sqls });
+      io.err(
+        r.rebuilt.length > 0
+          ? `bilite rebuild: 重算了 ${r.rebuilt.length} 张聚合表（${r.rebuilt.join('、')}）\n`
+          : 'bilite rebuild: models/ 里没有聚合表（kind: aggregate），什么都没做\n',
+      );
+      return EXIT.OK;
     },
   },
   {

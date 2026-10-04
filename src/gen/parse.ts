@@ -50,7 +50,7 @@ export interface GenIssue {
 }
 
 const ROLES: readonly MetaRole[] = ['pk', 'dim_fk', 'measure', 'degenerate', 'provenance'];
-const KINDS: readonly ModelKind[] = ['dimension', 'fact', 'bridge'];
+const KINDS: readonly ModelKind[] = ['dimension', 'fact', 'bridge', 'aggregate'];
 
 /** 允许的物理类型（归一化之后比对）。刻意**短**：声明层不该成为"随便写个类型都能过"的地方 */
 const TYPE_OK = /^(VARCHAR|VARCHAR\[\]|DATE|INTEGER|BIGINT|BOOLEAN|TIMESTAMP|DECIMAL\(\d+,\d+\))$/;
@@ -127,6 +127,58 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
 
   const title = typeof d.title === 'string' && d.title.trim() ? d.title.trim() : '';
   if (!title) issues.push(issue('warn', 'MODEL_TITLE_MISSING', `${file}.title`, '没写 title —— catalog 里这张表对人就没有描述'));
+
+  // ---- 聚合表：第三种声明形状（source + grain + measures），列**不是人写的** ----
+  //      单文件阶段只校验形状；列要等跨表阶段从 source 投影（这里看不见别的表）。
+  //      所以 measures 先记成"原型列"（type 为空），投影时再从 source 抄类型。
+  if (kind === 'aggregate') {
+    for (const stray of ['columns', 'keys', 'provenance'] as const) {
+      if (d[stray] !== undefined) {
+        issues.push(
+          issue('error', 'MODEL_FIELD_BAD', `${file}.${stray}`, `聚合表不写 ${stray} —— 它的列由 source 投影（留哪些维度写 grain，聚合什么写 measures）`),
+        );
+      }
+    }
+    const source = typeof d.source === 'string' ? d.source.trim() : '';
+    if (!source) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.source`, '聚合表必须声明 source（从哪张事实表聚合）'));
+    else if (!NAME_OK.test(source)) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.source`, `source 表名不合法：${source}`));
+
+    const grain = Array.isArray(d.grain) ? d.grain.map((g) => String(g)) : [];
+    if (grain.length === 0) {
+      issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${file}.grain`, '聚合表必须声明 grain（聚合键：留下的维度，没留下的都被加总）'));
+    } else if (!grain.every((g) => NAME_OK.test(g))) {
+      issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${file}.grain`, `grain 里有不合法的列名：${grain.filter((g) => !NAME_OK.test(g)).join('、')}`));
+    } else if (new Set(grain).size !== grain.length) {
+      issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${file}.grain`, `grain 里有重复列：${grain.join(',')}`));
+    }
+
+    const measures: IrColumn[] = [];
+    for (const c of readList(d.measures, 'measures', file, issues)) {
+      const n = typeof c.name === 'string' ? c.name.trim() : '';
+      if (!n) continue;
+      if (!NAME_OK.test(n)) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.measures.${n}`, `度量名不合法：${n}`));
+      if (grain.includes(n)) {
+        issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${file}.measures.${n}`, `${n} 同时在 grain 与 measures 里 —— 聚合键和被加总的量不能是同一列`));
+      }
+      const agg = c.agg === undefined ? 'sum' : String(c.agg);
+      if (agg !== 'sum') {
+        issues.push(
+          issue('error', 'MODEL_AGG_FUNC_BAD', `${file}.measures.${n}`, `聚合函数只认 sum（收到 ${agg}）`, 'v1 只加总：均值/最值都有口径问题（分母是谁？），要扩先过铁律 8'),
+        );
+      }
+      measures.push({ name: n, type: '', role: 'measure', key: false, notNull: false, agg });
+    }
+    if (!Array.isArray(d.measures) || measures.length === 0) {
+      issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.measures`, '聚合表必须声明 measures（至少一个要聚合的度量）'));
+    }
+
+    if (issues.some((i) => i.level === 'error')) return { table: null, issues };
+    return {
+      table: { name, kind: 'aggregate', title, grain, columns: measures, primaryKey: [], foreignKeys: [], source },
+      issues,
+    };
+  }
+
 
   // ---- 两种写法：分组（keys/measures/provenance）与平铺（columns）。同时给 = 说不清以哪个为准 ----
   const hasSplit = d.keys !== undefined || d.measures !== undefined || d.provenance !== undefined;
@@ -329,6 +381,74 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
   }
   const dup = tables.map((t) => t.name).filter((n, i, a) => a.indexOf(n) !== i);
   for (const n of new Set(dup)) issues.push(issue('error', 'MODEL_TABLE_DUP', n, `表名重复声明：${n}`));
+
+  // ---- 聚合表：跨表校验 + 列投影（单文件阶段只有形状，这里才看得见 source） ----
+  //   投影规则：grain 列从 source **原样抄**（类型/角色/语义/refs），并且 key: true（聚合键就是主键）；
+  //   measures 从 source 的度量列抄类型，聚合函数来自本声明。列序 = grain 在前、measures 在后。
+  for (let i = 0; i < tables.length; i++) {
+    const t = tables[i]!;
+    if (t.kind !== 'aggregate') continue;
+    const src = tables.find((s) => s.name === t.source);
+    if (!src || src.kind !== 'fact') {
+      issues.push(
+        issue('error', 'MODEL_SOURCE_BAD', `${t.name}.source`, `聚合的 source 必须是本目录声明过的事实表（${t.source} ${!src ? '没声明过' : `是 ${src.kind}，不是 fact`}）`, '聚合的数据从事实表派生：维度 / 桥接 / 别的聚合表都不许当源头'),
+      );
+      continue;
+    }
+    const srcCol = (n: string) => src.columns.find((c) => c.name === n);
+    for (const g of t.grain) {
+      const sc = srcCol(g);
+      if (!sc) issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 不是 ${src.name} 的列`));
+      else if (sc.role === 'measure' || sc.role === 'provenance') {
+        issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 在 ${src.name} 是${sc.role === 'measure' ? '度量' : '溯源'}列 —— 聚合键只能是维度坐标`));
+      }
+    }
+    // ★ 铁律 8 前移到解析期：口径（period_type）与期数（period）**不许被聚合掉**。
+    //   聚合掉口径 = 把"本年累计"与"单月"加在一起 —— 这是错得最安静的那一种：
+    //   数字看起来照样是对的量级，只是谁都不知道它已经不对了。
+    const dropped = src.columns.filter(
+      (c) => !t.grain.includes(c.name) && (c.semantic === 'period' || c.semantic === 'period_type'),
+    );
+    for (const c of dropped) {
+      issues.push(
+        issue('error', 'MODEL_AGG_NONADDABLE', `${t.name}.grain`, `${c.name} 被聚合掉了 —— 口径与期数不是可加维度（把${c.semantic === 'period' ? '不同月份' : '本年累计与单月'}加在一起是无声错）`, `把 ${c.name} 加进 grain；要换时间窗是查询侧的事，不是建表侧的事`),
+      );
+    }
+    // noop 提醒：grain 与 source 主键一致 → 一行都没被加总，这是复制不是聚合
+    if (
+      t.grain.length === src.grain.length &&
+      [...t.grain].sort().join(',') === [...src.grain].sort().join(',')
+    ) {
+      issues.push(
+        issue('warn', 'MODEL_AGG_NOOP', `${t.name}.grain`, `grain 与 ${src.name} 的粒度一致 —— 一行都没被加总（这不是聚合，是复制）`, '要么去掉一个维度（它会被 SUM 掉），要么别建这张表'),
+      );
+    }
+    for (const m of t.columns) {
+      const sc = srcCol(m.name);
+      if (!sc) issues.push(issue('error', 'MODEL_AGG_MEASURE_BAD', `${t.name}.measures.${m.name}`, `${m.name} 不是 ${src.name} 的列`));
+      else if (sc.role !== 'measure') {
+        issues.push(issue('error', 'MODEL_AGG_MEASURE_BAD', `${t.name}.measures.${m.name}`, `${m.name} 在 ${src.name} 是${sc.role}列，不是度量列`));
+      }
+    }
+    if (issues.some((i) => i.level === 'error' && i.at.startsWith(`${t.name}.`))) continue;
+
+    // 投影：grain 列原样抄（key: true），度量列抄类型、带聚合函数
+    const columns: IrColumn[] = t.grain.map((g) => {
+      const sc = srcCol(g)!;
+      return { ...sc, key: true, agg: undefined };
+    });
+    for (const m of t.columns) {
+      const sc = srcCol(m.name)!;
+      columns.push({ ...sc, key: false, agg: m.agg });
+    }
+    const primaryKey = [...t.grain];
+    tables[i] = {
+      ...t,
+      columns,
+      primaryKey,
+      foreignKeys: columns.filter((c) => c.refs).map((c) => ({ column: c.name, refs: c.refs! })),
+    };
+  }
 
   if (issues.length > 0) return { ir: null, issues };
   return { ir: { apiVersion: MODEL_API_VERSION, tables }, issues: [] };

@@ -1,0 +1,16 @@
+# 聚合表：从 fact_finance 全量重算的派生物（P3 第一刀）。
+# 删了能回来 —— `bilite rebuild` 一条命令 CREATE OR REPLACE 重算，聚合表没有"手工修数据"这回事。
+#
+# 声明只写三件事：source（从哪张事实表聚合）、grain（留哪些维度 —— 没留下的都被 SUM 掉）、
+# measures（聚合什么、怎么聚合）。**不写列**：列由 parse 从 source 投影（类型/角色/语义都抄过来）。
+#
+# ★ grain 里的维度是"加总后还有意义的粒度"。这张表把 company_id 加总掉了 ——
+#   全公司按月、按指标、按口径的总量。期数（fin_month）与口径（period_type）**不许**
+#   被聚合掉（parse 会报 MODEL_AGG_NONADDABLE）：把单月和本年累计加在一起是错得最安静的那一种。
+kind: aggregate
+title: 财务月度汇总（月 × 指标 × 口径，全公司）
+source: fact_finance
+grain: [fin_month, metric_id, period_type]
+measures:
+  - name: amount
+    agg: sum

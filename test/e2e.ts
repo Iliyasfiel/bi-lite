@@ -2994,7 +2994,7 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
   // —— ② 业务表真由声明长出来（e2e 的库就是 open() 空库引导建起的）——
   const bizTables = await db.query<{ n: number }>(
     `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
-      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
   );
   const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
   const deps = await db.query<{ depends_on: string }>(
@@ -3024,7 +3024,7 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
       try {
         const r = await c.runAndReadAll(
           `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
-            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%') AND table_name <> 'dim_alias'`,
+            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
         );
         return Number((r.getRowObjectsJson() as Array<{ n: unknown }>)[0]!.n);
       } finally { c.closeSync(); }
@@ -3373,6 +3373,9 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
   const { versionCount, setDimAttributes, dimAsOf, dimHistory, scdProblems } = scd;
 
   // —— ① 历史表由声明长出来；而且**此刻不变量已经成立** ——
+  //    ★ _model 的行数取自声明本身（不是写死的 8）：加一张声明表不该让这里红 ——
+  //      守的是"历史侧表在声明与登记里"，不是"现在有几张表"。
+  const gen33 = await import('../src/gen/parse.ts');
   const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
   const histTables = await db.query<{ table_name: string }>(
     `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'
@@ -3380,7 +3383,7 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
   );
   const problems0 = await scdProblems();
   check('★ 历史侧表由声明长出来（`_model` 里有它），且**接入层建维时写的首版**让不变量当即成立',
-    Number(modelRows[0]!.n) === 8 && histTables.length === 2 && problems0.length === 0,
+    Number(modelRows[0]!.n) === gen33.loadModels().tables.length && histTables.length === 2 && problems0.length === 0,
     `_model=${modelRows[0]!.n} 历史表=${histTables.length} 不变量问题=${problems0.join(' | ') || '无'}`);
 
   // —— ② 首版的生效日 = **本批最早的期数**（不是 now()，重放才确定）——
@@ -3469,6 +3472,154 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
 
   check('★ 收尾：所有操作之后，历史与当前态仍然一致（不变量为空）', (await scdProblems()).length === 0,
     (await scdProblems()).slice(0, 2).join(' | '));
+}
+
+// ============ 34. 聚合表（P3 第一刀）：kind: aggregate —— 列由投影、口径不许聚合掉、删了能回来 ============
+log('\n════════ 34. 聚合表 agg_*（kind: aggregate）════════');
+{
+  // ★ 这一阶段守的是 agg_* 的全部承诺（`docs/开发计划.md` §3.1）：
+  //   ① 列不是人写的 —— 声明只写 source/grain/measures，列由 parse 跨表阶段从 source 投影；
+  //   ② 口径不许被聚合掉 —— 铁律 8 前移到**解析期**（MODEL_AGG_NONADDABLE），不是落库后才发现；
+  //   ③ 删了能回来 —— 聚合表是派生物：CTAS 全量重算，手工投毒一条命令恢复；
+  //   ④ 数字对拍 —— 聚合表内容与手写 SQL 从事实表直接算是同一个答案（两条代码路径）。
+  const gen = await import('../src/gen/parse.ts');
+  const planMod = await import('../src/gen/plan.ts');
+  const { metaProblems } = await import('../src/meta/columns.ts');
+  const { main } = await import('../src/cli.ts');
+  const { queryMetrics } = await import('../src/semantic/query.ts');
+
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① 列由投影长出来（声明里一个列都没写）——
+  const ir = gen.loadModels();
+  const agg = ir.tables.find((t) => t.kind === 'aggregate');
+  if (!agg) throw new Error('models/ 里没有聚合表（agg_finance_by_month.yml 丢了？）');
+  const shape = agg.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}${c.agg ? `:${c.agg}` : ''}`).join(',');
+  check('★★ 聚合表的列由跨表投影长出来：grain 列照抄 source（键角色），measure 列带 agg —— 声明里一个列都没写',
+    shape === 'fin_month:pk:K,metric_id:dim_fk:K,period_type:pk:K,amount:measure:sum' &&
+      agg.primaryKey.join(',') === 'fin_month,metric_id,period_type' &&
+      agg.source === 'fact_finance',
+    shape);
+
+  // —— ② plan 幂等：壳在空库引导时已落地，列名一致即空 diff ——
+  //    类型**不比**：SUM(DECIMAL(18,2)) 落到 DuckDB 是 DECIMAL(38,2)，声明不写类型 —— 比了就永远 pending。
+  const plan0 = await planMod.planModels(ir);
+  check('★ plan 幂等：聚合表落地后 diff 为空（比列名、不比类型 —— SUM 会把 DECIMAL(18,2) 变成 DECIMAL(38,2)）',
+    plan0.pending === false && plan0.changes.length === 0, `changes=${plan0.changes.length}`);
+
+  // —— ③ 数字对拍：聚合表 === 手写 SQL 直接从事实表算 ——
+  //    e2e 中途多次直改 fact_finance（17/22/25/28 阶段），先 rebuild 同步一次再比，
+  //    要守的是"聚合管道算的 == 手写 SQL 算的"，不是"上一次导入之后没人动过事实表"。
+  const rb1 = await runCli(['rebuild']);
+  const rb1j = JSON.parse(rb1.out) as { rebuilt: string[]; sqls: string[] };
+  const factN = Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const expected = await db.query(
+    `SELECT fin_month, metric_id, period_type, SUM(amount) AS amount FROM fact_finance GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
+  );
+  const readAgg = () =>
+    db.query('SELECT fin_month, metric_id, period_type, amount FROM agg_finance_by_month ORDER BY 1, 2, 3');
+  const actual = await readAgg();
+  check('★ `bilite rebuild` 一条命令全量重算（CREATE OR REPLACE，不是增量 upsert）',
+    rb1.code === 0 && rb1j.rebuilt.includes('agg_finance_by_month') &&
+      rb1j.sqls[0]!.startsWith('CREATE OR REPLACE TABLE'),
+    rb1j.sqls[0]!.slice(0, 60) + '…');
+  check('★★ 对拍：聚合表每一行 === 手写 SQL 从事实表直接算（company_id 被 SUM 掉、行数变少）',
+    JSON.stringify(actual) === JSON.stringify(expected) && actual.length > 0 && actual.length < factN,
+    `${actual.length} 行聚合 ← ${factN} 行事实`);
+
+  // —— ④ 口径没被搅在一起：每一种口径各自成行 ——
+  //    ★ 口径集合**取自事实表本身**（不是写死两种 —— 夹具里有四种口径，
+  //      写死就等于把"夹具长什么样"编进断言）。
+  const pts = [...new Set(actual.map((r) => String(r.period_type)))].sort();
+  const ptFact = (await db.query<{ period_type: string }>(
+    'SELECT DISTINCT period_type FROM fact_finance ORDER BY 1')).map((r) => String(r.period_type));
+  check('★ 每种口径各自成行、从不互加（聚合表的口径集合 === 事实表的口径集合 —— 铁律 8 的验收）',
+    JSON.stringify(pts) === JSON.stringify(ptFact) && ptFact.length > 1, pts.join(','));
+
+  // —— ⑤ 删了能回来：手工投毒 → rebuild 恢复 ——
+  await db.execute('UPDATE agg_finance_by_month SET amount = 999999');
+  const rb2 = await runCli(['rebuild']);
+  const healed = await readAgg();
+  check('★★ 聚合表是派生物：手工投毒 999999 → `bilite rebuild` 恢复到与对拍 SQL 逐行相同',
+    rb2.code === 0 && JSON.stringify(healed) === JSON.stringify(expected),
+    `重算后 ${healed.length} 行，与手写 SQL 相同`);
+
+  // —— ⑥ 声明的 grain 变了 → plan 报 rebuild-table（非阻塞）；落地后改回去 → 又收敛 ——
+  const TMP = 'test/output/agg-models';
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.cpSync('models', TMP, { recursive: true });
+  const aggYml = (grain: string) =>
+    ['kind: aggregate', 'title: 探针聚合表', 'source: fact_finance', `grain: [${grain}]`,
+      'measures:', '  - name: amount', '    agg: sum', ''].join('\n');
+  fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, aggYml('fin_month, period_type'));
+  const planG = await planMod.planModels(gen.loadModels(TMP));
+  const rt = planG.changes.find((c) => c.kind === 'rebuild-table');
+  check('★★ grain 去掉一个维度 → plan 报 rebuild-table（非阻塞 —— 聚合表没有"删列永不自动"的顾虑，重算即对齐）',
+    rt !== undefined && rt.blocking === false && planG.blocking.length === 0, rt?.detail ?? '');
+  const colCount = async () => Number((await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'agg_finance_by_month'`))[0]!.n);
+  const apG = await runCli(['apply', '--models', TMP]);
+  const colsG = await colCount();
+  const apBack = await runCli(['apply']); // 声明改回 4 列（主 models/）→ 又一次 rebuild-table → 收敛
+  const colsBack = await colCount();
+  const planEnd = await planMod.planModels(ir);
+  check('★ 落地 3 列版本，再按主声明 apply → 收敛回 4 列、plan 归零（聚合表没有需要保护的旧结构）',
+    apG.code === 0 && colsG === 3 && apBack.code === 0 && colsBack === 4 && planEnd.pending === false,
+    `列数 ${colsG} → ${colsBack}，plan pending=${planEnd.pending}`);
+
+  // —— ⑦ 负例：铁律 8 前移到解析期（还没碰库就被拒）——
+  const neg = async (grain: string, extra?: { source?: string; measure?: string; agg?: string; columns?: boolean }) => {
+    fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, [
+      'kind: aggregate', 'title: 探针聚合表', `source: ${extra?.source ?? 'fact_finance'}`,
+      `grain: [${grain}]`,
+      ...(extra?.columns ? ['columns:', '  - { name: x, type: varchar }'] : []),
+      'measures:', `  - name: ${extra?.measure ?? 'amount'}`, `    agg: ${extra?.agg ?? 'sum'}`, '',
+    ].join('\n'));
+    return gen.diagnoseModels(TMP);
+  };
+  const codeOf = (d: { issues: Array<{ code: string }> }) => d.issues.map((i) => i.code).join(',');
+  const n1 = await neg('fin_month, metric_id'); // 聚合掉 period_type
+  check('★★ 聚合掉 period_type → MODEL_AGG_NONADDABLE（把本年累计与单月加在一起是错得最安静的那一种）',
+    codeOf(n1).includes('MODEL_AGG_NONADDABLE') && n1.ir === null, codeOf(n1));
+  const n2 = await neg('company_id, metric_id, period_type'); // 聚合掉 fin_month
+  check('★ 聚合掉期数列（semantic: period）同样被拒 —— 不只是口径，期数也不许被加总',
+    codeOf(n2).includes('MODEL_AGG_NONADDABLE'), codeOf(n2));
+  const n3 = await neg('fin_month, period_type', { source: 'dim_metric' });
+  check('★ source 不是事实表 → MODEL_SOURCE_BAD（维度/桥接/别的聚合表都不许当源头）',
+    codeOf(n3).includes('MODEL_SOURCE_BAD'), codeOf(n3));
+  const n4 = await neg('fin_month, period_type', { measure: 'batch_id' });
+  check('★ measure 拿 provenance 列冒充 → MODEL_AGG_MEASURE_BAD（批次号加起来没有意义）',
+    codeOf(n4).includes('MODEL_AGG_MEASURE_BAD'), codeOf(n4));
+  const n5 = await neg('fin_month, company_id, metric_id, period_type'); // 与 source 粒度同集合
+  check('★ grain 与源表粒度同集合 → warn MODEL_AGG_NOOP，且 fail-closed：连 warn 都不放行（一行都没被加总，这不是聚合是复制）',
+    codeOf(n5).includes('MODEL_AGG_NOOP') && n5.ir === null, codeOf(n5));
+  const n6 = await neg('fin_month, period_type', { agg: 'avg' });
+  check('★ agg: avg → MODEL_AGG_FUNC_BAD（v1 只加总：均值有口径问题 —— 分母是谁？）',
+    codeOf(n6).includes('MODEL_AGG_FUNC_BAD'), codeOf(n6));
+  const n7 = await neg('fin_month, period_type', { columns: true });
+  check('★ 手写 columns → MODEL_FIELD_BAD（列由 source 投影，人写的必与投影冲突）',
+    codeOf(n7).includes('MODEL_FIELD_BAD'), codeOf(n7));
+
+  // —— ⑧ 依赖图：agg → source 的边真的在（谁从谁派生，_model_dep 里可查）——
+  const deps = await db.query<{ depends_on: string }>(
+    `SELECT DISTINCT depends_on FROM _model_dep WHERE name = 'agg_finance_by_month' ORDER BY 1`,
+  );
+  check('★ _model_dep 有聚合表的两条边：metric_id→dim_metric、source→fact_finance（派生关系可查）',
+    deps.map((d) => d.depends_on).join(',') === 'dim_metric,fact_finance',
+    deps.map((d) => d.depends_on).join(','));
+
+  // —— ⑨ 零回归 + 收尾 ——
+  const probe = await queryMetrics(
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const });
+  check('★ 零回归：聚合表在场，既有财务查询照常出数（聚合是新增的派生物，不是查询路径的一部分）',
+    probe.groups.length > 0, `${probe.groups.length} 组`);
+  check('★ 收尾：临时目录清掉，契约零漂移、plan 归零',
+    (await metaProblems()).length === 0 && planEnd.pending === false);
+  fs.rmSync(TMP, { recursive: true, force: true });
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
