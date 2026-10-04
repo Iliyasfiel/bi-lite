@@ -883,12 +883,12 @@ export const COMMANDS: CliCommand[] = [
   {
     invocation: 'rebuild',
     name: 'rebuild',
-    summary: '全量重算聚合表（kind: aggregate）—— 聚合表是派生物，删了能回来',
+    summary: '全量对齐派生物：声明行（rows:）同步 + 聚合表重算 —— 都是删了能回来的东西',
     usage: 'bilite rebuild [--models <目录>]',
     async run(inv, io) {
       if (inv.kind !== 'rebuild') throw new Error('命令表与 Invocation 不匹配');
       const { diagnoseModels, MODELS_DIR } = await import('./gen/parse.ts');
-      const { rebuildAggregates } = await import('./gen/rebuild.ts');
+      const { rebuildAll } = await import('./gen/rebuild.ts');
       const dir = inv.modelsDir ?? MODELS_DIR;
 
       const d = diagnoseModels(dir);
@@ -899,13 +899,12 @@ export const COMMANDS: CliCommand[] = [
       }
       // 生成器命令一律 models:'skip'（与 plan/apply 同理：不让 open() 抢先落地任何东西）
       await openDb({ models: 'skip' });
-      const r = await rebuildAggregates(d.ir);
-      jsonTo(io, { models: dir, ok: true, rebuilt: r.rebuilt, sqls: r.sqls });
-      io.err(
-        r.rebuilt.length > 0
-          ? `bilite rebuild: 重算了 ${r.rebuilt.length} 张聚合表（${r.rebuilt.join('、')}）\n`
-          : 'bilite rebuild: models/ 里没有聚合表（kind: aggregate），什么都没做\n',
-      );
+      const r = await rebuildAll(d.ir);
+      jsonTo(io, { models: dir, ok: true, synced: r.synced, rebuilt: r.rebuilt, sqls: r.sqls });
+      const parts: string[] = [];
+      if (r.synced.length > 0) parts.push(`同步了声明行 ${r.synced.map((s) => `${s.table}×${s.rows}`).join('、')}`);
+      if (r.rebuilt.length > 0) parts.push(`重算了聚合表 ${r.rebuilt.join('、')}`);
+      io.err(parts.length > 0 ? `bilite rebuild: ${parts.join('；')}\n` : 'bilite rebuild: models/ 里没有派生物（rows: 或 kind: aggregate），什么都没做\n');
       return EXIT.OK;
     },
   },

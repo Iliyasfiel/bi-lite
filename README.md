@@ -44,7 +44,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 长表/宽表/对齐场景等接入夹具）
-npm run e2e             # ★ 464 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 487 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -339,7 +339,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 464 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 487 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -351,7 +351,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 ```
 src/
   cli.ts             命令行入口（与 Web / MCP 同构的薄壳；数据走 stdout、日志走 stderr）
-  gen/               ★ 生成器：models/*.yml → IR → plan / apply（业务表的 DDL 由声明长出来）
+  gen/               ★ 生成器：models/*.yml → IR → plan / apply / rebuild（业务表的 DDL 由声明长出来）
   paths.ts           ★ 源文件路径白名单（唯一实现 —— 它是安全判据，不许再写一份）
   db/schema.ts       DDL（四维表 + 事实表 + 批次表 + raw 着陆表 + 列契约表）+ 口径注册表
   db/index.ts        open / query / execute / exportParquet（单进程双连接）
@@ -387,7 +387,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，464 项断言
+npm run e2e        # ★ 唯一门禁，487 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现
 ```
@@ -413,6 +413,7 @@ npm run bench      # ⚠️ 未实现
 | §7.2 路径 2 | ✅ 自然语言 → spec：靠"spec 语言挡住欠约束"实现（`lint_spec` + 边打字边诊断） |
 | CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `compact` · `plan` / `apply` / `rebuild` · `validate` · `skill export` |
 | 聚合表 | ✅ `kind: aggregate`：列由跨表投影、`CREATE OR REPLACE` 全量重算（删了能回来）、落库同事务重建 |
+| 桥接层 | ✅ `kind: bridge` + 声明行 `rows:`：`bilite rebuild` 全量对齐、权重和 =1、聚合 `via:` 加权摊分（守恒对拍） |
 | 维度版本行（SCD2） | ✅ 历史挂侧表 `dim_*_hist`；`dimAsOf` 时点查询；**当前态查询零回归** |
 
 ### 已知限制
@@ -427,7 +428,8 @@ npm run bench      # ⚠️ 未实现
   删掉它那条规格立刻变成死路径（而且没有任何提示）。清理是人工动作，两条判据见 `AGENTS.md` §7。
 - **业务表由 `models/*.yml` 声明长出来**（`bilite plan` 看 diff、`bilite apply` 落地）——
   `fact_business_line`（运营指标，**没有口径列**）与 `fact_contract` 都在其中，不再是手写 DDL；
-  聚合表（`kind: aggregate`）同理，声明 source/grain/measures，列由投影、`bilite rebuild` 全量重算。
+  聚合表（`kind: aggregate`）同理，声明 source/grain/measures，列由投影、`bilite rebuild` 全量重算；
+  小维表与桥接表（`kind: bridge`）的行也写在声明里（`rows:`），`bilite rebuild` 全量对齐。
 - **公式缓存值不写回**：xlsx-populate 不重算公式。下游若直接读公式列数值，
   Excel 打开时会自动重算，但程序化读取需要另做处理。
 - **重打包后有 10/18 个部件字节不等**（属性顺序、转义、空白等良性差异）。

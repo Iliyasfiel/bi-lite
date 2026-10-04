@@ -28,6 +28,7 @@ import {
   ModelError,
   declaredFacts,
   normalizeSqlType,
+  viaJoinCandidates,
   type DeclaredFact,
   type Ir,
   type IrColumn,
@@ -98,6 +99,92 @@ function readList(
 }
 
 /**
+ * 声明内嵌行 → 字符串行。**值一律收成字符串**（标量：string/number/boolean）——
+ * 类型是列的事，行只管值；落库时 DuckDB 自己按列类型转换。
+ *
+ * ★ dimension：id **不收**（名字的纯函数 `nameHash`，手写会在改名时漂移）；name 必填且不重复。
+ * ★ bridge：外键收**名字**（sync 时查维表解析成 id，错名整批响亮报错），权重列也必填。
+ */
+function parseRows(
+  kind: 'dimension' | 'bridge',
+  columns: IrColumn[],
+  rowsRaw: unknown,
+  file: string,
+  issues: GenIssue[],
+): Array<Record<string, string>> | undefined {
+  if (!Array.isArray(rowsRaw)) {
+    issues.push(issue('error', 'MODEL_ROWS_BAD', `${file}.rows`, 'rows 必须是列表（每行一个映射：列名 → 值）'));
+    return undefined;
+  }
+  if (rowsRaw.length === 0) {
+    issues.push(issue('error', 'MODEL_ROWS_BAD', `${file}.rows`, 'rows 是空的 —— 空行集什么都对齐不了（没有行就别写 rows）'));
+    return undefined;
+  }
+  if (kind === 'dimension') {
+    const hasId = columns.some((c) => c.name === 'id');
+    const hasName = columns.some((c) => c.name === 'name');
+    if (!hasId || !hasName) {
+      issues.push(
+        issue('error', 'MODEL_ROWS_BAD', file, '带 rows 的维度表必须有 id 与 name 列 —— id 由名字派生、对齐按名字做，少一个"这行是谁"就说不清'),
+      );
+    }
+  }
+  const colNames = new Set(columns.map((c) => c.name));
+  const fkCols = columns.filter((c) => c.role === 'dim_fk' && c.key).map((c) => c.name);
+  const measureCols = columns.filter((c) => c.role === 'measure').map((c) => c.name);
+  const out: Array<Record<string, string>> = [];
+  const seenNames = new Set<string>();
+  const seenCombos = new Set<string>();
+  for (const [i, r] of rowsRaw.entries()) {
+    const at = `${file}.rows[${i}]`;
+    if (r === null || typeof r !== 'object' || Array.isArray(r)) {
+      issues.push(issue('error', 'MODEL_ROWS_BAD', at, '每一行必须是映射（列名 → 值）'));
+      continue;
+    }
+    const row: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r as Record<string, unknown>)) {
+      if (kind === 'dimension' && k === 'id') {
+        issues.push(issue('error', 'MODEL_ROWS_BAD', at, 'id 不手写 —— 它是名字的纯函数（ir.ts 的 nameHash），手写的 id 在改名时漂移'));
+        continue;
+      }
+      if (!colNames.has(k)) {
+        issues.push(issue('error', 'MODEL_ROWS_BAD', at, `行里有不是这张表列的键：${k}`));
+        continue;
+      }
+      if (v === null || typeof v === 'object') {
+        issues.push(issue('error', 'MODEL_ROWS_BAD', at, `${k} 的值必须是标量（收到 ${v === null ? 'null' : '嵌套结构'}）`));
+        continue;
+      }
+      row[k] = String(v);
+    }
+    if (kind === 'dimension') {
+      if (!row.name) {
+        issues.push(issue('error', 'MODEL_ROWS_BAD', at, '维度行缺 name —— 名字是这一行唯一的身份，也是 id 的来源'));
+      } else if (seenNames.has(row.name)) {
+        issues.push(issue('error', 'MODEL_ROWS_DUP', at, `名字重复：${row.name}（id 由名字派生，名字撞 = id 撞）`));
+      } else {
+        seenNames.add(row.name);
+      }
+      for (const c of columns) {
+        if (c.name === 'id') continue;
+        if (c.notNull && row[c.name] === undefined) {
+          issues.push(issue('error', 'MODEL_ROWS_BAD', at, `缺 ${c.name}（声明了 notNull 的列每行都要给值）`));
+        }
+      }
+    } else {
+      for (const k of [...fkCols, ...measureCols]) {
+        if (row[k] === undefined) issues.push(issue('error', 'MODEL_ROWS_BAD', at, `桥接行缺 ${k} —— 外键写名字、权重写数值，缺一个这条边就悬空`));
+      }
+      const combo = fkCols.map((k) => row[k]).join('→');
+      if (seenCombos.has(combo)) issues.push(issue('error', 'MODEL_ROWS_DUP', at, `重复的桥接边：${combo}`));
+      else seenCombos.add(combo);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+/**
  * 解析一份声明。**只解析，不跨表校验**（refs 指向的表存不存在，要等所有文件都读进来才知道）。
  * 一次给全本文件里的所有问题；有 error 时 `table` 为 null。
  */
@@ -132,16 +219,21 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
   //      单文件阶段只校验形状；列要等跨表阶段从 source 投影（这里看不见别的表）。
   //      所以 measures 先记成"原型列"（type 为空），投影时再从 source 抄类型。
   if (kind === 'aggregate') {
-    for (const stray of ['columns', 'keys', 'provenance'] as const) {
+    for (const stray of ['columns', 'keys', 'provenance', 'rows'] as const) {
       if (d[stray] !== undefined) {
         issues.push(
-          issue('error', 'MODEL_FIELD_BAD', `${file}.${stray}`, `聚合表不写 ${stray} —— 它的列由 source 投影（留哪些维度写 grain，聚合什么写 measures）`),
+          issue('error', 'MODEL_FIELD_BAD', `${file}.${stray}`, `聚合表不写 ${stray} —— 它的列由 source 投影（留哪些维度写 grain，聚合什么写 measures）${stray === 'rows' ? '；行更不是人写的（数据从事实派生）' : ''}`),
         );
       }
     }
     const source = typeof d.source === 'string' ? d.source.trim() : '';
     if (!source) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.source`, '聚合表必须声明 source（从哪张事实表聚合）'));
     else if (!NAME_OK.test(source)) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.source`, `source 表名不合法：${source}`));
+
+    // via：JOIN 穿过哪张桥接表做加权摊分（可选；join 键跨表推导，见 diagnoseModels）
+    const via = typeof d.via === 'string' ? d.via.trim() : '';
+    if (d.via !== undefined && !via) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.via`, 'via 要写表名（JOIN 穿过哪张桥接表）'));
+    else if (via && !NAME_OK.test(via)) issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.via`, `via 表名不合法：${via}`));
 
     const grain = Array.isArray(d.grain) ? d.grain.map((g) => String(g)) : [];
     if (grain.length === 0) {
@@ -174,7 +266,7 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
 
     if (issues.some((i) => i.level === 'error')) return { table: null, issues };
     return {
-      table: { name, kind: 'aggregate', title, grain, columns: measures, primaryKey: [], foreignKeys: [], source },
+      table: { name, kind: 'aggregate', title, grain, columns: measures, primaryKey: [], foreignKeys: [], source, via: via || undefined },
       issues,
     };
   }
@@ -187,6 +279,10 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
     issues.push(
       issue('error', 'MODEL_FIELD_BAD', file, '不能同时写 `columns` 与 `keys`/`measures`/`provenance`（两种等价写法，选一种）'),
     );
+  }
+  // via 是聚合表的专属字段（穿桥加权摊分）；写在别的表上是笔误，不是"以后可能用到"
+  if (d.via !== undefined) {
+    issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.via`, `via 只写在聚合表上（${kind || '这个 kind'} 用不着穿桥摊分）`));
   }
 
   let raw: RawColumn[] = [];
@@ -316,14 +412,42 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
       );
     }
   } else if (grain.length > 0) {
-    issues.push(issue('warn', 'MODEL_GRAIN_IGNORED', `${file}.grain`, '维度表的 grain 会被忽略（它的"一行"就是主键）'));
+    issues.push(issue('warn', 'MODEL_GRAIN_IGNORED', `${file}.grain`, '维度 / 桥接表的 grain 会被忽略（它的"一行"就是主键）'));
+  }
+
+  // ---- 桥接表的形状只有一种：恰好两个外键进主键 + ≤1 个权重列，没有第三种列 ----
+  //      "A 到 B 的多对多边"：少一端不叫桥，两端之外的东西（溯源/退化列）属于别的表。
+  if (kind === 'bridge') {
+    const fkKey = columns.filter((c) => c.role === 'dim_fk' && c.key);
+    const weights = columns.filter((c) => c.role === 'measure');
+    const rest = columns.filter((c) => !(c.role === 'dim_fk' && c.key) && c.role !== 'measure');
+    if (fkKey.length !== 2) {
+      issues.push(issue('error', 'MODEL_BRIDGE_SHAPE_BAD', file, `桥接表 = 恰好两个外键进主键（现在 ${fkKey.length} 个）—— 多对多的边，少一端就不叫桥`));
+    }
+    if (weights.length > 1) {
+      issues.push(issue('error', 'MODEL_BRIDGE_SHAPE_BAD', file, `桥接表最多一个权重列（现在 ${weights.length} 个）—— 一张桥只摊一件事；要摊两件事就建两张桥`));
+    }
+    if (rest.length > 0) {
+      issues.push(issue('error', 'MODEL_BRIDGE_SHAPE_BAD', file, `桥接表只有外键与权重列，这些列不属于这里：${rest.map((c) => c.name).join('、')}`));
+    }
+  }
+
+  // ---- 声明内嵌行（rows）：写路径唯一 = bilite rebuild 全量对齐，审计走 git diff ----
+  //      事实表带 rows 是结构错（它的写路径是接入，两条写路径会互相覆盖），不是行写错了的小错。
+  let rows: Array<Record<string, string>> | undefined;
+  if (d.rows !== undefined) {
+    if (kind === 'fact') {
+      issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.rows`, '事实表由接入装载 —— 行来自 Excel，不来自声明。给它写行就是开第二条写路径'));
+    } else {
+      rows = parseRows(kind === 'dimension' ? 'dimension' : 'bridge', columns, d.rows, file, issues);
+    }
   }
 
   if (issues.some((i) => i.level === 'error')) return { table: null, issues };
 
   const foreignKeys = columns.filter((c) => c.refs).map((c) => ({ column: c.name, refs: c.refs! }));
   return {
-    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys },
+    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys, rows },
     issues,
   };
 }
@@ -382,6 +506,38 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
   const dup = tables.map((t) => t.name).filter((n, i, a) => a.indexOf(n) !== i);
   for (const n of new Set(dup)) issues.push(issue('error', 'MODEL_TABLE_DUP', n, `表名重复声明：${n}`));
 
+  // ---- 桥接表：外键只许指维度表，而且那张维度表要有 name 列 ----
+  //      桥接行里的外键写的是**名字**，sync 靠查维表的 name 列把它解析成 id；
+  //      指到非维度表、或维度表没有 name 列，解析就没有落点。
+  for (const t of tables) {
+    if (t.kind !== 'bridge') continue;
+    for (const fk of t.foreignKeys) {
+      const target = tables.find((x) => x.name === fk.refs);
+      if (!target) continue; // 指了没声明的表，上面 MODEL_REFS_BAD 已经报过
+      if (target.kind !== 'dimension') {
+        issues.push(issue('error', 'MODEL_BRIDGE_REF_BAD', `${t.name}.${fk.column}`, `桥接外键只能指向维度表（${fk.refs} 是 ${target.kind}）`));
+      } else if (!target.columns.some((c) => c.name === 'name' && c.type === 'VARCHAR')) {
+        issues.push(issue('error', 'MODEL_BRIDGE_REF_BAD', `${t.name}.${fk.column}`, `${fk.refs} 没有 name 列 —— 桥接行写的是名字，解析时没东西可查`));
+      }
+    }
+  }
+
+  // ---- 单一写路径守卫：带 rows 的维度表，不许再被事实表引用 ----
+  //      事实表引用它 = 接入的主数据归并会往这张维表**建行**；而 rows 又让 rebuild 全量对齐
+  //      （DELETE + INSERT）。两条写路径互相删对方的东西，谁最后跑谁说了算 —— 这种表没有"对的时刻"。
+  //      （桥接表引用它没问题：桥接行解析只**读**维表，不写。）
+  const dimsWithRows = new Set(tables.filter((t) => t.kind === 'dimension' && t.rows).map((t) => t.name));
+  for (const t of tables) {
+    if (t.kind !== 'fact') continue;
+    for (const c of t.columns) {
+      if (c.role === 'dim_fk' && c.refs && dimsWithRows.has(c.refs)) {
+        issues.push(
+          issue('error', 'MODEL_ROWS_OWNER_BAD', `${t.name}.${c.name}`, `${c.refs} 带声明行（写路径 = bilite rebuild 全量对齐），但 ${t.name}.${c.name} 又引用它 —— 接入归并与声明对齐是两条写路径，会互相覆盖`, '行归声明，表就归 sync 一个写路径：事实表去引用不带 rows 的维度表'),
+        );
+      }
+    }
+  }
+
   // ---- 聚合表：跨表校验 + 列投影（单文件阶段只有形状，这里才看得见 source） ----
   //   投影规则：grain 列从 source **原样抄**（类型/角色/语义/refs），并且 key: true（聚合键就是主键）；
   //   measures 从 source 的度量列抄类型，聚合函数来自本声明。列序 = grain 在前、measures 在后。
@@ -396,11 +552,42 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
       continue;
     }
     const srcCol = (n: string) => src.columns.find((c) => c.name === n);
+    // ---- via：JOIN 穿过桥接表加权摊分（第二种聚合形态） ----
+    //   join 键不写：source 与桥接表各自的外键里引用**同一张维表**的那一对，恰好一对才合法。
+    const viaTable = t.via ? tables.find((x) => x.name === t.via) : undefined;
+    const viaCol = (n: string) => viaTable?.columns.find((c) => c.name === n);
+    if (t.via) {
+      if (!viaTable || viaTable.kind !== 'bridge') {
+        issues.push(
+          issue('error', 'MODEL_AGG_VIA_BAD', `${t.name}.via`, `via 必须是本目录声明过的桥接表（${t.via} ${!viaTable ? '没声明过' : `是 ${viaTable.kind}，不是 bridge`}）`, '加权摊分穿的是桥接表：两张维表之间的多对多边'),
+        );
+      } else {
+        const joins = viaJoinCandidates(t, { apiVersion: '', tables });
+        if (joins.length === 0) {
+          issues.push(issue('error', 'MODEL_AGG_VIA_BAD', `${t.name}.via`, `${src.name} 与 ${viaTable.name} 的外键没有引用同一张维表 —— 找不到 join 键`));
+        } else if (joins.length > 1) {
+          issues.push(
+            issue('error', 'MODEL_AGG_VIA_BAD', `${t.name}.via`, `join 键不唯一（${joins.map((j) => `${j.sourceCol} = ${j.viaCol}`).join('、')}）—— 共用的维表必须恰好一个，否则不知道按谁摊`),
+          );
+        }
+        const weights = viaTable.columns.filter((c) => c.role === 'measure');
+        if (weights.length !== 1) {
+          issues.push(issue('error', 'MODEL_AGG_VIA_BAD', `${t.name}.via`, `via 桥接表必须恰好一个权重列（${viaTable.name} 有 ${weights.length} 个）—— 加权摊分乘的就是它`));
+        }
+        if (!t.grain.some((g) => !srcCol(g) && viaCol(g))) {
+          issues.push(issue('error', 'MODEL_AGG_VIA_BAD', `${t.name}.grain`, 'grain 里没有来自 via 的维度 —— 穿了桥却不在桥那头留坐标，摊出去的钱没有去处（不要 via，直接聚）'));
+        }
+      }
+    }
     for (const g of t.grain) {
       const sc = srcCol(g);
-      if (!sc) issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 不是 ${src.name} 的列`));
-      else if (sc.role === 'measure' || sc.role === 'provenance') {
+      const vc = viaCol(g);
+      if (!sc && !vc) issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 不是 ${src.name}${t.via ? ` 或 ${t.via}` : ''} 的列`));
+      if (sc && (sc.role === 'measure' || sc.role === 'provenance')) {
         issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 在 ${src.name} 是${sc.role === 'measure' ? '度量' : '溯源'}列 —— 聚合键只能是维度坐标`));
+      }
+      if (vc && vc.role !== 'dim_fk') {
+        issues.push(issue('error', 'MODEL_AGG_GRAIN_BAD', `${t.name}.grain`, `grain 里的 ${g} 在 ${viaTable!.name} 是 ${vc.role} 列 —— 桥接表上能当聚合键的只有两端外键`));
       }
     }
     // ★ 铁律 8 前移到解析期：口径（period_type）与期数（period）**不许被聚合掉**。
@@ -432,10 +619,10 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
     }
     if (issues.some((i) => i.level === 'error' && i.at.startsWith(`${t.name}.`))) continue;
 
-    // 投影：grain 列原样抄（key: true），度量列抄类型、带聚合函数
+    // 投影：grain 列原样抄（source 里没有的，从 via 桥接表抄 —— 摊分坐标也在主键里，key: true），度量列抄类型、带聚合函数
     const columns: IrColumn[] = t.grain.map((g) => {
-      const sc = srcCol(g)!;
-      return { ...sc, key: true, agg: undefined };
+      const base = srcCol(g) ?? viaCol(g)!;
+      return { ...base, key: true, agg: undefined };
     });
     for (const m of t.columns) {
       const sc = srcCol(m.name)!;

@@ -151,7 +151,7 @@ export async function planModels(ir: Ir): Promise<ModelPlan> {
           table: t.name,
           detail: `聚合表 ${t.name} 的列与声明不一致（库里 ${liveNames.join(',') || '空'} / 声明 ${wantNames.join(',')}）—— 整表重算`,
           blocking: false,
-          sql: rebuildTableSql(t),
+          sql: rebuildTableSql(t, ir),
         });
       }
     } else {

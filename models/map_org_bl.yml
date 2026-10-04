@@ -1,0 +1,51 @@
+# 公司 × 业务线 摊分桥（P3 第二刀：map_* 桥接层）——
+# 一家公司的财务数字要按权重摊到业务线上，走的就是这张多对多的边表。
+#
+# ★ 行也在声明里（外键写**名字**，sync 时查维表解析成 id，错名整批响亮报错）：
+#   5 行声明 —— 集团全归工业；华东 6/4 分摊；华南全归工业；华北全归消费。
+#   每家公司的权重和必须 = 1（DECIMAL 精确校验，没有容差）：摊分要么完整、要么整个不摊。
+#
+# ★ 桥接表的形状只有一种（parse 守卫）：恰好两个外键进主键 + ≤1 个权重列。
+#   聚合表通过 `via: map_org_bl` 穿过来：JOIN 键自动推导（两边外键里引用同一张维表的那一对），
+#   度量 SUM(amount × weight) 加权摊分 —— 见 agg_finance_by_business.yml。
+kind: bridge
+title: 公司 × 业务线 摊分桥（权重）
+keys:
+  - name: company_id
+    type: varchar
+    role: dim_fk
+    key: true
+    notNull: true
+    refs: dim_company
+    semantic: org
+    comment: 声明行写公司名，sync 时解析成 dim_company.id
+  - name: bl_id
+    type: varchar
+    role: dim_fk
+    key: true
+    notNull: true
+    refs: dim_business_line
+    semantic: business_line
+    comment: 声明行写业务线名，sync 时解析成 dim_business_line.id
+measures:
+  - name: weight
+    type: decimal(5,4)
+    notNull: true
+    unit: 摊分比
+    comment: 按公司分组的权重和必须 = 1
+rows:
+  - company_id: 集团公司
+    bl_id: 工业
+    weight: 1.0
+  - company_id: 华东子公司
+    bl_id: 工业
+    weight: 0.6
+  - company_id: 华东子公司
+    bl_id: 消费
+    weight: 0.4
+  - company_id: 华南子公司
+    bl_id: 工业
+    weight: 1.0
+  - company_id: 华北子公司
+    bl_id: 消费
+    weight: 1.0

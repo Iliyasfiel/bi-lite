@@ -64,6 +64,19 @@ export interface IrTable {
    * （grain 列带类型与角色，度量列带聚合函数）。
    */
   source?: string;
+  /**
+   * kind='aggregate' 时可选：JOIN 穿过哪张桥接表（kind='bridge'）做**加权摊分**
+   * （SUM(度量 × 权重)）。join 键不写：自动取「source 与桥接表各自外键里引用同一张维表」
+   * 的那一对（`viaJoinCandidates`，恰好一对才合法，parse 守卫）。
+   */
+  via?: string;
+  /**
+   * kind='dimension' / 'bridge' 时可选：**声明内嵌行**（值一律字符串，sync 时再按列类型落）。
+   * 有 rows 的表写路径只有一条：`bilite rebuild` 全量对齐（DELETE + INSERT 同一事务）——
+   * 改行 = 改声明，审计走 git diff。事实表不许带 rows（它的写路径是接入），聚合表也不许
+   * （列都是投影来的，行更不该手写）。
+   */
+  rows?: Array<Record<string, string>>;
 }
 
 export interface Ir {
@@ -158,6 +171,37 @@ export function declaredFact(ir: Ir, name: string): DeclaredFact | undefined {
   return declaredFacts(ir).find((f) => f.name === name);
 }
 
+// ---------------- 桥接层的推导件 ----------------
+
+/**
+ * 名字的**纯函数哈希**（31 乘子 → base36 前 8 位）。接入侧主数据 id（`ingest/run.ts`
+ * 的 `entityId`：c_/m_ 前缀）与 sync 的声明行 id（表名去 `dim_` 前缀 + 本哈希）共用这一份
+ * —— 谁想改哈希，两边的存量 id 就一起变，所以它放 IR 层导出，不放 run.ts 私有。
+ */
+export function nameHash(s: string): string {
+  let h = 0;
+  for (const ch of s) h = (h * 31 + (ch.codePointAt(0) ?? 0)) >>> 0;
+  return h.toString(36).slice(0, 8);
+}
+
+/**
+ * via 聚合的 join 键候选：source 的 dim_fk 列 × 桥接表的 dim_fk 列里，**引用同一张维表**的对。
+ * 合法声明必须**恰好一对**（parse 守卫 MODEL_AGG_VIA_BAD）；SQL 生成（`rebuildTableSql`）取 [0]。
+ */
+export function viaJoinCandidates(t: IrTable, ir: Ir): Array<{ sourceCol: string; viaCol: string }> {
+  const src = ir.tables.find((x) => x.name === t.source);
+  const via = ir.tables.find((x) => x.name === t.via);
+  if (!src || !via) return [];
+  const out: Array<{ sourceCol: string; viaCol: string }> = [];
+  for (const s of src.columns) {
+    if (s.role !== 'dim_fk' || !s.refs) continue;
+    for (const v of via.columns) {
+      if (v.role === 'dim_fk' && v.refs === s.refs) out.push({ sourceCol: s.name, viaCol: v.name });
+    }
+  }
+  return out;
+}
+
 // ---------------- 列契约（`_meta_columns` / `_meta_objects` 的投影） ----------------
 
 export interface MetaColumn {
@@ -217,7 +261,7 @@ export function normalizeSqlType(raw: string): string {
 export function ddlHashOf(t: IrTable): string {
   const canonical = t.columns.map((c) => `${c.name}:${c.type}:${c.role}:${c.key ? 'K' : '-'}${c.agg ? ':' + c.agg : ''}`).join(',');
   return createHash('sha256')
-    .update(`${t.name}|${t.kind}|${canonical}|pk=${t.primaryKey.join(',')}|grain=${t.grain.join(',')}|src=${t.source ?? ''}`)
+    .update(`${t.name}|${t.kind}|${canonical}|pk=${t.primaryKey.join(',')}|grain=${t.grain.join(',')}|src=${t.source ?? ''}|via=${t.via ?? ''}`)
     .digest('hex')
     .slice(0, 12);
 }

@@ -7,7 +7,7 @@
 ## 0. 一分钟认知
 
 bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML 规格 → 本地 DuckDB 星型库 → 按模板出表。
-三个入口共用同一套引擎（**CLI 命令面已走完** —— 引擎侧 / 生成器 / 物料 / 运维全挂上，见 `docs/开发计划.md` §1.5）：**MCP + skill** 给 agent，**Web** 给人，**CLI** 给人与脚本。
+三个入口共用同一套引擎（**CLI 命令面已走完**，见 `docs/开发计划.md` §1.5）：**MCP + skill** 给 agent，**Web** 给人，**CLI** 给人与脚本。
 
 **它不是 BI 看板。** 保送填表（把财务数据按不同给定表格形式填成 Excel 报送）是主战场，
 看板是副产品。核心抽象只有一个：`spec`（声明式规格 YAML）—— **接入规格**说"这份 Excel 怎么读"，
@@ -25,7 +25,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 | 顺序 | 文档 | 用途 |
 |---|---|---|
 | 1 | `docs/需求与架构.md` | **唯一的规范文本**。§3 选型 / §4 数据模型 / §5 spec 与渲染 / §6 安全 / §7 Agent / §10 风险 / §11 落地顺序 |
-| 2 | `docs/tech-research-excel-template-and-duckdb.md` | 实测原始记录（含源码行号与完整输出）。§5.3 的结论都出自这里 |
+| 2 | `docs/tech-research-excel-template-and-duckdb.md` | 实测原始记录（含源码行号）。§5.3 的结论都出自这里 |
 | 3 | `src/` 各文件头部注释 | 每个模块开头都指向对应章节 |
 | 4 | `skills/bi-lite-ingest/SKILL.md` | **给 agent 的操作手册**：接入规格/报表规格的字段、五步流程、lint 与 dry-run 的分工、**不要向用户索要金额** |
 | 5 | `skills/bi-lite-ingest/AGENT-PROMPT.md` | **接线 + 一段可粘的 system prompt**：MCP 配置（stdio）、agent 的行为纪律、12 个工具的用法。**两份物料都由 `skillProblems()` 对拍** |
@@ -64,7 +64,6 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 7. **执行链路的每一行都不经过 LLM。** 接入规格 YAML 与报表规格 YAML **由 agent（或人）产出**，
    引擎只做**确定性执行**与**确定性拒绝**：`src/ingest/`、`src/spec/`、`src/render/` 下任何代码
    不得引用 LLM/MCP 相关模块，也不得为了"跑通"而放宽判据。
-   *（原表述是「导入链路的每一行都不经过 LLM / `src/import/`」；**长表导入已退场**（2026-10-01），见 `docs/开发计划.md` §1.1。*
 8. **运营指标独立成表**，共享 `dim_company` / `dim_period`，**不要塞进 `fact_finance`**：
    量纲、频率、口径体系都不同（Kimball 星型）。
    现有 `fact_contract` 与 `fact_business_line`（**都已建** —— 2026-10-02 起业务表由 `models/*.yml` 声明长出来）。
@@ -87,7 +86,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
     且主实例的硬化完全不受影响（归档前后 `read_text('/etc/passwd')` 始终被拒）。
     **不要用 `allowed_directories` 来"既允许归档又保持硬化"** —— 实测它与
     `enable_external_access=false` 互斥，且**不拦截 `read_text`/`read_csv`**，不能当安全边界。
-    详见 §4 备忘 9 与 `docs/需求与架构.md` §4.4.1。
+    详见 §4 备忘 9。
 12. **禁止裸 `catch {}`。** 有意容错的地方必须留下可观测痕迹（打日志 + 回传状态字段）。
     判例：Parquet 归档曾因裸 `catch {}` **静默失效多轮**而无人察觉（R13）。
     现在 `POST /api/ingest/run` 回传 `archived: boolean`，而且**写完会在同一个只读实例上读回来数一遍**
@@ -103,9 +102,8 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
     已知局限：分档串（`12.3亿`）与真正的低额金额都过不了它 —— 所以它只是第四道防线，不是第一道。
 14. **上报的数字必须按声明的 params 过滤；"静默算错"比"拒绝出表"危险得多。**
     `parseSpec()` 会检查 `params` 的每个键是否真的被 `{{key}}` 引用过（`findUnusedParams()`），
-    没有引用就**解析即报错**。判例（§11.3）：`specs/月度保送表.yaml` 曾声明 `year/month` 却从不引用，
-    于是"2026 年 6 月月报"静默地把 **12 个月全加总**（B4 得 765345，真值 66826）——
-    数字同量级、格式正常，人不会怀疑它。更糟的是**错数字被写进了 e2e 断言**，测试反而成了 bug 的守卫。
+    没有引用就**解析即报错**。判例（§11.3 与 §6.1）：声明 `year/month` 却从不引用 → "2026年6月月报"把 **12 个月全加总**
+    （B4 = 765345，真值 66826），且**错数字被写进了 e2e 断言** —— 测试反而成了 bug 的守卫。
     - 改 spec 结构时，**先确认 `scope.time` 还在**；新增会用到 `params` 的字段，记得同步
       `substitutableStrings()`（必须与 `compile.ts` 里所有 `substitute()` 调用点一致）。
     - 发现断言里的数字与独立算法（如直接 SQL）不一致时，**先怀疑断言**，别急着改代码迁就它。
@@ -169,6 +167,12 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
       `CREATE OR REPLACE TABLE AS SELECT` 全量重算 —— **删了能回来**，所以 plan 对它
       只比列名集合、不一致就是非阻塞的 `rebuild-table`；落库与数据**同一事务**重建，
       `bilite rebuild` 随时手动重算。
+    - **维度声明行（`rows:`）与桥接表（`kind: bridge`，第六种模板）**：小维表与多对多映射直接写进
+      `models/*.yml`（git 即审计），写路径只有 `bilite rebuild` 全量对齐一条（DELETE→INSERT 同事务，
+      维先桥后）。带 rows 的维**不许被 fact 引用**（`MODEL_ROWS_OWNER_BAD`：接入归并与全量对齐互删）；
+      桥接行外键**写名字**、落库时解析成 id（错名整批拒，绝不静默建主数据），每公司权重和必须 =1
+      （摊分要么完整、要么整个不摊）。聚合表 `via:` 穿桥 = SUM(amount × weight) 加权摊分，
+      join 键自动推导（恰一对），grain 必须留桥坐标（`MODEL_AGG_VIA_BAD`）。
 
 19. **维度历史只增不改；"当前态"与"开放版本"是同一事实的两种表示，必须对拍。**
     - 形态：**历史挂侧表**（`dim_company_hist` / `dim_metric_hist`，由 `models/*_hist.yml` 声明），
@@ -187,8 +191,8 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 ## 3. 常用命令
 
 ```bash
-npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，464 项断言，唯一的门禁
+npm run fixtures   # 生成测试假数据（模板 + 长表/宽表源与规格）到 test/fixtures/
+npm run e2e        # ★ 全链路验收，487 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -200,6 +204,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，P4）** → **skill export 与手册对拍（P4）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **生成器 P2（两种写法同一份 IR / plan 只读 / apply 幂等 / 加列不重写数据 / 删列被拦）** → **运营事实表（target 由声明决定 / 无口径列也能落库 / 退化列进主键 / 只进目标表）** → **维度版本行（SCD2：历史侧表 / 生效日用期首日 / 时点查询 / 零回归 / 不变量守卫会抓）** →
   **业务线报表（报表侧目标表声明化：`spec.fact` 从声明白名单取 / 无口径表拒口径轴 / 运营指标可出报表与看板）** →
   **聚合表（`kind: aggregate`：列由跨表投影 / 口径与期数不许被聚合掉 / `CREATE OR REPLACE` 全量重算 / 落库同事务重建）** →
+  **桥接层（`kind: bridge` + 声明行 `rows:`：`bilite rebuild` 全量对齐 / 权重和必须 =1 / `via:` 加权摊分守恒对拍）** →
   **agent 侧物料对拍（手册 + 配置 prompt 走同一份 `skillProblems()`）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
@@ -233,8 +238,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
    ⚠️ **别把这条读成"只有服务端能开库"**：Web / MCP / **CLI** 三个入口都是"薄壳 + 自己开库"，
    互斥由上面这把锁天然强制。CLI 是**短命进程**（用完即退），不构成本条禁止的"常驻进程"；
    服务端在跑时它拿不到锁，**明确报错**即可，不许静默失败。见 `docs/需求与架构.md` §4.4 末。
-   （唯一例外：`exportParquet()` 会开一个**同进程内、用完即弃的只读实例**做 Parquet 归档 —— 见备忘 9。
-   它在同进程内，不构成"第二个进程"，且只读。）
+   ⚠️ 「`exportParquet()` 是唯一例外」的旧说法**不成立** —— 它同样会改变库锁状态边界，见备忘 13。
 6. **`exceljs` 只能用于生成测试 fixture**（`devDependencies`）。
    **生产路径禁用**：对含批注/图表/图片的真实模板 `readFile` 即崩，写出还会静默删 8/9 类部件（§5.3.1）。
    另外它 `addConditionalFormatting` 用 `type: 'dataBar'` 会崩，测试里用 `cellIs`。
@@ -251,10 +255,8 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
    必须写成显式字段赋值（见 `QueryRefused`）。**这是固有约束，会反复遇到。**
 9. **`enable_external_access=false` 会连 `COPY ... TO` 一起拒，Parquet 归档必须另走只读实例。**
    实测报错：`Permission Error: Cannot access file "..." - file system operations are disabled by configuration`。
-   三条走不通的替代方案（都实测过，别再试）：
-   - `enable_external_access=false` + `allowed_directories` → `Cannot change allowed_directories when enable_external_access is disabled`
-   - 开 `lock_configuration` 后再 `SET allowed_directories` → `configuration has been locked`
-   - 想靠 `allowed_directories` 拦读 → **它不拦截 `read_text`/`read_csv`**，实测能读到 `/etc/passwd`
+   三条走不通的替代方案（都实测过，别再试）：`allowed_directories` 与硬化互斥、
+   `lock_configuration` 后 SET 被拒、`allowed_directories` 拦不住 `read_text`/`read_csv`（能读到 /etc/passwd）。
    正确做法：`exportParquet()` 开 `{ enable_external_access: 'true', access_mode: 'READ_ONLY' }` 的短命实例，
    `conn.closeSync()` + `inst.closeSync()` 收尾。**连接与实例都只有 `closeSync()`，没有 `close()`。**
    另一条实测事实：**归档后主连接也读不回 Parquet**（`read_parquet` 同样被硬化拒），这是预期行为。
@@ -336,17 +338,26 @@ src/
     ir.ts          ★ IR 定义（表 / 列 / 主键 / 外键 / 角色）+ metaOf()（列契约的**唯一投影**）+ 指纹
                    ★ 判据：**换一种 YAML 写法，IR 以下一行都不该改**（e2e 拿两种写法对拍）
                    ★ IrTable.source / IrColumn.agg：聚合表的源表与聚合函数（v1 只认 sum）
+                   ★ IrTable.via（聚合穿桥）/ rows（声明行）；nameHash() / viaJoinCandidates() 共享纯函数
     parse.ts       YAML → IR；两种等价写法（分组 keys/measures · 平铺 columns）；
                    diagnoseModels() 一次给全所有问题；跨表校验 refs 指向的表必须也被声明
                    ★ kind: aggregate：source/grain/measures → 跨表投影列（人不写列）；
                      口径与期数不许被聚合掉（MODEL_AGG_NONADDABLE）
-    ddl.ts         IR → DDL（纯函数：plan 给人看的是它、apply 执行的也是它）+ rebuildTableSql()
-                   （聚合表：CREATE OR REPLACE TABLE AS SELECT … GROUP BY，全量重算）
+                   ★ kind: bridge（桥接表）：恰 2 个 dim_fk + ≤1 度量列；带 rows 的维不许被
+                     fact 引用（MODEL_ROWS_OWNER_BAD：接入归并与 rebuild 全量对齐互删）；
+                     via 穿桥四守卫（存在/join 键恰一对/权重恰一列/grain 留桥坐标）
+    ddl.ts         IR → DDL（纯函数：plan 给人看的是它、apply 执行的也是它）+ rebuildTableSql(t, ir)
+                   （聚合表：CREATE OR REPLACE TABLE AS SELECT … GROUP BY；via 穿桥 = JOIN 桥接表
+                     按权重加权摊分 SUM(amount × weight)，join 键自动推导）
     plan.ts        IR + 现有库结构 → 人可读变更清单（**只读**）；删列 / 改类型 / NOT NULL 列 → 阻塞项
                    ★ 聚合表只比列名集合：不一致 → 非阻塞 rebuild-table（删了能回来，不算结构变更）
     apply.ts       plan → 落库（DDL + 列契约 + _model/_model_dep，**同一事务**）
-    rebuild.ts     rebuildAggregates()：重算全部（或按 source 过滤的）聚合表 —— CLI `bilite rebuild`
-                   与落库同事务重建共用它；写路径只有 CREATE OR REPLACE 全量重算这一条
+    sync.ts        ★ 声明行（rows）的唯一写实现：DELETE→INSERT 全量对齐（维先桥后）；
+                     维行 id = nameHash(name) 派生（不手写）；桥接行外键写名字、落库时解析成 id
+                     （错名一次给全拒绝，绝不静默建主数据）；每公司权重和 ≠1 整批回滚
+    rebuild.ts     rebuildAll()：sync 声明行 + 重算聚合 + 契约刷新，同一事务 —— CLI `bilite rebuild`；
+                   落库事务内只 executeRebuilds 重算聚合（行不依赖事实）；写路径只有
+                   CREATE OR REPLACE 全量重算这一条
   paths.ts          ★ 源文件路径白名单（resolveSource）—— **唯一实现**，是安全判据，别复制第二份
   land/             ★ 着陆层：源文件 → raw_file / raw_cell（append-only，**"可重放"的唯一依据**）
     raw.ts         landRawFile()：sha256 幂等（同 hash 一格都不重写）+ 只存有值的格
@@ -527,26 +538,16 @@ data/              ⚠️ 真实财务数据，永不提交
 | 运营事实表 | ✅ **完成**（`fact_business_line` 由声明长出来，**无口径列**；接入规格的 `target:` 决定写进哪张表 —— 见铁律 18 与 `docs/开发计划.md` §1.3） |
 | 报表侧目标表声明化 | ✅ **完成**（`spec.fact` 从 `models/*.yml` 声明白名单取，缺省 `fact_finance`；无口径表拒口径轴 —— FACT_UNKNOWN / DIM_NOT_ON_FACT / PERIOD_TYPE_NOT_ON_FACT；运营指标可出报表与看板，e2e 第 32 阶段 13 条断言） |
 | 聚合表 | ✅ **完成**（`kind: aggregate`：source/grain/measures 声明 → 列由跨表投影；MODEL_AGG_NONADDABLE 守口径；`CREATE OR REPLACE` 全量重算 + 落库同事务重建 + `bilite rebuild` 手动重算，e2e 第 34 阶段 18 条断言） |
+| 桥接层 | ✅ **完成**（`kind: bridge`（map_*）+ 维度声明行 `rows:`：`bilite rebuild` 全量对齐；权重和 =1、错名整批拒；聚合 `via:` 加权摊分 + 守恒对拍，e2e 第 35 阶段 23 条断言 —— 见铁律 18 与 `docs/开发计划.md` §1.2） |
 | CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §1.5 |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**464 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**487 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
 （含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
 第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。
 
-**下一步（尚未开始）**：
-- ~~`src/import/` 退场~~ → **已完成（2026-10-01，三片全绿）**：`longtable.ts`、三条 `/api/import/*` 路由、
-  旧导入页与旧断言都删了，并补了**退场守卫**（旧路由必须 404、首页不许留旧控件）。
-  第 26 阶段的对拍改为对**冻结快照**（`test/expected/集团导出长表-960行.json`）。
-  ⚠️ `resolve.ts` 同轮搬进了 `src/ingest/`，`src/import/` 目录随之消失 —— 旧路径至此**零残留**。
-- ~~期数的真实日期格~~ → **已完成（2026-10-01）**：由 spec 声明 `type: date`（序列号→日期，只支持
-  1900 系统；1904 系统两处响亮拒绝），e2e 第 27 阶段钉着"声明了才读、不声明不猜、重放一致"。
-- ⏸ ~~已推后（用户 2026-10-01 拍板）~~ → **2026-10-02 用户重新拍板：这四项重新开工**
-  （见 `docs/开发计划.md` §2 与 §1.6/§1.2）。① **§10 R8 Parquet compaction 已落**（第 29 阶段 8 条断言）；
-  ② **生成器 P2 已落**（`models/*.yml` → IR → plan / apply，第 30 阶段 13 条断言；业务表的 DDL 不再手写）；
-  ③ **`fact_business_line` 已落**（声明 + `target:` 由声明决定，第 31 阶段 13 条断言）；
-  ④ **SCD2 已落**（历史侧表 + 时点查询 + 不变量守卫，第 33 阶段 10 条断言）。**四项全部完成。**
+**下一步**：历史施工项全部完成（见 `docs/开发计划.md` §1 与 §4 刀谱）；下一刀看 §3。
 
 **§7.2 路径 2（自然语言描述口径 → spec）已完成**，但它**不是一个独立功能**：
 真正的工作量落在"让 spec 语言在解析期挡住欠约束"上（`src/spec/{dims,expr,lint}.ts`），
@@ -555,46 +556,28 @@ agent 侧只是多了一个 `lint_spec` 工具让它自己先撞一次墙。
 
 ### 6.1 本轮的教训：测试也会成为 bug 的守卫
 
-第 5 步发现 `specs/月度保送表.yaml` 声明 `year/month` 却从不引用，
-"2026年6月月报"实际把 **12 个月全加总**（B4 = 765345，真值 66826）。
-**错的数字已经被写进 `test/e2e.ts` 的断言**，此后一直是绿的 ——
-测试不但没抓住 bug，反而把它锁死了（详见 §2 铁律 14、`docs/需求与架构.md` §11.3）。
+第 5 步发现 `specs/月度保送表.yaml` 声明 `year/month` 却从不引用 —— "2026年6月月报"
+实际把 **12 个月全加总**（B4 = 765345，真值 66826），而**错的数字已写进 `test/e2e.ts` 断言**、
+此后一直绿：测试不但没抓住 bug，反而把它锁死了（§2 铁律 14、`docs/需求与架构.md` §11.3）。
 
-**推论**：断言里的期望值必须来自**独立算法**（如直接 SQL 查一遍），
-不能来自"上一次跑出来的结果"。发现数字对不上时，**先怀疑断言**。
+**推论**：断言里的期望值必须来自**独立算法**（直接 SQL），不能来自"上一次跑出来的结果"；
+发现数字对不上时，**先怀疑断言**。
 
 **新增 MCP 工具时**：必须走 `callTool()`（铁律 13），并在 `test/e2e.ts` 第 13 阶段补断言
 （工具数、返回值零金额、错误路径）。
 
 ### 6.2 接口全绿 ≠ 功能可用：浏览器里才撞得到的三个 bug
 
-R1 交付后 e2e **186 项全绿**，但把人真的会走的路径在浏览器里点一遍，
-连着撞出 **3 个 e2e 结构上抓不到的 bug**：
-
-1. **`UnresolvedName` 没有 `kind` 字段** —— 候选清单由「公司」「指标」两个 Resolver
-   分别产出，汇总成 `unresolved.companies / .metrics` 后**就再也分不出谁是谁**。
-   后果有两个：前端把公司标成「指标」（截图里一眼可见）；更要命的是人拍板回传的
-   `DimDecision.kind` 变成 `undefined`，服务端按 `kind|normalized` 查决定表**永远匹配不上** ——
-   **点「并入」等于没点，提交被无限次拦下**。这是整个"人拍板"机制在不工作。
-   *为什么 e2e 没抓到*：断言只查了 `Array.isArray(staged.unresolved.companies)`
-   （§7 那句"stage 输出 unresolved 候选清单"），**从没把 unresolved 转成 decisions 再提交一次**。
-   现在补的断言正是端到端复现浏览器那一步：`unresolved → decisions → commit` 必须通过。
-2. **点完「并入」提交按钮不变** —— 决定确实记下了，但 `refresh()` 只重渲染卡片、
-   没同步按钮状态，按钮仍是 disabled 且文案不变。人看到的是"点了没反应"。
-   修法：抽出 `syncCommitButton()`，`renderStage()` 与 `refresh()` **都调它**。
-   *为什么 e2e 没抓到*：断言在服务端，不经过 DOM。
-3. **并发/连点上传撞 `batchId`** —— 原来只有 `Date.now()`，同毫秒的两个请求生成同一个 id，
-   后到的那个直接 `Duplicate key "batch_id: ..."`. 用户手快连点两次，或拖放时误触发两次
-   `change`，就会看到校验失败。修法：时间戳外加一个进程内自增序号。
-   *为什么 e2e 没抓到*：断言是串行的，从不并发调用 `stage()`。
+R1 交付后 e2e 186 项全绿，浏览器里点一遍人走的路径，连撞 3 个 e2e 结构上抓不到的 bug：
+① `UnresolvedName` 丢 `kind` 字段 —— `DimDecision.kind` 变 `undefined`，按 `kind|normalized` 查决定表永远匹配不上，**点「并入」等于没点**；
+② 点完「并入」按钮不变 —— `refresh()` 只重渲染卡片没同步按钮状态（修法：`syncCommitButton()` 两处都调）；
+③ 并发/连点上传撞 `batchId` —— 只用 `Date.now()`，同毫秒两个请求同 id（修法：加进程内自增序号）。
 
 **推论（比这三条本身重要）**：
-- **接口测试覆盖不了 UI 状态机。** 交付带交互的功能前，**必须真的走一遍人的路径**
-  （浏览器点击），不能只看 e2e 绿。
-- **"两个来源的数据汇总成一个列表"时，务必把来源标识带下去。** 丢掉 `kind` 这种
-  "看起来冗余"的字段，代价是下游全部失能 —— 而且**不报错**，只是静默不生效。
-- **断言要复现用户动作的完整回路**，而不是只检查中间产物存在（`Array.isArray(...)`
-  这种断言几乎不设防）。
+- **接口测试覆盖不了 UI 状态机。** 交付带交互的功能前，**必须真的走一遍人的路径**，不能只看 e2e 绿。
+- **"两个来源的数据汇总成一个列表"时，务必把来源标识带下去。** 丢掉 `kind` 这种"看起来冗余"的字段，
+  代价是下游全部失能 —— 而且**不报错**，只是静默不生效。
+- **断言要复现用户动作的完整回路**，而不是只检查中间产物存在（`Array.isArray(...)` 这种断言几乎不设防）。
 - **凡是有唯一 id 生成的地方，都问一句"同毫秒两次会怎样"**。
 
 ## 7. 测试纪律
@@ -633,10 +616,8 @@ R1 交付后 e2e **186 项全绿**，但把人真的会走的路径在浏览器�
 - 新增校验规则 → 加到接入层的 `lintIngest()` / `dryRunIngest()` 的 `issues`，并同步加进 `test/e2e.ts` 第 2 阶段。
 - **改了断言 → 同步 §3 / §6 里的条数** —— 现在这条**由 e2e 自校验**：末尾它会读
   `AGENTS.md` §3/§6、`docs/需求与架构.md` §11.1 与 `README.md` **三处**的条数，对不上就红，
-  并告出六处各是多少。**README 是 2026-10-02 才纳进来的** —— 在此之前它一直写着过时的
-  247 与「231 项断言，15 个阶段」；纳进来的当天又漏了一处（"技术选型"表格里那个 231），
-  所以它现在是**三处**而不是两处。README 恰好是最多人信的那份文档。
-  （条数会漂：231 与 247 对不上过一次，根因就是没人管它 —— 所以干脆交给门禁。）
+  并告出六处各是多少。（README 是 2026-10-02 才纳进来的、当天又漏一处，共三处；
+  它恰好是最多人信的那份文档。条数曾因没人管而漂过 —— 所以干脆交给门禁。）
 - 安全相关的断言（第 9 阶段）**只许增加，不许删除**。
 - 版式保真的断言（第 6 阶段）包含 **styles.xml 防膨胀** 四项 —— 这是铁律 4 的回归防线。
 
