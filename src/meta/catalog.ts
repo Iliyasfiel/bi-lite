@@ -13,6 +13,7 @@
  */
 import { query } from '../db/index.ts';
 import { staticCatalog } from '../semantic/query.ts';
+import { semanticFacts, type SemanticFact } from '../semantic/introspect.ts';
 import { API_VERSION, metaProblems, schemaFingerprint } from './columns.ts';
 
 export interface CatalogColumn {
@@ -44,6 +45,8 @@ export interface Catalog {
     dimensions: string[];
   };
   objects: CatalogObject[];
+  /** 语义自省（架构 §7.1）：每张 fact/aggregate 表「能查什么」——从声明推导，零新登记 */
+  semantic: { facts: SemanticFact[] };
   /** `metaProblems()` 的结果。非空 = 声明与真实结构漂移了，agent 不该信这份 catalog */
   drift: string[];
   note: string;
@@ -96,6 +99,7 @@ export async function catalogDump(): Promise<Catalog> {
       dimensions: static_.dimensions.map((d) => d.name),
     },
     objects: await objects(),
+    semantic: { facts: semanticFacts() },
     drift: await metaProblems(),
     note: NOTE,
   };
@@ -134,6 +138,13 @@ export function catalogPrompt(c: Catalog): string {
     ...c.objects.map(
       (o) => `  ${o.name}  ${o.kind}${o.grain ? `  grain: ${o.grain}` : ''}\n` +
         o.columns.map((col) => `      ${col.column.padEnd(14)} ${col.role}${col.refTable ? ` → ${col.refTable}` : ''}`).join('\n'),
+    ),
+    '语义自省（每张可查询表能查什么 —— 从声明推导）',
+    ...c.semantic.facts.map(
+      (f) => `  ${f.name}  度量 ${f.measures.map((m) => `${m.column}${m.unit ? `(${m.unit})` : ''}${m.agg ? `[${m.agg}]` : ''}`).join('/') || '—'}` +
+        ` · 维度 ${[...f.dimRefs.map((d) => `${d.column}→${d.refTable}`), ...f.slicers.map((s) => s.column)].join('/') || '—'}` +
+        ` · 口径 ${f.periodTypeColumn ? `${f.periodTypeColumn}（必须钉）` : '无'}` +
+        (f.lineage.source ? ` · 派生 ← ${f.lineage.source}${f.lineage.via ? ` via ${f.lineage.via}` : ''}` : ''),
     ),
   ];
   if (c.drift.length) out.push('⚠️ 契约漂移（这份 catalog 不可信，先修声明）：', ...c.drift.map((d) => `  - ${d}`));

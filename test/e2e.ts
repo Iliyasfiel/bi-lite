@@ -3838,6 +3838,98 @@ log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + vi
   fs.rmSync(TMP, { recursive: true, force: true });
 }
 
+// ============ 36. 语义层自省 + 查询改写器（P3 第三刀）：零新登记 + 判据一份 ============
+log('\n════════ 36. 语义层自省 + 查询改写器 ════════');
+{
+  // ★ 这一阶段守的是语义层自省与改写器的全部承诺（`docs/开发计划.md` §3.1 交付④、架构 §7.1）：
+  //   ① 自省 = 声明的投影：semanticFacts 与 loadModels 覆盖同一张表集合，**零新登记表**；
+  //   ② 「能查什么」从 role 推出来：measure→指标（带单位）、dim_fk→维度、退化列→切片、
+  //      口径列在不在 → 铁律 17 是否生效、source/via → 派生谱系；
+  //   ③ 改写器只做形状翻译（查询级口径 + 指标成员名 → MetricsQuery），判据仍只有 compileMetrics 一份；
+  //   ④ catalog 面同源：dump 的 semantic 节与自省函数是同一份声明的同一投影。
+  const { semanticFacts, semanticFactOf } = await import('../src/semantic/introspect.ts');
+  const { compileSemanticQuery, runSemanticQuery } = await import('../src/semantic/rewrite.ts');
+  const gen = await import('../src/gen/parse.ts');
+  const ir36 = gen.loadModels();
+  const facts36 = gen.declaredFactsOf();
+  const run36 = (sql: string) => db.query(sql);
+  const refused = async (sq: Parameters<typeof runSemanticQuery>[0]) => {
+    try { await runSemanticQuery(sq, run36, facts36); return 'no-error'; }
+    catch (e) { return e instanceof QueryRefused ? e.reason : (e as Error).message; }
+  };
+
+  // —— ① 自省覆盖 = 声明覆盖（零新登记）——
+  const sf36 = semanticFacts(ir36);
+  const declared36 = ir36.tables.filter((t) => t.kind === 'fact' || t.kind === 'aggregate').map((t) => t.name);
+  check('★★ 自省覆盖恰好 = 声明的 fact/aggregate 表（零新登记：加表自动多一项，没有第二份清单可漂）',
+    sf36.map((f) => f.name).join(',') === declared36.join(','), sf36.map((f) => f.name).join(','));
+  check('★ semanticFactOf 认声明表；未声明的名字 fail-closed 返回 null，不编造形状',
+    semanticFactOf('fact_finance', ir36) !== null && semanticFactOf('fact_nope', ir36) === null);
+
+  // —— ② 每张表的「能查什么」从声明 role 推出 ——
+  const fin = semanticFactOf('fact_finance', ir36)!;
+  check('★ fact_finance：role=measure → 度量 amount(元) 自动可选指标（事实表度量无聚合方式）',
+    fin.measures.length === 1 && fin.measures[0].column === 'amount' && fin.measures[0].unit === '元' && fin.measures[0].agg === null);
+  check('★ fact_finance：role=dim_fk → 可用维度 company→dim_company、metric→dim_metric',
+    fin.dimRefs.map((d) => `${d.column}→${d.refTable}`).sort().join(',') === 'company_id→dim_company,metric_id→dim_metric');
+  check('★ fact_finance：口径列在（period_type）→ 这张表查询必须钉口径（铁律 17 的自省面）',
+    fin.periodTypeColumn === 'period_type');
+  check('★ fact_finance：谱系为空 —— 它是源头表，不是派生物',
+    fin.lineage.source === null && fin.lineage.via === null);
+  const bl = semanticFactOf('fact_business_line', ir36)!;
+  check('★ fact_business_line：无口径列 → 查询不许给口径（同一铁律的另一面，从声明读出）',
+    bl.periodTypeColumn === null);
+  check('★ fact_business_line：business_line 退化列被自省为切片（行内列当维度用）',
+    bl.slicers.map((s) => s.column).join(',') === 'business_line');
+  const agg = semanticFactOf('agg_finance_by_business', ir36)!;
+  check('★ 聚合表谱系：← fact_finance via map_org_bl（派生关系从声明读出，不用查 _model_dep）',
+    agg.lineage.source === 'fact_finance' && agg.lineage.via === 'map_org_bl');
+  check('★ 聚合表度量带聚合方式（agg:sum）、事实表不带 —— 同一自省形状区分两类表',
+    agg.measures.length === 1 && agg.measures[0].agg === 'sum' && agg.measures[0].column === 'amount');
+
+  // —— ③ 改写器：纯翻译 ——
+  const mq36 = compileSemanticQuery({ metrics: ['营业收入'], caliber: '单月', by: ['company'], audience: 'human' as const });
+  check('★★ 改写器只做形状翻译：查询级口径分摊到每个度量、by→groupBy，不复制任何判据',
+    mq36.measures.length === 1 && mq36.measures[0].metric === '营业收入' && mq36.measures[0].periodType === '单月'
+      && mq36.groupBy.join(',') === 'company');
+  const viaRewrite = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '本年累计', by: ['company'], audience: 'human' as const }, run36, facts36);
+  const { queryMetrics } = await import('../src/semantic/query.ts');
+  const byHand = await queryMetrics(
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    run36, facts36);
+  // 分组行序引擎从未承诺（GROUP BY ALL 无 ORDER BY，并行聚合顺序任意）——
+  // 语义等价 = 同一组组、同一组值，比较前按组键排序，不把行序当语义。
+  const canon = (r: { groups: Array<{ values: unknown[]; cells: unknown[] }> }) =>
+    JSON.stringify(r.groups.map((g) => [g.values, g.cells]).sort((a, b) => JSON.stringify(a[0]).localeCompare(JSON.stringify(b[0]))));
+  check('★★ 端到端等价：runSemanticQuery 与手写 queryMetrics 出同一组数（翻译不改语义）',
+    canon(viaRewrite) === canon(byHand), `${viaRewrite.groups.length} 组`);
+
+  // —— ④ 判据一份：改写器不吞错，compileMetrics 的拒绝原样上抛 ——
+  check('★ 未声明表名 → FACT_UNKNOWN 原样上抛（白名单判据仍在 compileMetrics）',
+    (await refused({ fact: 'fact_nope', metrics: ['营业收入'], caliber: '单月', audience: 'human' as const })) === 'FACT_UNKNOWN');
+  check('★ 有口径列不钉 → BAD_MEASURE 原样上抛（铁律 17，改写器不放行）',
+    (await refused({ metrics: ['营业收入'], audience: 'human' as const })) === 'BAD_MEASURE');
+  check('★ 无口径表硬配口径 → PERIOD_TYPE_NOT_ON_FACT 原样上抛（铁律 17 的另一面）',
+    (await refused({ fact: 'fact_business_line', metrics: ['营业收入'], caliber: '单月', audience: 'human' as const })) === 'PERIOD_TYPE_NOT_ON_FACT');
+  check('★ 目标表没有的维度 → DIM_NOT_ON_FACT 原样上抛（dimAvailableOn 三处共用，不因新形状失效）',
+    (await refused({ metrics: ['营业收入'], caliber: '单月', by: ['business_line'], audience: 'human' as const })) === 'DIM_NOT_ON_FACT');
+
+  // —— ⑤ 受众分级穿透改写器 ——
+  const agt36 = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '本年累计', by: ['company'], audience: 'agent' as const }, run36, facts36);
+  check('★ agent 受众穿透改写器仍分档（redaction=banded，分档值带亿/万/千）——铁律 10 不因新形状失效',
+    agt36.meta.redaction === 'banded' && agt36.groups.some((g) => g.cells.some((c) => typeof c === 'string' && /[亿万千]/.test(c))));
+
+  // —— ⑥ catalog 面同源 ——
+  const { catalogDump } = await import('../src/meta/catalog.ts');
+  const cat36 = await catalogDump();
+  check('★★ catalogDump().semantic 与 semanticFacts() 同源：同一份声明的同一投影，不漂',
+    JSON.stringify(cat36.semantic.facts) === JSON.stringify(semanticFacts(ir36)));
+  check('★ 自省节零金额（findAmountLike 扫不到任何像金额的数）',
+    findAmountLike(cat36.semantic).length === 0);
+}
+
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
