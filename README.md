@@ -389,7 +389,6 @@ data/                ⚠️ 真实财务数据，永不提交
 npm run fixtures   # 生成测试假数据到 test/fixtures/
 npm run e2e        # ★ 唯一门禁，487 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
-npm run bench      # ⚠️ 未实现
 ```
 
 > `npm run e2e` 会清空 `data/bi.duckdb` 重跑。**别拿它对着真实数据库跑。**

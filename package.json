@@ -13,7 +13,6 @@
   "scripts": {
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",
-    "bench": "node test/bench.ts",
     "start": "node src/server.ts"
   },
   "dependencies": {
