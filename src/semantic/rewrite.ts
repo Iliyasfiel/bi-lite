@@ -33,6 +33,10 @@ export interface SemanticQuery {
   by?: string[];
   /** 维度过滤（键 = DIMENSIONS 键，值 = 成员名） */
   filter?: Record<string, string | string[]>;
+  /** 场景 selector（正交维度，P5 刀 22）：落地成 filter.scenario —— 与 filter 冲突时 selector 赢 */
+  scenario?: string;
+  /** 币种 selector（正交维度，刀 22）：透传 MetricsQuery.ccy —— fx_rate 按行落窗期取率换算 */
+  ccy?: string;
   /** 受众由调用入口钉死（铁律 10），不给默认值 */
   audience: 'human' | 'agent';
 }
@@ -43,7 +47,9 @@ export function compileSemanticQuery(sq: SemanticQuery): MetricsQuery {
     fact: sq.fact,
     measures: sq.metrics.map((metric) => ({ metric, periodType: sq.caliber })),
     groupBy: sq.by ?? [],
-    filter: sq.filter,
+    // selector 赢过显式 filter：一个查询只有一个主场景，filter 里残留的 scenario 是旧形状
+    filter: { ...sq.filter, ...(sq.scenario ? { scenario: sq.scenario } : {}) },
+    ccy: sq.ccy,
     audience: sq.audience,
   };
 }

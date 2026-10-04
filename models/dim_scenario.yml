@@ -1,0 +1,24 @@
+# 场景维度（正交维度，P5 刀 22：开发计划 §3.2）—— 实际 / 预算 / 预测。
+#
+# ★ 为什么是"声明内嵌行"而不是事实外键：带声明行的维表不许被事实表引用
+#   （parse 的单一写路径守卫 MODEL_ROWS_OWNER_BAD）——与 dim_business_line / fact_business_line
+#   同一先例。fact_finance 上的 scenario 是**行内退化列**，这里的声明行只管「枚举有哪些成员」。
+#
+# ★ 为什么是正交维度：同一笔钱可以有多个场景版本（实际/预算/预测），场景不是口径（窗口），
+#   也不进主键的期间坐标 —— 它是账的另一面，跟 grain 里其他坐标完全正交。
+kind: dimension
+title: 场景维度（实际 / 预算 / 预测）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    comment: sc_<nameHash>，名字的纯函数，由 sync 派生
+  - name: name
+    type: varchar
+    notNull: true
+    semantic: scenario
+rows:
+  - name: 实际
+  - name: 预算
+  - name: 预测

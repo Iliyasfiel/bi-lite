@@ -681,12 +681,19 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
     // ★ 铁律 8 前移到解析期：口径（period_type）与期数（period）**不许被聚合掉**。
     //   聚合掉口径 = 把"本年累计"与"单月"加在一起 —— 这是错得最安静的那一种：
     //   数字看起来照样是对的量级，只是谁都不知道它已经不对了。
+    //   正交维度同理（刀 22）：聚合掉场景 = 实际与预算混加；聚合掉币种 = 人民币与美元混加。
+    const NONADDABLE: Record<string, string> = {
+      period: '不同月份',
+      period_type: '本年累计与单月',
+      scenario: '实际与预算',
+      ccy: '人民币与美元',
+    };
     const dropped = src.columns.filter(
-      (c) => !t.grain.includes(c.name) && (c.semantic === 'period' || c.semantic === 'period_type'),
+      (c) => !t.grain.includes(c.name) && c.semantic !== undefined && c.semantic in NONADDABLE,
     );
     for (const c of dropped) {
       issues.push(
-        issue('error', 'MODEL_AGG_NONADDABLE', `${t.name}.grain`, `${c.name} 被聚合掉了 —— 口径与期数不是可加维度（把${c.semantic === 'period' ? '不同月份' : '本年累计与单月'}加在一起是无声错）`, `把 ${c.name} 加进 grain；要换时间窗是查询侧的事，不是建表侧的事`),
+        issue('error', 'MODEL_AGG_NONADDABLE', `${t.name}.grain`, `${c.name} 被聚合掉了 —— 把${NONADDABLE[c.semantic!]}加在一起是无声错`, `把 ${c.name} 加进 grain；要换${c.semantic === 'period' || c.semantic === 'period_type' ? '时间窗' : '场景或币种'}是查询侧的事，不是建表侧的事`),
       );
     }
     // noop 提醒：grain 与 source 主键一致 → 一行都没被加总，这是复制不是聚合
