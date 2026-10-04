@@ -144,7 +144,6 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 npm run fixtures   # 生成测试假数据（模板 + 长表/宽表源与规格）到 test/fixtures/
 npm run e2e        # ★ 全链路验收，487 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
-npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 
 - **`npm run e2e` 必须全绿才可提交。** 覆盖 35 个阶段 + 三条结构守卫（页面路径↔路由表 /
