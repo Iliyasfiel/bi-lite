@@ -159,19 +159,25 @@ const INGEST_SPEC = 'test/fixtures/月度经营接入.yaml';
 
 const wb3 = new ExcelJS.Workbook();
 const is = wb3.addWorksheet('月报');
-is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%']);
-/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E 两个值列；F 是派生列（规格里跳过） */
-const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, month: number]> = [
-  ['华东子公司', '营业收入', 1234.5, 56.75],
-  ['华东子公司', '净利润', 200.25, 20.125],
-  ['华南子公司', '营业收入', 9876.5, 432.25],
-  ['华南子公司', '净利润', 500.75, 50.375],
+is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%', '去年同期累计', '账面累计']);
+/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E/G/H 四个值列（口径两两不同）；F 是派生列（规格里跳过） */
+const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, month: number, lastYearCum: number, bookCum: number]> = [
+  ['华东子公司', '营业收入', 1234.5, 56.75, 1100.25, 1300.5],
+  ['华东子公司', '净利润', 200.25, 20.125, 180.5, 210.75],
+  ['华南子公司', '营业收入', 9876.5, 432.25, 9000.5, 10000.25],
+  ['华南子公司', '净利润', 500.75, 50.375, 450.25, 520.5],
 ];
-for (const [company, metric, cumulative, month] of INGEST_ROWS) {
-  is.addRow([company, '2026-06', metric, cumulative, month, 0]);
+for (const [company, metric, cumulative, month, lastYearCum, bookCum] of INGEST_ROWS) {
+  is.addRow([company, '2026-06', metric, cumulative, month, 0, lastYearCum, bookCum]);
+}
+// 2025-06 的单月行：只填 E（单月）列 —— D/G/H 留空。★ 为什么不填 D：2025-06 报告的「本年累计」
+// 与 2026-06 报告「去年同期累计」（G）平移后落**同一个窗口** [2025-01, 2025-06]（过渡态 PK 不同、
+// 两行都在），窗口谓词会双算 —— 夹具直接避开这个过渡态已知产物（刀 23 重灌按新 PK 合并）。
+for (const [company, metric, , month] of INGEST_ROWS) {
+  is.addRow([company, '2025-06', metric, null, month, null, null, null]);
 }
 // 「合计」行刻意留着：规格里的 drop 就是为它写的，夹具必须能真的验到那条规则
-is.addRow(['合计', '2026-06', '合计', null, null, 0]);
+is.addRow(['合计', '2026-06', '合计', null, null, 0, null, null]);
 for (let c = 1; c <= 6; c++) is.getColumn(c).width = 16;
 await wb3.xlsx.writeFile(INGEST_SRC);
 
@@ -197,11 +203,11 @@ sheets:
           - col: C
             dim: metric
         values:
-          columns: [D, E, F]
+          columns: [D, E, F, G, H]
           skip:
             - columns: [F]
-              why: 同比% 是派生列
-          periodTypes: [本年累计, 单月]
+              why: 同比% 是派生列（calculator 口径，语义层算，不接入 —— 铁律 5）
+          periodTypes: [本年累计, 单月, 去年同期累计, 账面累计]
         keys:
           - col: B
             as: period
@@ -210,8 +216,8 @@ sheets:
 `,
 );
 
-const factRows = INGEST_ROWS.length * 2; // 4 行数据 × 2 个接入的值列
-console.log(`✅ 接入源: ${INGEST_SRC}  (${INGEST_ROWS.length} 行数据 → ${factRows} 条事实 + 1 行「合计」被 drop)`);
+const factRows = INGEST_ROWS.length * 4 + INGEST_ROWS.length * 1; // 2026:4 行 × 4 值列 + 2025:4 行 × 1 值列（仅单月）
+console.log(`✅ 接入源: ${INGEST_SRC}  (${INGEST_ROWS.length * 2} 行数据 → ${factRows} 条事实 + 1 行「合计」被 drop)`);
 console.log(`✅ 接入规格: ${INGEST_SPEC}`);
 
 // ============ 4. 长表的接入规格（"新路径能表达长表"的夹具）============

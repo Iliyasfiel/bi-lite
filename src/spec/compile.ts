@@ -79,7 +79,12 @@ export function compileBlock(
 ): CompiledQuery {
   // ---- 目标表解析：factName 有值就必须声明过（fail-closed），否则落缺省表 ----
   const factName = opts.factName && opts.factName.trim() !== '' ? opts.factName : undefined;
-  const fact: DeclaredFact | null = factName ? (opts.facts ?? []).find((f) => f.name === factName) ?? null : null;
+  // 缺省表也按声明解析（口径窗口声明长在 models/fact_finance.yml 的 calibers 上，
+  // 不查声明就拿不到 windowFrom / 平移口径，编译出来的窗口条件会悄悄回到旧路）；
+  // 调用方没注入 facts 时保持 null（表名仍落 DEFAULT_TARGET，旧行为不变）。
+  const fact: DeclaredFact | null = (opts.facts ?? []).find(
+    (f) => f.name === (factName ?? DEFAULT_TARGET),
+  ) ?? null;
   if (factName && !fact) {
     throw new Error(
       `目标表未声明: ${factName} —— 表名会原样拼进 SQL（铁律 2），只接受 models/*.yml 里声明过的事实表（kind: fact）。`,
@@ -156,13 +161,36 @@ export function compileBlock(
     addFilter(ident(dim), f);
   }
 
+  // ★ 口径二分过渡态（刀 21 落地，刀 23 删列后本分支随旧路一起退场）：
+  //   去年同期累计行**装载即平移**（架构 §7.4：落地月 = 报告月 − shift 年），
+  //   旧路（period_type 列）的独立算法 = 把声明里的 shift 手工落进时间谓词。
+  //   平移行不在报告月，全局时间钉必须给它们留一条按声明平移的 OR 分支，否则同比列全空。
+  //   哪个口径平移、平移几年，判据来自 models/*.yml 的同一份 calibers 声明 —— 不是第二份口径知识；
+  //   旧路作为**独立实现**参与对拍（期望取自旧路），两路数字一致才放行删列。
+  const shiftedCalibers = (fact?.calibers ?? []).filter((c) => (c.shift ?? 0) !== 0);
+  const timePin: string[] = [];
   if (block.scope?.time?.year !== undefined) {
-    where.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
+    timePin.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
     joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
   }
   if (block.scope?.time?.month !== undefined) {
-    where.push(`dim_period.month = ${q(substitute(String(block.scope.time.month), params))}`);
+    timePin.push(`dim_period.month = ${q(substitute(String(block.scope.time.month), params))}`);
     joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
+  }
+  if (shiftedCalibers.length > 0 && timePin.length > 0) {
+    const shiftNames = shiftedCalibers.map((c) => q(c.name)).join(', ');
+    const shift = shiftedCalibers[0]!.shift ?? 0;
+    const y = Number(substitute(String(block.scope?.time?.year ?? ''), params));
+    if (Number.isNaN(y)) throw new Error('scope.time.year 平移失败：不是数字');
+    const shiftedY = y + shift;
+    const mRaw = block.scope?.time?.month;
+    const branch =
+      mRaw === undefined
+        ? `f.period_type IN (${shiftNames}) AND CAST(year(f.fin_month) AS VARCHAR) = '${shiftedY}'`
+        : `f.period_type IN (${shiftNames}) AND year(f.fin_month) = ${shiftedY} AND month(f.fin_month) = ${Number(substitute(String(mRaw), params))}`;
+    where.push(`(( ${timePin.join(' AND ')} AND f.period_type NOT IN (${shiftNames}) ) OR ( ${branch} ))`);
+  } else {
+    where.push(...timePin);
   }
 
   // 行标签必须限定在 order 里，避免返回多余行

@@ -79,6 +79,12 @@ export interface IngestFactRow {
   period: string;
   /** 口径。**运营事实表没有口径列时是 null**（由目标表的声明决定） */
   periodType: string | null;
+  /**
+   * 口径 → 窗口（铁律 5，由 run.ts 按目标表声明的 calibers 推导；dryrun 不算——它只出形状）。
+   * period = **落库期数**（shift 口径装载即平移，如去年同期累计的 2026-06 源落在 2025-06），
+   * from = 窗口起点（YYYY-MM-DD）。stg 影子**不用它**——影子记源单元格与原始期间。
+   */
+  window?: { period: string; from: string };
   /** 行内携带的**退化列**（如 business_line）—— 列名 → 原样格值 */
   deg: Record<string, string>;
   amount: number | null;

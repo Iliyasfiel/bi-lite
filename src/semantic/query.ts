@@ -149,7 +149,12 @@ export function compileMetrics(
 
   // ---- 目标表解析 ----
   const factName = mq.fact && mq.fact.trim() !== '' ? mq.fact : undefined;
-  const fact: DeclaredFact | null = factName ? (facts ?? []).find((f) => f.name === factName) ?? null : null;
+  // 缺省表也按声明解析（口径白名单 = 声明的 calibers，窗口谓词要 windowFrom ——
+  // 不查声明，查询就悄悄退回旧路 period_type，判据从这里开始漂）；
+  // 调用方没注入 facts 时保持 null（表名仍落 DEFAULT_TARGET，旧行为不变）。
+  const fact: DeclaredFact | null = (facts ?? []).find(
+    (f) => f.name === (factName ?? DEFAULT_TARGET),
+  ) ?? null;
   if (factName && !fact) {
     throw new QueryRefused(
       `目标表未声明: ${factName} —— 表名会原样拼进 SQL（铁律 2），只接受 models/*.yml 里声明过的事实表（kind: fact）。`,
@@ -169,12 +174,34 @@ export function compileMetrics(
     }
   }
 
-  const allowedPeriods = new Set(PERIOD_TYPES.map((p) => p.id));
+  // ---- 口径白名单 = 该表**声明的 calibers**（铁律 5：口径是窗口声明，不是全局注册表）----
+  //   缺省表（调用方没注入声明）按全局注册表判 —— 那是"fact_finance 形状"的保守回退。
+  const calibers = fact?.calibers ?? [];
+  const caliberOfName = (n: string) => calibers.find((c) => c.name === n);
+  const allowedPeriods = new Set<string>(
+    calibers.length ? calibers.map((c) => c.name) : PERIOD_TYPES.map((p) => p.id),
+  );
 
-  // 分组表达式
+  // ---- 窗口平移（铁律 5）：as-of 期间是平移前的 ---- 过滤值要平回去、标签要平出来。
+  //   同一查询混不同 shift 是口径错配（一半的月份轴对不上 x 轴），直接拒，不猜。
+  const shiftOf = (m: MeasureRef): number => (m.periodType ? (caliberOfName(m.periodType)?.shift ?? 0) : 0);
+  const shifts = new Set(mq.measures.filter((m) => m.periodType).map(shiftOf));
+  if (shifts.size > 1) {
+    throw new QueryRefused(
+      `一个查询里混了不同窗口平移的口径（shift ${[...shifts].join(' / ')}）—— 月份轴对不齐（铁律 5）。`,
+      'CALIBER_SHIFT_CONFLICT',
+    );
+  }
+  const shift = shifts.values().next().value ?? 0;
+
+  // 分组表达式：shift ≠ 0 时 month/year 的标签平移 -shift 年（落窗在去年，报的是今年）
+  const periodCol = shift === 0 ? 'f.fin_month' : `f.fin_month + INTERVAL ${-shift} YEAR`;
   const groupExprs = groupBy.map((d) => {
     const dim = DIMENSIONS[d as DimName];
-    return dim.table ? `${dim.table}.${dim.labelCol}` : dim.labelCol;
+    if (dim.table) return `${dim.table}.${dim.labelCol}`;
+    if (d === 'month') return `strftime(${periodCol}, '%Y-%m')`;
+    if (d === 'year') return `CAST(year(${periodCol}) AS VARCHAR)`;
+    return dim.labelCol;
   });
 
   // 度量列：条件聚合，别名用序号避免中文别名问题。
@@ -199,6 +226,7 @@ export function compileMetrics(
         'UNKNOWN_PERIOD_TYPE',
       );
     }
+    const cal = m.periodType ? caliberOfName(m.periodType) : undefined;
     columns.push({
       key: `m${i}`,
       label: m.periodType
@@ -210,10 +238,34 @@ export function compileMetrics(
       periodType: m.periodType ?? '',
       agg,
     });
-    // 没有口径列的表：度量就是指标本身，条件里没有 period_type 可言
-    const cond = m.periodType
-      ? `dim_metric.name = ${q(m.metric)} AND f.period_type = ${q(m.periodType)}`
-      : `dim_metric.name = ${q(m.metric)}`;
+    // calculator 口径（单月同比）不占事实表列 —— SQL 里根本没有这种行，钉住就是死查询。
+    // 它在改写器里组合两个单月子查询算出来（铁律 5 第三件）。
+    if (cal?.calculator) {
+      throw new QueryRefused(
+        `口径「${m.periodType}」是 calculator 口径，不落事实表（铁律 5）—— 在语义层计算，不进 SQL。`,
+        'CALIBER_IS_CALCULATOR',
+      );
+    }
+    // 窗口谓词：口径钉住 → **声明展开**（铁律 5 的判据就落在这一段）。
+    // 累计是水平量 —— 窗口必须精确匹配，跨窗口求和结构性不可能；
+    // 同一 fin_month 下三种窗口互斥（单月 period_from=当月 / 本年累计=年首 / 账面累计=固定起点）。
+    let cond: string;
+    if (fact?.windowFrom && cal) {
+      const w = fact.windowFrom; // 声明来的列名（NAME_OK 白名单验过），不是用户输入
+      const p = fact.periodColumn;
+      const rule =
+        cal.from === 'same'
+          ? `f.${w} = f.${p}`
+          : cal.from === 'year_start'
+            ? `f.${w} = date_trunc('year', f.${p})`
+            : `f.${w} = DATE '${cal.since}-01'`;
+      cond = `dim_metric.name = ${q(m.metric)} AND ${rule}`;
+    } else {
+      // 没有窗口列的表（缺省形状 / 运营事实）保持旧行为
+      cond = m.periodType
+        ? `dim_metric.name = ${q(m.metric)} AND f.period_type = ${q(m.periodType)}`
+        : `dim_metric.name = ${q(m.metric)}`;
+    }
     const measureCol = fact?.measureColumn ?? 'amount';
     return `${agg}(CASE WHEN ${cond} THEN f.${measureCol} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
   });
@@ -237,11 +289,22 @@ export function compileMetrics(
     }
     const dim = DIMENSIONS[col as DimName];
     const ref = dim.table ? `${dim.table}.${dim.labelCol}` : dim.labelCol;
+    // filter 用到维表也要补 join —— 只给 groupBy 补的话，"按公司过滤但不分组"直接炸 binder
+    // （spec/expr 的 needJoin 同一判例：引用了维表列，就要把维表带进来）
+    if (dim.table) joins.add(`JOIN ${dim.table} ON ${dim.joinOn}`);
+    // 窗口平移：as-of 期间（filter 值）要**平回去**找落窗行 —— 查 2026-06 的去年同期累计，
+    // 行落在 2025-06。只有 period 承载维（month/year）平移，其余维度不动。
+    const shiftValue = (v: string): string => {
+      if (shift === 0) return v;
+      if (col === 'month' && /^\d{4}-\d{2}$/.test(v)) return `${Number(v.slice(0, 4)) + shift}${v.slice(4)}`;
+      if (col === 'year' && /^\d{4}$/.test(v)) return String(Number(v) + shift);
+      return v;
+    };
     if (Array.isArray(val)) {
       if (val.length === 0) throw new QueryRefused(`过滤条件 ${col} 是空数组`, 'EMPTY_FILTER');
-      where.push(`${ref} IN (${val.map((v) => q(String(v))).join(', ')})`);
+      where.push(`${ref} IN (${val.map((v) => q(shiftValue(String(v)))).join(', ')})`);
     } else {
-      where.push(`${ref} = ${q(String(val))}`);
+      where.push(`${ref} = ${q(shiftValue(String(val)))}`);
     }
   }
 

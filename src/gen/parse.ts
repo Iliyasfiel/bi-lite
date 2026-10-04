@@ -31,6 +31,7 @@ import {
   viaJoinCandidates,
   type DeclaredFact,
   type Ir,
+  type IrCaliber,
   type IrColumn,
   type IrTable,
   type MetaRole,
@@ -443,11 +444,98 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
     }
   }
 
+  // ---- 口径声明（calibers / windowFrom，铁律 5"五值拆三件"）：只有 fact 能带 ----
+  //      窗口是声明不是行上字符串：from/since/shift 决定装载怎么落窗、查询怎么展开谓词；
+  //      calculator 口径不落行（语义层算）。判据只有这一处，别处不许再写窗口规则。
+  let windowFrom: string | undefined;
+  let calibers: IrCaliber[] | undefined;
+  if (d.windowFrom !== undefined || d.calibers !== undefined) {
+    if (kind !== 'fact') {
+      issues.push(issue('error', 'MODEL_FIELD_BAD', file, `${kind} 表不声明口径（calibers/windowFrom 是事实表的口径体系）`));
+    } else {
+      const wf = typeof d.windowFrom === 'string' ? d.windowFrom.trim() : '';
+      if (!wf) {
+        issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.windowFrom`, '声明了口径就必须写 windowFrom（窗口起点列）—— 非 calculator 的窗口口径都要落到这一列'));
+      } else if (!seen.has(wf)) {
+        issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.windowFrom`, `windowFrom 指向的列不存在：${wf}`));
+      } else {
+        windowFrom = wf;
+      }
+      const rawCalibers = Array.isArray(d.calibers) ? (d.calibers as Array<Record<string, unknown>>) : [];
+      if (rawCalibers.length === 0) {
+        issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.calibers`, 'calibers 必须是非空列表（每条口径一条声明）'));
+      }
+      const names = new Set<string>();
+      const parsed: IrCaliber[] = [];
+      const operandOwners = new Map<string, string>(); // operand 名 → calculator 口径名（循环后验指向）
+      for (const rc0 of rawCalibers) {
+        const rc = (rc0 ?? {}) as Record<string, unknown>;
+        const name = typeof rc.name === 'string' ? rc.name.trim() : '';
+        const at = `${file}.calibers${name ? '.' + name : ''}`;
+        if (!name) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.calibers`, '口径缺 name'));
+          continue;
+        }
+        if (names.has(name)) issues.push(issue('error', 'MODEL_FIELD_BAD', at, `口径名重复：${name}`));
+        names.add(name);
+        const calculator = rc.calculator === true;
+        const from = typeof rc.from === 'string' ? rc.from.trim() : undefined;
+        const since = typeof rc.since === 'string' ? rc.since.trim() : undefined;
+        const shift = typeof rc.shift === 'number' && Number.isInteger(rc.shift) ? rc.shift : undefined;
+        const operand = typeof rc.operand === 'string' ? rc.operand.trim() : undefined;
+        if (calculator) {
+          if (from !== undefined || since !== undefined || shift !== undefined) {
+            issues.push(issue('error', 'MODEL_FIELD_BAD', at, `calculator 口径不落行，不能带 from/since/shift：${name}`));
+          }
+          // calculator 必须声明操作数（单月同比 = 单月）—— 不声明，改写器就无从取数，拒绝猜
+          if (!operand) {
+            issues.push(issue('error', 'MODEL_FIELD_BAD', at, `calculator 口径必须写 operand（操作数口径名）：${name}`));
+          } else {
+            operandOwners.set(operand, name);
+          }
+          parsed.push(operand ? { name, calculator: true, operand } : { name, calculator: true });
+          continue;
+        }
+        if (operand !== undefined) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', at, `${name} 不是 calculator 口径，写了 operand 也无处安放（只有语义层口径有操作数）`));
+          continue;
+        }
+        if (from !== 'same' && from !== 'year_start' && from !== 'since') {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', at, `${name} 的 from 只能是 same / year_start / since（calculator: true 才是语义层口径）`));
+          continue;
+        }
+        if (from === 'since' && (since === undefined || !/^\d{4}-\d{2}$/.test(since))) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', at, `${name} 是 since 口径，必须写 since: "YYYY-MM"`));
+          continue;
+        }
+        if (from !== 'since' && since !== undefined) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', at, `${name} 不是 since 口径，写了 since 也无处安放`));
+          continue;
+        }
+        if (shift !== undefined && from !== 'year_start') {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', at, `${name} 的 shift 只能配 from: year_start（窗口平移以年首为基准）`));
+          continue;
+        }
+        parsed.push({ name, from, since, shift });
+      }
+      if (parsed.length > 0 && windowFrom === undefined && parsed.some((c) => !c.calculator)) {
+        issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.windowFrom`, '有窗口口径（非 calculator）就必须写 windowFrom —— 窗口要落到一列上'));
+      }
+      // operand 必须指向同表声明的另一个口径（操作数是它自己的数据来源，跨表 = 隐式耦合）
+      for (const [op, owner] of operandOwners) {
+        if (!names.has(op)) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.calibers.${owner}`, `operand 指向的口径「${op}」不在本表 calibers 声明里 —— calculator 只能算本表口径`));
+        }
+      }
+      calibers = parsed;
+    }
+  }
+
   if (issues.some((i) => i.level === 'error')) return { table: null, issues };
 
   const foreignKeys = columns.filter((c) => c.refs).map((c) => ({ column: c.name, refs: c.refs! }));
   return {
-    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys, rows },
+    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys, rows, windowFrom, calibers },
     issues,
   };
 }

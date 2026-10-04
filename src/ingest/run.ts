@@ -376,6 +376,65 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       ],
     };
   }
+
+  // ---- 口径 → 窗口（铁律 5"五值拆三件"的装载侧）：规则只有声明里的 calibers 一处 ----
+  //   窗口实存：period_from 按 from 规则算（same = 与期间锚同月 / year_start = 当年首日 /
+  //   since = 固定起点）；窗口平移（shift）：**装载即平移**——行的落库期数就是平移后的
+  //   窗口终点（去年同期累计的源期间 2026-06 落在 [2025-01, 2025-06] 窗口上），
+  //   查询期标签 +1 年再对齐 x 轴。同一窗口不存两份（存两份必然在审计调整时漂移）。
+  //   stg 影子不受影响：它记的是源单元格坐标与原始期间（r.period），不是落窗结果。
+  const caliberOf = new Map((fact.calibers ?? []).map((c) => [c.name, c]));
+  const notIngestible = rows.filter((r) => r.periodType !== null && caliberOf.get(r.periodType)?.calculator === true);
+  if (notIngestible.length > 0) {
+    return {
+      ...base,
+      errors: [
+        {
+          level: 'error',
+          code: 'CALIBER_NOT_INGESTIBLE',
+          at: 'source',
+          message: `本批有 ${notIngestible.length} 行是 calculator 口径（${[...new Set(notIngestible.map((r) => r.periodType))].join('、')}）—— 它不落事实表，在语义层算（铁律 5）。`,
+          hint: '把这一列从规格 values.columns 里拿掉（如同比% 是派生列，声明 skip）；calculator 口径的数是查出来的，不是接进来的。',
+        },
+      ],
+    };
+  }
+  const notDeclared = rows.filter((r) => r.periodType !== null && fact.windowFrom !== null && !caliberOf.has(r.periodType));
+  if (notDeclared.length > 0) {
+    return {
+      ...base,
+      errors: [
+        {
+          level: 'error',
+          code: 'CALIBER_NOT_DECLARED',
+          at: 'source',
+          message: `本批有 ${notDeclared.length} 行的口径（${[...new Set(notDeclared.map((r) => r.periodType))].join('、')}）不在目标表 ${fact.name} 的 calibers 声明里。`,
+          hint: '口径白名单 = models/*.yml 的 calibers（铁律 5）—— 声明里没有的口径，查询侧也查不到，先补声明或改规格。',
+        },
+      ],
+    };
+  }
+  const monthShift = (period: string, years: number): string => {
+    const [y, m] = period.split('-').map(Number);
+    return `${y + years}-${String(m).padStart(2, '0')}`;
+  };
+  for (const r of rows) {
+    if (r.periodType === null) continue;
+    const cal = caliberOf.get(r.periodType);
+    if (!cal) continue; // 上面的守卫只挡 windowFrom 表；无窗口列的表（运营事实）没有窗口可言
+    const landed = cal.shift ? monthShift(r.period, cal.shift) : r.period;
+    const from =
+      cal.from === 'same'
+        ? day(landed)
+        : cal.from === 'year_start'
+          ? `${landed.slice(0, 4)}-01-01`
+          : cal.from === 'since'
+            ? `${cal.since}-01`
+            : null;
+    if (!from) continue; // parse 守卫已挡非法 from，这里到不了
+    r.window = { period: landed, from };
+  }
+
   /**
    * 一条事实行的**主键元组**（与 `queryHits` 里 SELECT 出来的列序一致）——
    * 撞库预检拿它跟库里的已有坐标比。
@@ -383,7 +442,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   const pkKeyOf = (r: IngestFactRow): string =>
     fact.primaryKey
       .map((col) => {
-        if (col === fact.periodColumn) return day(r.period);
+        if (col === fact.periodColumn) return day(r.window?.period ?? r.period);
         if (col === fact.periodTypeColumn) return r.periodType ?? '';
         if (col === fact.companyColumn) return assigned.get(`company|${r.company}`) ?? '';
         if (col === fact.metricColumn) return assigned.get(`metric|${r.metric}`) ?? '';
@@ -395,7 +454,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   // 撞库检查（只在 'reject' 下做）：同一坐标已存在 → 拒绝整批，而不是静默覆盖。
   // 旧实现是 `ON CONFLICT DO UPDATE`，"后写赢"这件事没有任何人看得见。
   if (onConflict === 'reject') {
-    const periods = [...new Set(rows.map((r) => r.period))];
+    // 平移口径的落库期数 ≠ 源期间 —— 撞库预检必须按**落库**坐标查，否则漏检
+    const periods = [...new Set(rows.map((r) => r.window?.period ?? r.period))];
     // 期数列拿出来时统一成 `YYYY-MM-DD`（与 pkKeyOf 的 day(period) 对齐）——
     // 不这么做的话，'2026-06-01' 与 '2026-06' 看起来就是两个坐标，撞库预检会漏。
     const selectPk = fact.primaryKey
@@ -484,7 +544,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     }
 
     // 期间维度（与公司/指标无关，逐行幂等）
-    for (const p of [...new Set(rows.map((r) => r.period))]) {
+    // 平移口径也要有 dim_period 行（落库期数是平移后的），否则查询期 join 不到
+    for (const p of [...new Set(rows.map((r) => r.window?.period ?? r.period))]) {
       const [y, m] = p.split('-');
       await execute(
         `INSERT INTO dim_period (fin_month, year, month, is_audited)
@@ -524,7 +585,15 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
      *   不写 NULL 糊过去 —— "这一行缺一块"必须响亮。
      */
     function valueOfColumn(col: string, r: IngestFactRow, batch: string): string {
-      if (col === fact.periodColumn) return `${lit(day(r.period))}::DATE`;
+      if (col === fact.periodColumn) return `${lit(day(r.window?.period ?? r.period))}::DATE`;
+      if (fact.windowFrom && col === fact.windowFrom) {
+        if (!r.window) {
+          throw new Error(
+            `目标表 ${fact.name} 有窗口列 ${fact.windowFrom}，但第 ${r.row} 行的口径「${r.periodType}」推不出窗口 —— 口径必须声明在 calibers 里（铁律 5）。（正常流程走不到这里：CALIBER_NOT_DECLARED 守卫在前）`,
+          );
+        }
+        return `${lit(r.window.from)}::DATE`;
+      }
       if (col === fact.companyColumn) return lit(dimIdOf('company', r.company, r));
       if (col === fact.metricColumn) return lit(dimIdOf('metric', r.metric, r));
       if (fact.periodTypeColumn && col === fact.periodTypeColumn) {

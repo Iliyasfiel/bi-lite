@@ -59,6 +59,18 @@ export interface IrTable {
   /** 外键：列 → 指向的表（冗余于 columns[].refs，方便 plan 做依赖检查） */
   foreignKeys: Array<{ column: string; refs: string }>;
   /**
+   * kind='fact' 且声明了口径体系时：**窗口起点列**（如 period_from）——终点 ≡ 期间锚列
+   * （semantic: period 的那列，如 fin_month）。窗口规则逐条写在 `calibers`，
+   * 判据单一在 `compileMetrics`（铁律 5）。
+   */
+  windowFrom?: string;
+  /**
+   * kind='fact' 时可选：**口径声明**（铁律 5 的"五值拆三件"）。规则（from/since/shift）决定
+   * 装载怎么落窗与查询怎么展开谓词；`calculator: true` 的口径不落行，语义层算（铁律 6：
+   * 非 calculator 的窗口口径不许在代码里"顺手算出来"）。
+   */
+  calibers?: IrCaliber[];
+  /**
    * kind='aggregate' 时：从哪张事实表聚合（grain 里没出现的源维度就是被加总的）。
    * 聚合表的**列不是人写的**——由 parse 在跨表校验阶段从 source 投影出来
    * （grain 列带类型与角色，度量列带聚合函数）。
@@ -83,6 +95,26 @@ export interface Ir {
   /** 声明本身的口径版本（改 IR 语义时递增） */
   apiVersion: string;
   tables: IrTable[];
+}
+
+/**
+ * 一条**口径声明**（铁律 5 的"窗口是声明，不是行上字符串"）。
+ * - `calculator: true`：语义层算的口径（如单月同比），不落事实表，装载拒绝、查询展开成计算；
+ * - 其余是窗口口径：`from` 声明窗口起点怎么定（same = 与期间锚同月；year_start = 当年首日；
+ *   since = 固定起点 `since: "YYYY-MM"`），`shift: -1` 声明**装载即平移**（去年同期累计：
+   * 落窗在平移后的期间上，查询期标签 +1 年对齐 x 轴 —— 存两份必然在审计调整时漂移，所以不存）。
+ */
+export interface IrCaliber {
+  name: string;
+  from?: 'same' | 'year_start' | 'since';
+  /** from = since 时的固定起点（"YYYY-MM"，取当月首日） */
+  since?: string;
+  /** 窗口平移的年数（去年同期累计 = -1）；只能配 from: year_start */
+  shift?: number;
+  /** true = calculator 口径：不落行，语义层算（铁律 6） */
+  calculator?: boolean;
+  /** calculator 必填：操作数口径的名字（单月同比 = 单月）—— 同一张表里必须另有这个口径 */
+  operand?: string;
 }
 
 /** 解析/校验阶段的错误：带 code，便于 CLI 与 e2e 判据稳定 */
@@ -122,6 +154,10 @@ export interface DeclaredFact {
   /** 溯源列（role = provenance） */
   provenanceColumn: string | null;
   primaryKey: string[];
+  /** 窗口起点列（声明了 calibers 的事实表才有；见 IrTable.windowFrom） */
+  windowFrom: string | null;
+  /** 口径声明（无 = 这张表没有口径体系；有 = 查询白名单按它收窄） */
+  calibers: IrCaliber[];
 }
 
 /** 从 IR 里挑出事实表的落库形状（`kind: fact` 的那些） */
@@ -161,6 +197,8 @@ export function declaredFacts(ir: Ir): DeclaredFact[] {
       measureColumn: measure.name,
       provenanceColumn: provenance?.name ?? null,
       primaryKey: t.primaryKey,
+      windowFrom: t.windowFrom ?? null,
+      calibers: t.calibers ?? [],
     });
   }
   return facts;
