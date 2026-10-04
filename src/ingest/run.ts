@@ -74,6 +74,8 @@ export interface IngestRunResult {
   shape: IngestShape;
   /** Parquet 归档是否成功（失败不影响落库，但要说出来） */
   archived: boolean;
+  /** 本次落库**同事务重建**的聚合表名（以本次 target 为 source 的那些；空 = 没有聚合管这张表） */
+  rebuiltAggregates: string[];
   /** 只会有值于 planOnly：按当前规格与快照，这次会**新建**哪些主数据 */
   willCreate?: Array<{ kind: DimKind; raw: string }>;
   /** 一句话结论（planOnly 用：会不会被拒、为什么） */
@@ -182,6 +184,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     errors,
     shape,
     archived: false,
+    rebuiltAggregates: [],
   };
 
   // ---- 关卡 1：形状不对，一行都不写 ----
@@ -437,6 +440,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   const createdMetrics: string[] = [];
   let inserted = 0;
   let archived = true;
+  let rebuiltAggregates: string[] = [];
 
   await execute('BEGIN');
   try {
@@ -577,6 +581,16 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     //   所以这里唯一可能的错法是"声明写错了"，那种错会被当场抓住（e2e 有断言）。
     await registerMeta();
 
+    // ★ 聚合表与数据**同一个事务**重建（P3）：以本次落库的 target 为 source 的聚合，
+    //   落库完立刻重算 —— 聚合表不存在"事实已提交、聚合还是旧的"那段窗口
+    //   （那种窗口里出的报表对不上账，而且没人知道为什么）。
+    //   声明坏了就在这里抛：整个批次连同聚合一起回滚，不留半批（fail-closed）。
+    const { loadModels } = await import('../gen/parse.ts');
+    const { aggregateTablesOf, executeRebuilds } = await import('../gen/rebuild.ts');
+    const aggs = aggregateTablesOf(loadModels(), target);
+    if (aggs.length > 0) await executeRebuilds(aggs);
+    rebuiltAggregates = aggs.map((t) => t.name);
+
     await execute(`UPDATE import_batch SET status = 'committed' WHERE batch_id = ${lit(batchId)}`);
     await execute('COMMIT');
   } catch (e) {
@@ -621,6 +635,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     errors: [],
     shape,
     archived,
+    rebuiltAggregates,
   };
 }
 

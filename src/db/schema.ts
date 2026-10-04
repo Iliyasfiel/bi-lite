@@ -84,8 +84,8 @@ CREATE TABLE IF NOT EXISTS raw_cell (
 
 CREATE TABLE IF NOT EXISTS _meta_objects (
   object_name VARCHAR PRIMARY KEY,
-  kind        VARCHAR NOT NULL,      -- dimension / fact / bridge
-  grain       VARCHAR,               -- 事实表的粒度（逗号分隔的列名）
+  kind        VARCHAR NOT NULL,      -- dimension / fact / bridge / aggregate
+  grain       VARCHAR,               -- 事实表与聚合表的粒度（逗号分隔的列名）
   api_version VARCHAR
 );
 
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS _meta_columns (
 -- ddl_hash 就是"我上次落地的是哪一版声明"的凭证。
 CREATE TABLE IF NOT EXISTS _model (
   name        VARCHAR PRIMARY KEY,   -- 表名
-  kind        VARCHAR NOT NULL,      -- dimension / fact / bridge
+  kind        VARCHAR NOT NULL,      -- dimension / fact / bridge / aggregate
   title       VARCHAR,
   ddl_hash    VARCHAR NOT NULL,      -- 该表声明的结构指纹（src/gen/ir.ts 的 ddlHashOf）
   declared_at TIMESTAMP

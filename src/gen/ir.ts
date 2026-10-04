@@ -23,7 +23,7 @@ export const DEFAULT_TARGET = 'fact_finance';
 export type MetaRole = 'pk' | 'dim_fk' | 'measure' | 'degenerate' | 'provenance';
 
 /** 表在语义层的种类 */
-export type ModelKind = 'dimension' | 'fact' | 'bridge';
+export type ModelKind = 'dimension' | 'fact' | 'bridge' | 'aggregate';
 
 export interface IrColumn {
   name: string;
@@ -42,6 +42,8 @@ export interface IrColumn {
   /** DEFAULT 的 SQL 字面量，原样写进去（不解释） */
   default?: string;
   comment?: string;
+  /** 聚合表（kind='aggregate'）的度量列：怎么聚合（v1 只认 sum） */
+  agg?: string;
 }
 
 export interface IrTable {
@@ -56,6 +58,12 @@ export interface IrTable {
   primaryKey: string[];
   /** 外键：列 → 指向的表（冗余于 columns[].refs，方便 plan 做依赖检查） */
   foreignKeys: Array<{ column: string; refs: string }>;
+  /**
+   * kind='aggregate' 时：从哪张事实表聚合（grain 里没出现的源维度就是被加总的）。
+   * 聚合表的**列不是人写的**——由 parse 在跨表校验阶段从 source 投影出来
+   * （grain 列带类型与角色，度量列带聚合函数）。
+   */
+  source?: string;
 }
 
 export interface Ir {
@@ -175,7 +183,7 @@ export function metaOf(ir: Ir): MetaObject[] {
   return ir.tables.map((t) => ({
     name: t.name,
     kind: t.kind,
-    grain: t.kind === 'fact' ? t.grain : undefined,
+    grain: t.kind === 'fact' || t.kind === 'aggregate' ? t.grain : undefined,
     columns: t.columns.map((c) => ({
       column: c.name,
       role: c.role,
@@ -207,9 +215,9 @@ export function normalizeSqlType(raw: string): string {
  * ★ 只取**结构**（列名/类型/角色/主键），不取注释与标题 —— 改一句注释不该触发任何变更。
  */
 export function ddlHashOf(t: IrTable): string {
-  const canonical = t.columns.map((c) => `${c.name}:${c.type}:${c.role}:${c.key ? 'K' : '-'}`).join(',');
+  const canonical = t.columns.map((c) => `${c.name}:${c.type}:${c.role}:${c.key ? 'K' : '-'}${c.agg ? ':' + c.agg : ''}`).join(',');
   return createHash('sha256')
-    .update(`${t.name}|${t.kind}|${canonical}|pk=${t.primaryKey.join(',')}|grain=${t.grain.join(',')}`)
+    .update(`${t.name}|${t.kind}|${canonical}|pk=${t.primaryKey.join(',')}|grain=${t.grain.join(',')}|src=${t.source ?? ''}`)
     .digest('hex')
     .slice(0, 12);
 }

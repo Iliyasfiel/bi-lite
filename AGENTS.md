@@ -162,6 +162,13 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
       有阻塞项时 `apply` **整体不动**（连能做的也不做 —— 半个落地比整体不动更难查）。
     - 新增一张业务表 = 在 `models/` 里加一份声明 + `bilite plan` / `bilite apply`；
       **不许回头改 `src/gen/` 里的生成器代码**（P3 的判据：表不该随模板增长而需要改代码）。
+    - **聚合表（`kind: aggregate`，第五种模板）是派生物**：声明 `source`（必须是事实表）+ `grain`
+      （聚合键，⊆ source 列）+ `measures`（v1 只认 sum）；**列由跨表投影，人不写列**（手写 columns 即错）。
+      **口径与期数不许被聚合掉**（`MODEL_AGG_NONADDABLE`）—— 把本年累计与单月加在一起是
+      错得最安静的那一种，这是铁律 8 前移到解析期。写路径只有一条：
+      `CREATE OR REPLACE TABLE AS SELECT` 全量重算 —— **删了能回来**，所以 plan 对它
+      只比列名集合、不一致就是非阻塞的 `rebuild-table`；落库与数据**同一事务**重建，
+      `bilite rebuild` 随时手动重算。
 
 19. **维度历史只增不改；"当前态"与"开放版本"是同一事实的两种表示，必须对拍。**
     - 形态：**历史挂侧表**（`dim_company_hist` / `dim_metric_hist`，由 `models/*_hist.yml` 声明），
@@ -181,7 +188,7 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 960 行长表 + 接入路径的源与规格：宽表一份、长表一份）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，446 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，464 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
@@ -192,6 +199,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
   图表渲染 → **Web 服务 HTTP 全链路** → **MCP 工具集（真实客户端 + 模板推断）** →
   **spec 校验（防静默算错，铁律 14 + 17）** → **主数据对齐（铁律 16）** → **着陆层 raw（幂等与保真，P1）** → **重放（raw 是值的唯一来源，P1）** → **装载顺序守卫（事实行不许指向不存在的主数据，P1）** → **装载事务化（不留半个批次，P1）** → **源文件被删后仍能重放（路径 → raw，P1）** → **CLI render / query（受众钉死 + 物料隔离，P1）** → **catalog（列契约与三层导出，P1）** → **MCP catalog（agent 拿得到现状，P4）** → **CLI `validate`（一份命令、两份判据，P4）** → **skill export 与手册对拍（P4）** → **Web 接入向导（新接入路径的 HTTP 面 + 拍板回路，§11.5）** → **长表接入对拍（与冻结快照逐行含金额，§11.6）** → **退场守卫（旧路由 404 / 旧控件不在页面上）** → **期数的日期格（声明 `type: date`；1904 系统拒绝）** → **口径名不在注册表（PERIODTYPE_UNKNOWN）** → **CLI `catalog show` 与 `ingest dry-run` / `run` 真跑（退出码即结论：error 也退 1）** → **上传件只增不减守卫（扫 src/ 证明没有自动清理）** → **Parquet 归档 compaction（R8：逐批次对拍后才删源；0 行残骸退 1）** → **生成器 P2（两种写法同一份 IR / plan 只读 / apply 幂等 / 加列不重写数据 / 删列被拦）** → **运营事实表（target 由声明决定 / 无口径列也能落库 / 退化列进主键 / 只进目标表）** → **维度版本行（SCD2：历史侧表 / 生效日用期首日 / 时点查询 / 零回归 / 不变量守卫会抓）** →
   **业务线报表（报表侧目标表声明化：`spec.fact` 从声明白名单取 / 无口径表拒口径轴 / 运营指标可出报表与看板）** →
+  **聚合表（`kind: aggregate`：列由跨表投影 / 口径与期数不许被聚合掉 / `CREATE OR REPLACE` 全量重算 / 落库同事务重建）** →
   **agent 侧物料对拍（手册 + 配置 prompt 走同一份 `skillProblems()`）** → **三条结构守卫（页面路径 ↔ 路由表 / 每个 MCP 工具都被真调用 / 六处文档条数自校验）** → **自包含守卫（夹具规格与它的源都得在；不许拿生产规格当运行输入）**。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`，
   传 `port=0` 由内核分配端口（e2e 就是这样在进程内起服务的）。
@@ -311,7 +319,7 @@ npm run bench      # ⚠️ 未实现（test/bench.ts 尚不存在）
 ```
 src/
   cli.ts           命令行入口（三个入口之一，给人与脚本；见 docs/开发计划.md §1.5）
-                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · plan|apply · validate · skill export
+                   命令：ingest lint|dry-run|run · render · query · catalog dump|show · compact · plan|apply|rebuild · validate · skill export
                    （`scanArgs` 是唯一的参数扫描器）
                    ★ `validate` 不写新判据 —— 只判别该调 `diagnoseIngest` 还是 `diagnoseSpec`
                      （按模板几何判：`spec/geometry.ts` 的 `looksLikeIngestDoc`，不按"有没有 source"）
@@ -324,14 +332,21 @@ src/
                      apply 落地非阻塞项，有阻塞项就整体不动。两者共用同一份 IR 与同一份 DDL 生成
                    ★ query 的受众**写死 human**（铁律 10）—— 没有 `--audience` 这种开关
                    ⚠️ 不许把 CLI 取数命令写进 agent 侧物料 —— 那等于给 agent 开一条取数路（§7.5，e2e 有断言）
-  gen/             ★ 生成器（P2）：models/*.yml → IR → plan → apply。业务表的 DDL 由它长出来
+  gen/             ★ 生成器（P2/P3）：models/*.yml → IR → plan → apply / rebuild。业务表的 DDL 由它长出来
     ir.ts          ★ IR 定义（表 / 列 / 主键 / 外键 / 角色）+ metaOf()（列契约的**唯一投影**）+ 指纹
                    ★ 判据：**换一种 YAML 写法，IR 以下一行都不该改**（e2e 拿两种写法对拍）
+                   ★ IrTable.source / IrColumn.agg：聚合表的源表与聚合函数（v1 只认 sum）
     parse.ts       YAML → IR；两种等价写法（分组 keys/measures · 平铺 columns）；
                    diagnoseModels() 一次给全所有问题；跨表校验 refs 指向的表必须也被声明
-    ddl.ts         IR → DDL（纯函数：plan 给人看的是它、apply 执行的也是它）
+                   ★ kind: aggregate：source/grain/measures → 跨表投影列（人不写列）；
+                     口径与期数不许被聚合掉（MODEL_AGG_NONADDABLE）
+    ddl.ts         IR → DDL（纯函数：plan 给人看的是它、apply 执行的也是它）+ rebuildTableSql()
+                   （聚合表：CREATE OR REPLACE TABLE AS SELECT … GROUP BY，全量重算）
     plan.ts        IR + 现有库结构 → 人可读变更清单（**只读**）；删列 / 改类型 / NOT NULL 列 → 阻塞项
+                   ★ 聚合表只比列名集合：不一致 → 非阻塞 rebuild-table（删了能回来，不算结构变更）
     apply.ts       plan → 落库（DDL + 列契约 + _model/_model_dep，**同一事务**）
+    rebuild.ts     rebuildAggregates()：重算全部（或按 source 过滤的）聚合表 —— CLI `bilite rebuild`
+                   与落库同事务重建共用它；写路径只有 CREATE OR REPLACE 全量重算这一条
   paths.ts          ★ 源文件路径白名单（resolveSource）—— **唯一实现**，是安全判据，别复制第二份
   land/             ★ 着陆层：源文件 → raw_file / raw_cell（append-only，**"可重放"的唯一依据**）
     raw.ts         landRawFile()：sha256 幂等（同 hash 一格都不重写）+ 只存有值的格
@@ -511,10 +526,11 @@ data/              ⚠️ 真实财务数据，永不提交
 | 维度版本行（SCD2） | ✅ **完成**（历史挂侧表 `dim_*_hist`；`setDimAttributes` 三步同序、`dimAsOf` 半开区间时点查询、`scdProblems()` 对拍两份表示 —— 见铁律 19 与 `docs/开发计划.md` §1.3） |
 | 运营事实表 | ✅ **完成**（`fact_business_line` 由声明长出来，**无口径列**；接入规格的 `target:` 决定写进哪张表 —— 见铁律 18 与 `docs/开发计划.md` §1.3） |
 | 报表侧目标表声明化 | ✅ **完成**（`spec.fact` 从 `models/*.yml` 声明白名单取，缺省 `fact_finance`；无口径表拒口径轴 —— FACT_UNKNOWN / DIM_NOT_ON_FACT / PERIOD_TYPE_NOT_ON_FACT；运营指标可出报表与看板，e2e 第 32 阶段 13 条断言） |
+| 聚合表 | ✅ **完成**（`kind: aggregate`：source/grain/measures 声明 → 列由跨表投影；MODEL_AGG_NONADDABLE 守口径；`CREATE OR REPLACE` 全量重算 + 落库同事务重建 + `bilite rebuild` 手动重算，e2e 第 34 阶段 18 条断言） |
 | CLI 入口 | ✅ **命令面走完了**（`ingest lint` / `dry-run` / `run` · `render` · `query` · `catalog dump` / `show` · `compact` · **`plan` / `apply`** · `validate` / `skill export`）。`lint` 零 DB 访问；`query` 受众写死 human；`catalog dump` 遇契约漂移**不以成功退出** —— 见 `docs/开发计划.md` §1.5 |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**446 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
+**464 项 e2e 断言**（含第 12 阶段 HTTP 全链路、第 13 阶段真实 MCP 客户端与模板推断、
 第 14 阶段 spec 校验防静默算错、第 15 阶段主数据对齐、第 25 阶段新接入路径的 HTTP 面与拍板回路
 （含并发落库、归档可读）、第 26 阶段长表接入对拍（与**冻结快照**逐行含金额）、
 第 27 阶段期数的日期格（声明 type: date 才读；不声明不猜；重放一致；1904 拒绝））守着。

@@ -6,15 +6,16 @@
  *   所以这里只算，不写一个字；apply 拿同一份清单去执行。
  *
  * ★ 两类变更分得很清楚，因为它们的风险完全不同：
- *   - **可自动**（`blocking: false`）：建表、加列、刷新列契约。加列在 DuckDB 里是纯元数据操作，
- *     不重写数据（e2e 有断言：加列前后行数与值都不变）。
+ *   - **可自动**（`blocking: false`）：建表、加列、刷新列契约、聚合表**整表重算**
+ *     （`rebuild-table`，CREATE OR REPLACE —— 派生物没有中间态可守，也没有数据可丢）。
+ *     加列在 DuckDB 里是纯元数据操作，不重写数据（e2e 有断言：加列前后行数与值都不变）。
  *   - **阻塞**（`blocking: true`）：**删列**、**改类型**、**加 NOT NULL 列**。
  *     这三件事都可能悄悄丢数据或让旧数据不合约束 —— 生成器**绝不自动做**，
  *     只报出来让人决定（`apply` 一看到阻塞项就整体不动，连能做的也不做：
  *     半个落地比整体不动更难查）。
  */
 import { query } from '../db/index.ts';
-import { addColumnSql, createTableSql, depsOf } from './ddl.ts';
+import { addColumnSql, createTableSql, depsOf, rebuildTableSql } from './ddl.ts';
 import { ddlHashOf, metaOf, type Ir } from './ir.ts';
 
 export type ChangeKind =
@@ -22,6 +23,7 @@ export type ChangeKind =
   | 'add-column'
   | 'drop-column'
   | 'type-changed'
+  | 'rebuild-table'
   | 'undeclared-table'
   | 'register-meta';
 
@@ -136,45 +138,63 @@ export async function planModels(ir: Ir): Promise<ModelPlan> {
       });
       continue;
     }
-    // 声明里有、库里没有 → 加列
-    for (const c of t.columns) {
-      if (liveCols.has(`${t.name}.${c.name}`)) continue;
-      // 新列要 NOT NULL 且没默认值：库里有数据时 DuckDB 会直接失败 —— 交给人数，不擅自改声明
-      const risky = c.notNull && !c.default && (await rowCount(t.name)) > 0;
-      changes.push({
-        kind: 'add-column',
-        table: t.name,
-        column: c.name,
-        detail: risky
-          ? `加列 ${t.name}.${c.name}（${c.type} NOT NULL）—— 表里已经有数据，这一列没有值可填`
-          : `加列 ${t.name}.${c.name}（${c.type}${c.default ? ` DEFAULT ${c.default}` : ''}）`,
-        blocking: risky,
-        sql: addColumnSql(t.name, c),
-      });
-    }
-    // 类型不一致 → 阻塞（改类型可能丢精度、也可能让旧值不合约束）
-    for (const c of t.columns) {
-      const liveType = liveCols.get(`${t.name}.${c.name}`);
-      if (liveType && liveType !== c.type) {
+    if (t.kind === 'aggregate') {
+      // ---- 聚合表：派生物没有"加列/删列/改类型"的中间态 —— 列集合不一致就**整表重算**。
+      //      类型也不比：SUM(DECIMAL(18,2)) 落地是 DECIMAL(38,2)，物理类型由聚合表达式决定
+      //      （声明里本来就不写类型，比类型等于比一个不存在的承诺）。
+      const liveNames = cur.live.filter((c) => c.table_name === t.name).map((c) => c.column_name);
+      const wantNames = t.columns.map((c) => c.name);
+      const same = liveNames.length === wantNames.length && wantNames.every((n) => liveNames.includes(n));
+      if (!same) {
         changes.push({
-          kind: 'type-changed',
+          kind: 'rebuild-table',
           table: t.name,
-          column: c.name,
-          detail: `${t.name}.${c.name} 的类型不一致：声明 ${c.type} / 库里 ${liveType}`,
-          blocking: true,
+          detail: `聚合表 ${t.name} 的列与声明不一致（库里 ${liveNames.join(',') || '空'} / 声明 ${wantNames.join(',')}）—— 整表重算`,
+          blocking: false,
+          sql: rebuildTableSql(t),
         });
       }
-    }
-    // 库里有、声明里没有 → 阻塞（**永不自动删列**：那是丢数据）
-    for (const live of cur.live.filter((c) => c.table_name === t.name)) {
-      if (!t.columns.some((c) => c.name === live.column_name)) {
+    } else {
+      // 声明里有、库里没有 → 加列
+      for (const c of t.columns) {
+        if (liveCols.has(`${t.name}.${c.name}`)) continue;
+        // 新列要 NOT NULL 且没默认值：库里有数据时 DuckDB 会直接失败 —— 交给人数，不擅自改声明
+        const risky = c.notNull && !c.default && (await rowCount(t.name)) > 0;
         changes.push({
-          kind: 'drop-column',
+          kind: 'add-column',
           table: t.name,
-          column: live.column_name,
-          detail: `${t.name}.${live.column_name} 在库里存在、声明里没有 —— 生成器**不删列**`,
-          blocking: true,
+          column: c.name,
+          detail: risky
+            ? `加列 ${t.name}.${c.name}（${c.type} NOT NULL）—— 表里已经有数据，这一列没有值可填`
+            : `加列 ${t.name}.${c.name}（${c.type}${c.default ? ` DEFAULT ${c.default}` : ''}）`,
+          blocking: risky,
+          sql: addColumnSql(t.name, c),
         });
+      }
+      // 类型不一致 → 阻塞（改类型可能丢精度、也可能让旧值不合约束）
+      for (const c of t.columns) {
+        const liveType = liveCols.get(`${t.name}.${c.name}`);
+        if (liveType && liveType !== c.type) {
+          changes.push({
+            kind: 'type-changed',
+            table: t.name,
+            column: c.name,
+            detail: `${t.name}.${c.name} 的类型不一致：声明 ${c.type} / 库里 ${liveType}`,
+            blocking: true,
+          });
+        }
+      }
+      // 库里有、声明里没有 → 阻塞（**永不自动删列**：那是丢数据）
+      for (const live of cur.live.filter((c) => c.table_name === t.name)) {
+        if (!t.columns.some((c) => c.name === live.column_name)) {
+          changes.push({
+            kind: 'drop-column',
+            table: t.name,
+            column: live.column_name,
+            detail: `${t.name}.${live.column_name} 在库里存在、声明里没有 —— 生成器**不删列**`,
+            blocking: true,
+          });
+        }
       }
     }
     // 列契约是否该刷新
@@ -196,7 +216,7 @@ export async function planModels(ir: Ir): Promise<ModelPlan> {
   }
   // 声明里没有、库里有的**语义表**（新建了表却没声明）—— 列到"阻塞"这一侧，因为生成器不管无主的表
   for (const t of liveTables) {
-    if (!/^(dim|fact|map)_/.test(t) || t === 'dim_alias') continue;
+    if (!/^(dim|fact|map|agg)_/.test(t) || t === 'dim_alias') continue;
     if (!ir.tables.some((d) => d.name === t)) {
       changes.push({
         kind: 'undeclared-table',
