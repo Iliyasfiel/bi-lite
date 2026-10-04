@@ -248,7 +248,8 @@ const { dryRunIngest } = await import('../src/ingest/dryrun.ts');
 const { runIngest } = await import('../src/ingest/run.ts');
 const { masterCatalog } = await import('../src/ingest/master.ts');
 
-const longSpec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'));
+const { declaredFactsOf } = await import('../src/gen/parse.ts');
+const longSpec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'), { facts: declaredFactsOf() });
 const dry0 = await dryRunIngest(longSpec, { catalog: await masterCatalog() });
 const shape0 = dry0.blocks[0]!;
 const unCompany = shape0.unmatched.filter((u) => u.kind === 'company');
@@ -490,7 +491,7 @@ const { queryMetrics, compileMetrics, band, catalog, QueryRefused } = await impo
 
 const cat = await catalog();
 log(`  目录: ${cat.dimensions.length} 维度 / ${cat.periodTypes.length} 口径 / ${cat.metrics.length} 指标 / ${cat.companies.length} 公司`);
-check('目录含 6 个维度', cat.dimensions.length === 6, cat.dimensions.map((d) => d.name).join(','));
+check('目录含 8 个维度（含正交维度的场景 / 币种）', cat.dimensions.length === 8, cat.dimensions.map((d) => d.name).join(','));
 check('目录含 5 个口径', cat.periodTypes.length === 5);
 check('目录含 5 指标 / 4 公司', cat.metrics.length === 5 && cat.companies.length === 4);
 // 目录本身不含金额
@@ -653,7 +654,7 @@ check('ECharts 本地直供（无 CDN 依赖）', vendor.status === 200 && vendo
 
 // 目录：零金额
 const webCat = await getJson('/api/catalog');
-check('GET /api/catalog 返回维度与口径', webCat.dimensions.length === 6 && webCat.periodTypes.length === 5,
+check('GET /api/catalog 返回维度与口径', webCat.dimensions.length === 8 && webCat.periodTypes.length === 5,
   `${webCat.dimensions.length} 维度 / ${webCat.periodTypes.length} 口径`);
 check('目录不含任何金额字段', !/\d{4,}/.test(JSON.stringify(webCat.companies) + JSON.stringify(webCat.metrics)));
 
@@ -929,7 +930,7 @@ try {
   const catOne = await raw('get_catalog', { object: 'fact_finance' });
   check('★ 按需下钻是默认路径：只看一张表的粒度与逐列角色',
     !catOne.isError && catOne.json.name === 'fact_finance' &&
-      catOne.json.grain === 'fin_month,company_id,metric_id,period_type' &&
+      catOne.json.grain === 'fin_month,company_id,metric_id,period_type,scenario,ccy' &&
       (catOne.json.columns ?? []).some((c: { column: string; role: string }) => c.column === 'amount' && c.role === 'measure'),
     `列=${(catOne.json.columns ?? []).length}`);
   const catBad = await raw('get_catalog', { object: '不存在的表' });
@@ -939,7 +940,7 @@ try {
   // --- 1. list_metrics：纯元数据 ---
   const lm = await raw('list_metrics');
   check('list_metrics 成功', !lm.isError);
-  check('list_metrics 有维度/口径/指标/公司', lm.json.dimensions.length === 6 && lm.json.periodTypes.length === 5 && lm.json.metrics.length === 5 && lm.json.companies.length === 4);
+  check('list_metrics 有维度/口径/指标/公司', lm.json.dimensions.length === 8 && lm.json.periodTypes.length === 5 && lm.json.metrics.length === 5 && lm.json.companies.length === 4);
   check('list_metrics 不含金额', findAmountLike(lm.json).length === 0);
 
   // --- 2. get_template_schema：模板结构，且不回传数字 ---
@@ -1218,6 +1219,9 @@ sheets:
               why: 同比% 是派生列，库里没有对应口径
         keys:
           - { col: B, as: period }
+          # 正交维度（刀 22）：这份自检源没有场景/币种列 → 常量绑定
+          - { as: scenario, value: 实际 }
+          - { as: ccy, value: 人民币 }
 `;
     // ★ 两处都可能报：`shape.issues` 是读取期收集的，`errors` 有的路径会**整批替换**
     //   （如 CONFLICT_WITH_EXISTING 只在 errors 里）。按 code|message 去重后取并集。
@@ -1613,7 +1617,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
     name: string,
     opts: { decisions?: Array<{ kind: 'company' | 'metric'; raw: string; action: 'merge' | 'create'; targetId?: string; note?: string }>; strict?: boolean } = {},
   ) => {
-    const spec = parseIngestSpec(fs.readFileSync(`test/fixtures/${name}.yaml`, 'utf8'));
+    const spec = parseIngestSpec(fs.readFileSync(`test/fixtures/${name}.yaml`, 'utf8'), { facts: declaredFactsOf() });
     return runIngest(spec, { catalog: await masterCatalog(), autoCreateDims: true, ...opts });
   };
 
@@ -1832,7 +1836,7 @@ log('\n════════ 17. 重放（raw 是值的唯一来源）══�
   // ★ 用**夹具规格**，不是 `ingest/月度经营接入.yaml` —— 那份是生产规格，源在 data/ 里，
   //   不在版本库里。测试借它的源，等于让门禁依赖一个洁净 clone 上不存在的东西。
   const SPEC = 'test/fixtures/月度经营接入.yaml';
-  const spec = parseIngestSpec(fs.readFileSync(SPEC, 'utf8'));
+  const spec = parseIngestSpec(fs.readFileSync(SPEC, 'utf8'), { facts: declaredFactsOf() });
   const cat = await masterCatalog();
 
   const landed = await landRawFile(spec.source);
@@ -1932,7 +1936,7 @@ log('\n════════ 19. 装载事务化（不留半个批次）═�
   //   源文件不存在 → `runIngest` 在关卡 0 就返回 SOURCE_NOT_FOUND，走不到阶段 2 的抛点，
   //   于是「中途失败确实抛错」在作者本机绿、在干净克隆红（364/1）。
   //   **测试借生产数据 = 门禁依赖作者本机**，公开仓库不该这样。
-  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8'));
+  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8'), { facts: declaredFactsOf() });
   const counts = async () => {
     const one = async (t: string) =>
       Number((await db.query<{ n: number }>(`SELECT count(*) AS n FROM ${t}`))[0]!.n);
@@ -1995,6 +1999,7 @@ log('\n════════ 20. 源文件被删之后仍能重放 ═══�
   fs.copyFileSync('test/fixtures/月度经营接入源.xlsx', PROBE);
   const spec = parseIngestSpec(
     fs.readFileSync('test/fixtures/月度经营接入.yaml', 'utf8').replace(/^source:.*$/m, `source: ${PROBE}`),
+    { facts: declaredFactsOf() },
   );
   try {
     const landed = await landRawFile(spec.source);
@@ -2123,7 +2128,7 @@ log('\n════════ 22. catalog（列契约与三层导出）══�
   // —— 按需下钻：单表结构（默认路径，别整库吞下去）——
   const ff = await catalogShow('fact_finance');
   check('★ catalog show fact_finance：粒度 + 逐列角色（含 amount=measure）',
-    ff.grain === 'fin_month,company_id,metric_id,period_type' &&
+    ff.grain === 'fin_month,company_id,metric_id,period_type,scenario,ccy' &&
       ff.columns.some((c) => c.column === 'amount' && c.role === 'measure') &&
       ff.columns.some((c) => c.column === 'company_id' && c.refTable === 'dim_company'),
     `grain=${ff.grain} 列=${ff.columns.length} 行=${ff.rowCount}`);
@@ -2326,7 +2331,8 @@ sheets:
           columns: [D]
 `;
     const lintBad = await post2('/api/ingest/lint', { yaml: brokenYaml });
-    const inProc = diagnoseIngest(brokenYaml);
+    // ★ 库层这一侧同样要带上声明（必需坐标的清单来自目标表声明 —— 与 HTTP 同一份判据）
+    const inProc = diagnoseIngest(brokenYaml, { facts: declaredFactsOf() });
     check('② ★ 一次给全所有问题（不是"改一条、再撞下一条"）',
       lintBad.willBeRejected === true && (lintBad.errors ?? []).length >= 3,
       `${(lintBad.errors ?? []).length} 条：${(lintBad.errors ?? []).map((e: any) => e.code).join(',')}`);
@@ -2594,7 +2600,7 @@ log('\n════════ 26. 长表接入对拍（与冻结的期望值�
     badForms.length === 0,
     badForms.length ? badForms.map(([t, w]) => `${t} 期望 ${w}`).join(' | ') : `比了 ${forms.length} 种写法`);
 
-  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'));
+  const spec = parseIngestSpec(fs.readFileSync('test/fixtures/集团导出长表.yaml', 'utf8'), { facts: declaredFactsOf() });
 
   // —— ① 期望值：**冻结的黄金快照**（由旧长表路径在它被删除前生成过一次）——
   //    ★ 换成快照不是"降低标准"：那份期望值仍然出自旧路的独立执行，
@@ -2679,7 +2685,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
   const DATE_SRC = 'test/fixtures/接入-日期格.xlsx';
 
   // —— ③ 声明了 type: date：干跑（**还没着陆**，读的是 xlsx）读出三个不同的期 ——
-  const dryDate = await dryRunIngest(parseIngestSpec(dateYaml), { catalog: cat });
+  const dryDate = await dryRunIngest(parseIngestSpec(dateYaml, { facts: declaredFactsOf() }), { catalog: cat });
   check('★ 声明 type: date 后日期格的期数被读出（3 行 3 坐标 + "期数逐行不同"，且没有 PERIOD_CELL_NOT_TEXT）',
     dryDate.ok === true && dryDate.blocks[0]!.dataRows === 3
       && dryDate.blocks[0]!.coordinates.total === 3
@@ -2688,7 +2694,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
     `ok=${dryDate.ok} 行=${dryDate.blocks[0]!.dataRows} 坐标=${dryDate.blocks[0]!.coordinates.total} 码=${dryDate.issues.map((i) => i.code).join(',')}`);
 
   // —— ④ 不声明就不猜 ——
-  const dryNoType = await dryRunIngest(parseIngestSpec(dateYaml.replace(/^(\s+)type: date$/m, '')), { catalog: cat });
+  const dryNoType = await dryRunIngest(parseIngestSpec(dateYaml.replace(/^(\s+)type: date$/m, ''), { facts: declaredFactsOf() }), { catalog: cat });
   const noTypeIssue = dryNoType.issues.find((i) => i.code === 'PERIOD_CELL_NOT_TEXT');
   check('★ 不声明 type 时**不猜**：报 PERIOD_CELL_NOT_TEXT，并给出"改成文本 / 声明 type: date"两条路',
     dryNoType.ok === false && !!noTypeIssue && /type: date/.test(noTypeIssue.hint ?? ''),
@@ -2697,7 +2703,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
   // —— ⑤ 1904 日期系统：干跑与着陆都必须**响亮拒绝** ——
   //    ★ 不拒的后果是静默差 4 年：同一天在 1900 系统是 46174、1904 系统是 44712（实测）。
   let dry1904 = '';
-  try { await dryRunIngest(parseIngestSpec(dateYaml.replace('接入-日期格.xlsx', '接入-日期格1904.xlsx')), { catalog: cat }); }
+  try { await dryRunIngest(parseIngestSpec(dateYaml.replace('接入-日期格.xlsx', '接入-日期格1904.xlsx'), { facts: declaredFactsOf() }), { catalog: cat }); }
   catch (e) { dry1904 = (e as Error).message; }
   check('★ 1904 日期系统的工作簿：干跑响亮拒绝（宁可拒绝，也不要静默差 4 年）', /1904/.test(dry1904), dry1904.slice(0, 60));
 
@@ -2709,7 +2715,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
 
   // —— ⑥ 真落库（值从 **raw** 来），期数仍然对 ——
   await db.execute(`DELETE FROM fact_finance WHERE company_id IN (SELECT id FROM dim_company WHERE name = '华东子公司')`);
-  const dateRun = await runIngest(parseIngestSpec(dateYaml), { catalog: cat, autoCreateDims: true });
+  const dateRun = await runIngest(parseIngestSpec(dateYaml, { facts: declaredFactsOf() }), { catalog: cat, autoCreateDims: true });
   const months = (await db.query<{ m: string }>(
     `SELECT DISTINCT strftime(f.fin_month, '%Y-%m-%d') AS m FROM fact_finance f
      JOIN dim_company c ON c.id = f.company_id
@@ -2728,7 +2734,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
     JSON.stringify(rawSerial[0] ?? {}));
 
   // —— ⑧ 重放：值改成从 **raw** 读（与落库同一条路），期数一模一样 ——
-  const dryFromRaw = await dryRunIngest(parseIngestSpec(dateYaml), { catalog: cat, openBook: () => rawWorkbook(hash) });
+  const dryFromRaw = await dryRunIngest(parseIngestSpec(dateYaml, { facts: declaredFactsOf() }), { catalog: cat, openBook: () => rawWorkbook(hash) });
   check('★ 重放（值从 raw 读）得到同一份期数：3 行 3 坐标 + PERIOD_PER_ROW，且没有 PERIOD_CELL_NOT_TEXT',
     dryFromRaw.ok === true && dryFromRaw.blocks[0]!.dataRows === 3
       && dryFromRaw.blocks[0]!.coordinates.total === 3
@@ -3512,8 +3518,8 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   if (!agg) throw new Error('models/ 里没有聚合表（agg_finance_by_month.yml 丢了？）');
   const shape = agg.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}${c.agg ? `:${c.agg}` : ''}`).join(',');
   check('★★ 聚合表的列由跨表投影长出来：grain 列照抄 source（键角色），measure 列带 agg —— 声明里一个列都没写',
-    shape === 'fin_month:pk:K,metric_id:dim_fk:K,period_type:pk:K,amount:measure:sum' &&
-      agg.primaryKey.join(',') === 'fin_month,metric_id,period_type' &&
+    shape === 'fin_month:pk:K,metric_id:dim_fk:K,period_type:pk:K,scenario:pk:K,ccy:pk:K,amount:measure:sum' &&
+      agg.primaryKey.join(',') === 'fin_month,metric_id,period_type,scenario,ccy' &&
       agg.source === 'fact_finance',
     shape);
 
@@ -3567,7 +3573,7 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   const aggYml = (grain: string) =>
     ['kind: aggregate', 'title: 探针聚合表', 'source: fact_finance', `grain: [${grain}]`,
       'measures:', '  - name: amount', '    agg: sum', ''].join('\n');
-  fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, aggYml('fin_month, period_type'));
+  fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, aggYml('fin_month, period_type, scenario, ccy')); // 探针也要过 MODEL_AGG_NONADDABLE（正交维度不许聚合掉，刀 22）
   const planG = await planMod.planModels(gen.loadModels(TMP));
   const rt = planG.changes.find((c) => c.kind === 'rebuild-table');
   check('★★ grain 去掉一个维度 → plan 报 rebuild-table（非阻塞 —— 聚合表没有"删列永不自动"的顾虑，重算即对齐）',
@@ -3576,11 +3582,11 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
     `SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'agg_finance_by_month'`))[0]!.n);
   const apG = await runCli(['apply', '--models', TMP]);
   const colsG = await colCount();
-  const apBack = await runCli(['apply']); // 声明改回 4 列（主 models/）→ 又一次 rebuild-table → 收敛
+  const apBack = await runCli(['apply']); // 声明改回 6 列（主 models/）→ 又一次 rebuild-table → 收敛
   const colsBack = await colCount();
   const planEnd = await planMod.planModels(ir);
-  check('★ 落地 3 列版本，再按主声明 apply → 收敛回 4 列、plan 归零（聚合表没有需要保护的旧结构）',
-    apG.code === 0 && colsG === 3 && apBack.code === 0 && colsBack === 4 && planEnd.pending === false,
+  check('★ 落地 5 列版本，再按主声明 apply → 收敛回 6 列、plan 归零（聚合表没有需要保护的旧结构）',
+    apG.code === 0 && colsG === 5 && apBack.code === 0 && colsBack === 6 && planEnd.pending === false,
     `列数 ${colsG} → ${colsBack}，plan pending=${planEnd.pending}`);
 
   // —— ⑦ 负例：铁律 8 前移到解析期（还没碰库就被拒）——
@@ -3606,7 +3612,7 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   const n4 = await neg('fin_month, period_type', { measure: 'batch_id' });
   check('★ measure 拿 provenance 列冒充 → MODEL_AGG_MEASURE_BAD（批次号加起来没有意义）',
     codeOf(n4).includes('MODEL_AGG_MEASURE_BAD'), codeOf(n4));
-  const n5 = await neg('fin_month, company_id, metric_id, period_type'); // 与 source 粒度同集合
+  const n5 = await neg('fin_month, company_id, metric_id, period_type, scenario, ccy'); // 与 source 粒度同集合（含正交维度 —— 聚合掉它们另有 NONADDABLE 拦着）
   check('★ grain 与源表粒度同集合 → warn MODEL_AGG_NOOP，且 fail-closed：连 warn 都不放行（一行都没被加总，这不是聚合是复制）',
     codeOf(n5).includes('MODEL_AGG_NOOP') && n5.ir === null, codeOf(n5));
   const n6 = await neg('fin_month, period_type', { agg: 'avg' });
@@ -3958,7 +3964,7 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
     return { code, out: o.join(''), err: e.join('') };
   };
   const SPEC37 = 'test/fixtures/月度经营接入.yaml';
-  const spec37 = parseIngestSpec(fs.readFileSync(SPEC37, 'utf8'));
+  const spec37 = parseIngestSpec(fs.readFileSync(SPEC37, 'utf8'), { facts: declaredFactsOf() });
   const cat37 = await masterCatalog();
 
   // —— ① 同事务影子：落库成功 ⇔ stg 有批次（自造干净起点）——
@@ -4213,6 +4219,122 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
   } catch (e) { refusedAgent = (e as { reason?: string }).reason ?? (e as Error).message; }
   check('⑦ agent 拿比率：每格明细支撑不足 3 行 → TOO_FINE_GRAINED（腿 A 先炸，比率拿不到）',
     refusedAgent.includes('TOO_FINE_GRAINED'), refusedAgent.split('\n')[0]);
+}
+
+// ════════ 39. 正交维度（P5 刀 22）：scenario/ccy 行内退化列 + ccy selector 按 fx_rate 取率 ════════
+//   期望值全部取**夹具常量与手算**（铁律 6.1 立场：对拍的期望不来自被测路径自己）。
+//   判据：① scenario 是过滤/分组（注册表维度，零 join）；② ccy 换算在 compileMetrics ——
+//   fx_s = 行的记账币种当月率、fx_u = selector 币种当月率，**按行落窗期取率**
+//   （去年同期累计行落 2025-06 → 用 7.15，不是 as-of 期的 7.12 —— 历史汇率不跟着查询期走）。
+{
+  const { dimAvailableOn } = await import('../src/spec/dims.ts');
+  const { runSemanticQuery } = await import('../src/semantic/rewrite.ts');
+  const facts39 = declaredFactsOf();
+  const ff39 = facts39.find((f) => f.name === 'fact_finance')!;
+  const run39 = (sql: string) => db.query(sql);
+
+  // —— ① 声明面：三张新表由声明行同步（rebuild 全量对齐），fact 的退化列与主键 ——
+  const rowCount = async (t: string) => Number((await db.query<{ n: string }>(`SELECT count(*) AS n FROM ${t}`))[0]!.n);
+  check('① dim_scenario / dim_currency / dim_fx_rate 由声明行同步（3 / 2 / 4 行，git 即审计）',
+    (await rowCount('dim_scenario')) === 3 && (await rowCount('dim_currency')) === 2 && (await rowCount('dim_fx_rate')) === 4,
+    `scenario=${await rowCount('dim_scenario')} currency=${await rowCount('dim_currency')} fx=${await rowCount('dim_fx_rate')}`);
+  check('① fact_finance 主键 6 列（scenario/ccy 入键），退化列自动收纳两个正交维度',
+    ff39.primaryKey.length === 6 && ff39.degenerateColumns.includes('scenario') && ff39.degenerateColumns.includes('ccy'),
+    `pk=[${ff39.primaryKey.join(',')}] deg=[${ff39.degenerateColumns.join(',')}]`);
+
+  // —— ② scenario selector：改写器落地成 filter（selector 与显式 filter 冲突时 selector 赢）——
+  const qSel = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '单月', by: ['month'],
+      filter: { month: '2026-06', company: '华东子公司', scenario: '预算' },
+      scenario: '实际', audience: 'human' },
+    run39, facts39,
+  );
+  check('② scenario selector 赢过显式 filter，华东·营收·单月·2026-06 = 夹具值 56.75',
+    qSel.groups.length === 1 && qSel.groups[0]!.cells[0] === 56.75,
+    `groups=${qSel.groups.length} cell=${qSel.groups[0]?.cells[0]}`);
+  const qBudget = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '单月', by: ['month'], filter: { month: '2026-06', company: '华东子公司' }, scenario: '预算', audience: 'human' },
+    run39, facts39,
+  );
+  check('② 预算场景没有任何行 → 空组（不是 0，是没有数据）', qBudget.groups.length === 0, `groups=${qBudget.groups.length}`);
+  // 注册表路径（不经改写器）：filter.scenario 直接打 WHERE —— CLI / Web 的调用形状
+  const qDirect = await queryMetrics(
+    { measures: [{ metric: '营业收入', periodType: '单月' }], filter: { month: '2026-06', company: '华东子公司', scenario: '实际' }, audience: 'human' },
+    run39, facts39,
+  );
+  check('② scenario 走注册表维度直接过滤（CLI / Web 形状，零 join）= 56.75',
+    qDirect.groups[0]?.cells[0] === 56.75, `cell=${qDirect.groups[0]?.cells[0]}`);
+
+  // —— ③ ccy selector：按行落窗期取率换算（fx_s 记账币种率 / fx_u selector 币种率）——
+  const qUsd = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '单月', by: ['month'], filter: { month: '2026-06', company: '华东子公司' }, ccy: '美元', audience: 'human' },
+    run39, facts39,
+  );
+  const usdCell = qUsd.groups[0]?.cells[0] ?? null;
+  check('③ 美元换算：56.75 / 7.12 —— 断言「换算值 × 当月率 ≈ 人民币原值」的回程（不编浮点字面量）',
+    typeof usdCell === 'number' && Math.abs(usdCell * 7.12 - 56.75) < 1e-9,
+    `cell=${usdCell} 期望≈${56.75 / 7.12}`);
+  const qUsdLag = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '去年同期累计', by: ['month'], filter: { month: '2026-06', company: '华东子公司' }, ccy: '美元', audience: 'human' },
+    run39, facts39,
+  );
+  const lagCell = qUsdLag.groups[0]?.cells[0] ?? null;
+  const qOld = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '去年同期累计', by: ['month'], filter: { month: '2026-06', company: '华东子公司' }, audience: 'human' },
+    run39, facts39,
+  );
+  check('③ ★ 按行落窗期取率：去年同期累计行落 2025-06 → 用 2025 率 7.15（若按 as-of 期取 7.12 则取率错）',
+    typeof lagCell === 'number' && Math.abs(lagCell * 7.15 - 1100.25) < 1e-9 && Math.abs(lagCell * 7.12 - 1100.25) > 1,
+    `cell=${lagCell} 期望≈${1100.25 / 7.15}`);
+  check('③ 对拍：同一行不给 selector = 原始记账金额 1100.25（期望取旧路，不是换算路径自证）',
+    qOld.groups[0]?.cells[0] === 1100.25, `cell=${qOld.groups[0]?.cells[0]}`);
+
+  // —— ④ 拒绝面：没有 ccy 列的表不许换算；汇率表不是事实表；未绑定坐标的规格拒 ——
+  let refusedCcy = '';
+  try {
+    await queryMetrics(
+      { fact: 'fact_business_line', measures: [{ metric: '营业收入' }], ccy: '美元', audience: 'human' },
+      run39, facts39,
+    );
+  } catch (e) { refusedCcy = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('④ fact_business_line 上 ccy selector → CCY_NOT_ON_FACT（静默忽略 = 以为在换算其实没有）',
+    refusedCcy.includes('CCY_NOT_ON_FACT'), refusedCcy.split('\n')[0]);
+  let refusedFx = '';
+  try {
+    await queryMetrics({ fact: 'dim_fx_rate', measures: [{ metric: 'rate' }], audience: 'human' }, run39, facts39);
+  } catch (e) { refusedFx = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('④ 汇率表是维表不是事实表 → FACT_UNKNOWN（declaredFacts 只认 kind: fact）',
+    refusedFx.includes('FACT_UNKNOWN'), refusedFx.split('\n')[0]);
+
+  // —— ⑤ 常量绑定（keys[].value）：源里没有的坐标整批一个值；col 与 value 互斥 ——
+  const { diagnoseIngest } = await import('../src/ingest/types.ts');
+  const constSpec = [
+    'id: 常量绑定探针', 'source: test/fixtures/集团导出长表.xlsx', 'sheets:',
+    '  - name: 财务快报', '    blocks:', '      - anchor: E2',
+    '        keys:', '          - { col: A, as: period }', '          - { col: B, as: scenario, value: 实际 }',
+    '        values:', '          columns: [E]',
+  ].join('\n');
+  const dConst = diagnoseIngest(constSpec, { facts: facts39 });
+  check('⑤ keys 同一项 col 与 value 都给 → KEYS_SOURCE_BAD（来源要么是格子要么是声明值，二选一）',
+    dConst.issues.some((i) => i.code === 'KEYS_SOURCE_BAD'), dConst.issues.map((i) => i.code).join(','));
+  // 常量真的进了行：接入路径落库的正交维度只有声明值这一种
+  const dist = await db.query<{ scenario: string; ccy: string; n: string }>(
+    'SELECT scenario, ccy, count(*) AS n FROM fact_finance GROUP BY ALL ORDER BY 1, 2');
+  check('⑤ 库里事实行的正交坐标 = 常量声明的唯一组（实际 × 人民币 —— 长表与宽表都靠常量绑定）',
+    dist.length === 1 && dist[0]!.scenario === '实际' && dist[0]!.ccy === '人民币' && Number(dist[0]!.n) > 0,
+    dist.map((d) => `${d.scenario}|${d.ccy}×${d.n}`).join(', '));
+
+  // —— ⑥ 聚合表带着正交维度重算（MODEL_AGG_NONADDABLE 的验收：实际与预算绝不互加）——
+  //   （聚合表不是 declaredFact —— 对拍走 SQL，可查询性是 P6 治理的事，不是刀 22 的事）
+  const aggScenarios = (await db.query<{ scenario: string }>(
+    'SELECT DISTINCT scenario FROM agg_finance_by_month ORDER BY 1')).map((r) => r.scenario);
+  check('⑥ 聚合表按场景留坐标：只有实际（预算没有行就不该出现组 —— NONADDABLE 不许混加）',
+    aggScenarios.includes('实际') && !aggScenarios.includes('预算'), `groups=[${aggScenarios.join(',')}]`);
+
+  // —— ⑦ fail-closed：没注入声明时退化列维恒不可用（缺省形状不是"不知道"）——
+  check('⑦ dimAvailableOn(ccy, null) = false —— 缺省形状按 fail-closed 判（与 business_line 同一先例）',
+    dimAvailableOn('ccy', null) === false && dimAvailableOn('scenario', null) === false,
+    `ccy=${dimAvailableOn('ccy', null)} scenario=${dimAvailableOn('scenario', null)}`);
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——

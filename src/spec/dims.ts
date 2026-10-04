@@ -8,7 +8,7 @@
  *   而 compile.ts 又 import types.ts、types.ts 要调用 lint —— 成环。
  *   单独成模块后依赖是单向的：dims.ts ← lint.ts ← types.ts ← compile.ts。
  *
- * ★ 安全含义（铁律 2）：**能进 SQL 的标识符只有这里的六个**。
+ * ★ 安全含义（铁律 2）：**能进 SQL 的标识符只有这里的八个**。
  *   任何绕过这份白名单拼 SQL 的路都是漏洞，这也是"agent 无 SQL 权限"的落点。
  */
 
@@ -39,6 +39,11 @@ export const DIMENSIONS = {
   // 行内退化列维（铁律 8 的运营事实表）：列长在事实表上、低基数、只用来切片，不值得单独建维。
   // ★ 是否可用由**目标表的声明**决定（dimAvailableOn）—— 财务表没有这一列，配了就报错。
   business_line: { table: null, labelCol: 'f.business_line', idCol: 'business_line', joinOn: null },
+  // 正交维度（P5 刀 22）：scenario 过滤/分组零 join；ccy 的**换算**不在编译维度这层做，
+  //   在 compileMetrics 的 selector 分支（fx_rate 按行落窗期取率）—— 这里只管「f.ccy 能过滤」。
+  //   可用性同样由目标表声明决定（fact_finance 有这两列，运营事实表没有）。
+  scenario: { table: null, labelCol: 'f.scenario', idCol: 'scenario', joinOn: null },
+  ccy: { table: null, labelCol: 'f.ccy', idCol: 'ccy', joinOn: null },
 } as const;
 
 export type DimName = keyof typeof DIMENSIONS;

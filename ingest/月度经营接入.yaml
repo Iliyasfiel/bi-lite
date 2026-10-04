@@ -22,5 +22,10 @@ sheets:
         keys:
           - col: B
             as: period
+          # 正交维度（刀 22）：真实月报源没有场景/币种列 —— 整批常量绑定
+          - as: scenario
+            value: 实际
+          - as: ccy
+            value: 人民币
         drop:
           labels: [合计]

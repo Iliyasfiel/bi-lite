@@ -159,8 +159,9 @@ const INGEST_SPEC = 'test/fixtures/月度经营接入.yaml';
 
 const wb3 = new ExcelJS.Workbook();
 const is = wb3.addWorksheet('月报');
-is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%', '去年同期累计', '账面累计']);
-/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E/G/H 四个值列（口径两两不同）；F 是派生列（规格里跳过） */
+is.addRow(['单位', '期数', '指标', '本年累计', '本月数', '同比%', '去年同期累计', '账面累计', '场景', '币种']);
+/** 行键 = (A 列公司, C 列指标)；B 列期数；D/E/G/H 四个值列（口径两两不同）；F 是派生列（规格里跳过）；
+ *  I/J 是正交维度（刀 22）：场景 / 币种，全部行同一组值（实际 / 人民币）——多场景多币种是刀 22 以后的事 */
 const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, month: number, lastYearCum: number, bookCum: number]> = [
   ['华东子公司', '营业收入', 1234.5, 56.75, 1100.25, 1300.5],
   ['华东子公司', '净利润', 200.25, 20.125, 180.5, 210.75],
@@ -168,17 +169,17 @@ const INGEST_ROWS: Array<[company: string, metric: string, cumulative: number, m
   ['华南子公司', '净利润', 500.75, 50.375, 450.25, 520.5],
 ];
 for (const [company, metric, cumulative, month, lastYearCum, bookCum] of INGEST_ROWS) {
-  is.addRow([company, '2026-06', metric, cumulative, month, 0, lastYearCum, bookCum]);
+  is.addRow([company, '2026-06', metric, cumulative, month, 0, lastYearCum, bookCum, '实际', '人民币']);
 }
 // 2025-06 的单月行：只填 E（单月）列 —— D/G/H 留空。★ 为什么不填 D：2025-06 报告的「本年累计」
 // 与 2026-06 报告「去年同期累计」（G）平移后落**同一个窗口** [2025-01, 2025-06]（过渡态 PK 不同、
 // 两行都在），窗口谓词会双算 —— 夹具直接避开这个过渡态已知产物（刀 23 重灌按新 PK 合并）。
 for (const [company, metric, , month] of INGEST_ROWS) {
-  is.addRow([company, '2025-06', metric, null, month, null, null, null]);
+  is.addRow([company, '2025-06', metric, null, month, null, null, null, '实际', '人民币']);
 }
 // 「合计」行刻意留着：规格里的 drop 就是为它写的，夹具必须能真的验到那条规则
-is.addRow(['合计', '2026-06', '合计', null, null, 0, null, null]);
-for (let c = 1; c <= 6; c++) is.getColumn(c).width = 16;
+is.addRow(['合计', '2026-06', '合计', null, null, 0, null, null, null, null]);
+for (let c = 1; c <= 10; c++) is.getColumn(c).width = 16;
 await wb3.xlsx.writeFile(INGEST_SRC);
 
 // 夹具规格：形状与 `ingest/月度经营接入.yaml` 一致，只有 source 指向夹具自己。
@@ -211,6 +212,10 @@ sheets:
         keys:
           - col: B
             as: period
+          - col: I
+            as: scenario
+          - col: J
+            as: ccy
         drop:
           labels: [合计]
 `,
@@ -232,6 +237,7 @@ fs.writeFileSync(
   `# 由 \`npm run fixtures\` 生成（test/make-fixtures.ts）—— **长表的测试夹具，不是生产规格**。
 # 四个坐标全在列里：期数在 A 列（逐行不同），公司/指标/口径在 B/C/D，金额在 E。
 # 与宽表（月度经营接入.yaml）的差别就在期数：这边每行一个期，那边整块同一个期。
+# 正交维度（刀 22）源里没有列 → 常量绑定：这份长表的数据全是「实际场景 / 人民币记账」。
 id: 集团导出长表-夹具
 source: ${LONG}
 onConflict: reject
@@ -251,6 +257,11 @@ sheets:
         keys:
           - col: A
             as: period
+          # 正交维度（刀 22）：长表源没有场景/币种列 → 常量绑定（数据全是 实际 / 人民币）
+          - as: scenario
+            value: 实际
+          - as: ccy
+            value: 人民币
         values:
           columns: [E]
 `,
@@ -310,6 +321,11 @@ sheets:
         keys:
           - col: A
             as: period
+          # 正交维度（刀 22）：这些场景源没有场景/币种列 → 常量绑定（对拍坐标不变）
+          - as: scenario
+            value: 实际
+          - as: ccy
+            value: 人民币
         values:
           columns: [E]
 `,
@@ -377,6 +393,11 @@ sheets:
           - col: A
             as: period
             type: date
+          # 正交维度（刀 22）：源里没有场景/币种列 → 常量绑定
+          - as: scenario
+            value: 实际
+          - as: ccy
+            value: 人民币
         values:
           columns: [E]
 `,

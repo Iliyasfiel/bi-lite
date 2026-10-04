@@ -442,8 +442,11 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   const nonTextPeriodRows: number[] = [];
   const periodKey = (block.keys ?? []).find((k) => k.as === 'period');
   const periodKeyCol = periodKey?.col;
-  /** 行内携带的**退化列**（如 business_line）：keys[].as 指到目标表声明的退化列上 */
+  /** 行内携带的**退化列**（如 business_line）：keys[].as 指到目标表声明的退化列上；
+   *  刀 22 起还有**常量绑定**（value）—— 源里没有的列、整批一个值（如 长表 → 实际/人民币）。 */
   const degKeys = (block.keys ?? []).filter((k) => k.as !== 'period');
+  const degConsts = degKeys.filter((k) => k.value !== undefined);
+  const degColKeys = degKeys.filter((k) => k.col !== undefined);
   // ★ 「这一列是日期格」由 spec 声明（默认 text）。见 Ingest keys[].type 的注释：
   //   靠读 numFmt 自动判断会在**重放**时失效（raw 里只存了那个数字）。
   const periodAsDate = periodKey?.type === 'date';
@@ -533,10 +536,12 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
 
     // ★ 行内退化列（如 business_line）：格值按原样带走。它进了事实表的主键，
     //   所以空值 = 这一行缺坐标（算 incomplete），不许静默当空串写进去。
+    //   常量绑定整批同值，先预置好；空值检查只对**列绑定**有意义（常量在静态诊断就拦了空值）。
     const deg: Record<string, string> = {};
     let degMissing = false;
-    for (const k of degKeys) {
-      const v = textAt(sheet, r, colIndex(k.col));
+    for (const k of degConsts) deg[k.as] = k.value!;
+    for (const k of degColKeys) {
+      const v = textAt(sheet, r, colIndex(k.col!));
       if (v === null || v.trim() === '') degMissing = true;
       else deg[k.as] = v;
     }

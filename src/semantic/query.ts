@@ -45,6 +45,8 @@ const DIM_LABELS: Record<DimName, string> = {
   month: '月份',
   year: '年份',
   business_line: '业务线',
+  scenario: '场景',
+  ccy: '币种',
 };
 
 /** 完整目录（含 DB 里的公司/指标主数据）—— 只有元数据，不含任何金额 */
@@ -77,6 +79,12 @@ export interface MetricsQuery {
   fact?: string;
   groupBy?: string[];                                           // 只能取 DIMENSIONS 的键
   filter?: Record<string, string | string[]>;
+  /**
+   * 币种 selector（正交维度，P5 刀 22）：把金额按**行落窗期**换算成该币种
+   * （f.amount × fx_s.rate / fx_u.rate，fx_rate 按月取率）。省略 = 原样返回记账币种金额。
+   * 只对声明了 ccy 列的表有意义 —— 否则 CCY_NOT_ON_FACT（静默忽略 = 以为在换算其实没有）。
+   */
+  ccy?: string;
   limit?: number;
   audience: 'human' | 'agent';
 }
@@ -194,6 +202,19 @@ export function compileMetrics(
   }
   const shift = shifts.values().next().value ?? 0;
 
+  // ---- 币种 selector（正交维度，P5 刀 22）：按**行落窗期**取率换算 ----
+  //   fx_s = 行的记账币种当月率，fx_u = selector 币种当月率；比率在 CASE 内逐行做再聚合，
+  //   同表混存多币种也正确。JOIN 用 f.fin_month（原始落窗月，不是 +1y 平移标签）——
+  //   去年同期累计行落在 2025-06 就用 2025-06 的率，历史汇率不跟着 as-of 期走。
+  //   目标表没有 ccy 列 → 拒绝（静默忽略 = 写的人以为在换算其实没有）。
+  const ccySel = mq.ccy && mq.ccy.trim() !== '' ? mq.ccy : undefined;
+  if (ccySel && !dimAvailableOn('ccy', fact)) {
+    throw new QueryRefused(
+      `目标表 ${tableName} 没有「ccy」维度，不能按币种换算 —— 运营事实表没有币种体系。`,
+      'CCY_NOT_ON_FACT',
+    );
+  }
+
   // 分组表达式：shift ≠ 0 时 month/year 的标签平移 -shift 年（落窗在去年，报的是今年）
   const periodCol = shift === 0 ? 'f.fin_month' : `f.fin_month + INTERVAL ${-shift} YEAR`;
   const groupExprs = groupBy.map((d) => {
@@ -267,7 +288,8 @@ export function compileMetrics(
         : `dim_metric.name = ${q(m.metric)}`;
     }
     const measureCol = fact?.measureColumn ?? 'amount';
-    return `${agg}(CASE WHEN ${cond} THEN f.${measureCol} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
+    const valueExpr = ccySel ? `(f.${measureCol} * fx_s.rate / fx_u.rate)` : `f.${measureCol}`;
+    return `${agg}(CASE WHEN ${cond} THEN ${valueExpr} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
   });
 
   // join（去重）
@@ -275,6 +297,11 @@ export function compileMetrics(
   for (const d of groupBy) {
     const j = DIMENSIONS[d as DimName].joinOn;
     if (j) joins.add(`JOIN ${DIMENSIONS[d as DimName].table} ON ${j}`);
+  }
+  // 币种 selector 的取率 join（fx_rate 行唯一于 rate_month × ccy —— 模型声明里的承诺）
+  if (ccySel) {
+    joins.add('JOIN dim_fx_rate fx_s ON fx_s.rate_month = f.fin_month AND fx_s.ccy = f.ccy');
+    joins.add(`JOIN dim_fx_rate fx_u ON fx_u.rate_month = f.fin_month AND fx_u.ccy = ${q(ccySel)}`);
   }
 
   // WHERE

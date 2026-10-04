@@ -14,7 +14,7 @@ kind: aggregate
 title: 财务业务线摊分（月 × 业务线 × 指标 × 口径）
 source: fact_finance
 via: map_org_bl
-grain: [fin_month, bl_id, metric_id, period_type]
+grain: [fin_month, bl_id, metric_id, period_type, scenario, ccy]
 measures:
   - name: amount
     agg: sum

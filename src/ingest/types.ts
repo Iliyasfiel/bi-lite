@@ -154,8 +154,12 @@ export interface IngestBlock extends IngestBlockGeometry {
    * ★ 自 2026-10-02 起 `as` 还接受**目标表声明的行内退化列名**（如 `as: business_line`）：
    *   那一格的文本按原样写进事实表的同名列。它不是维（没有主数据归并），是"这一行的属性"。
    *   能写哪些名字由声明决定（`models/<表>.yml` 里 role: degenerate 的列）—— 写错即拒绝。
+   *
+   * ★ 自刀 22 起退化列还可以**常量绑定**：`{ as: scenario, value: "实际" }`（不写 col）——
+   *   源里没有这一列、但整批数据就是这个值（长表/历史源没有场景与币种列）。
+   *   col 与 value 互斥：一个坐标要么每行从格子里读，要么整批一个值，混着写 = 声明不清。
    */
-  keys?: Array<{ col: string; as: 'period' | string; type?: 'text' | 'date' }>;
+  keys?: Array<{ col?: string; as: 'period' | string; value?: string; type?: 'text' | 'date' }>;
   /** 网格之外的固定键：company / metric / period */
   facts?: Record<string, FactSource>;
   /** 不接入的行 */
@@ -446,8 +450,11 @@ export function bindingsOf(block: IngestBlock): Map<string, string[]> {
   }
   for (const k of block.keys ?? []) {
     if (k.as === 'period') add('period', `keys[col=${k.col}].as`);
-    // ★ 行内退化列（如 business_line）也是一个坐标 —— 它进了事实表的主键，就得有来源
-    else if (typeof k.as === 'string' && k.as) add(String(k.as), `keys[col=${k.col}].as`);
+    // ★ 行内退化列（如 business_line）也是一个坐标 —— 它进了事实表的主键，就得有来源。
+    //   常量绑定（value）与列绑定（col）都算数：where 文案区分两种来源，报错时人能对上。
+    else if (typeof k.as === 'string' && k.as) {
+      add(String(k.as), k.value !== undefined ? `keys[value=${k.value}].as` : `keys[col=${k.col}].as`);
+    }
   }
   for (const [dim, src] of Object.entries(block.facts ?? {})) {
     if (dim === 'company' || dim === 'metric' || dim === 'period_type' || dim === 'period') {
@@ -564,8 +571,23 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
               ? `${fact.name} 声明的行内退化列：${fact.degenerateColumns.join(' / ')}。行内的其它列要么声明成 rows[].dim（当坐标），要么就不接入 —— 没有第三种。`
               : '行内的其它列要么声明成 rows[].dim（当坐标），要么就不接入 —— 没有第三种。');
         }
-        if (!safeCol(k?.col)) {
+        if (k?.col !== undefined && !safeCol(k.col)) {
           err('KEYS_COL_BAD', `${kAt}.col`, `列号不合法：${JSON.stringify(k?.col)}。`);
+        }
+        // ★ col 与 value 互斥（刀 22 常量绑定）：来源要么是格子，要么是声明值，二选一。
+        //   两个都写 = 声明不清；两个都不写 = 坐标凭空消失。value 必须非空 —— 空值常量
+        //   会把主键坐标静默写成空串，和"格子空值"是同一类错，只是藏得更深。
+        const hasCol = typeof k?.col === 'string' && k.col.trim() !== '';
+        const hasValue = typeof k?.value === 'string' && k.value.trim() !== '';
+        if (k?.value !== undefined && hasCol) {
+          err('KEYS_SOURCE_BAD', `${kAt}`, `col 与 value 不能同时给（收到 col=${JSON.stringify(k.col)}, value=${JSON.stringify(k.value)}）。`,
+            '要么每行从格子读（写 col），要么整批一个值（写 value）—— 二选一。');
+        }
+        if (!hasCol && !hasValue) {
+          err('KEYS_SOURCE_BAD', `${kAt}`, 'keys 项必须有 col 或 value 之一（两者都没给 = 这个坐标没有来源）。');
+        }
+        if (k?.value !== undefined && !hasValue) {
+          err('KEYS_SOURCE_BAD', `${kAt}.value`, 'value 不能是空串 —— 空值常量等于没有这个坐标。');
         }
         // ★ type 是"这一列的格怎么读"的**声明**（见 KeysSpec 的注释）。只承认 text / date：
         //   写成一个引擎不认识的词，必须当场拦下 —— 否则它会静默退回默认读法，
