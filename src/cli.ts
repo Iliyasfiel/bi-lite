@@ -84,6 +84,7 @@ export type Invocation =
   | { kind: 'apply'; modelsDir: string | null }
   | { kind: 'rebuild'; modelsDir: string | null }
   | { kind: 'validate'; specFile: string }
+  | { kind: 'replay'; specFile: string; source: string | null }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
@@ -117,6 +118,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'apply') return parseGenArgs('apply', tokens.slice(1));
   if (first === 'rebuild') return parseGenArgs('rebuild', tokens.slice(1));
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
+  if (first === 'replay') return parseReplayArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
 }
@@ -352,6 +354,19 @@ function parseValidateArgs(tokens: readonly string[]): Invocation {
   return { kind: 'validate', specFile };
 }
 
+/** `replay` —— 标准化层重展对拍（架构 §4.7）：从库内 raw 重展，与 stg 最新批次逐格对拍。 */
+function parseReplayArgs(tokens: readonly string[]): Invocation {
+  const hint = 'bilite replay --help';
+  if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'replay' };
+  // 同 validate：裸跑 replay 让"脚本里变量为空"看起来像通过 —— 缺文件就是用法错误
+  if (tokens.length === 0) return usage('缺 <规格.yaml>：bilite replay <规格.yaml> [--source 源.xlsx]', hint);
+  const args = scanArgs(tokens, ['--source'], [], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  const specFile = onePositional(args, '接入规格文件', hint);
+  if (typeof specFile !== 'string') return specFile;
+  return { kind: 'replay', specFile, source: args.values['--source']?.[0] ?? null };
+}
+
 function parseSkillArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite skill export --help';
   const sub = tokens[0];
@@ -464,6 +479,7 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'plan',
   'apply',
   'rebuild',
+  'replay',
   'validate',
   'skill-export',
 ];
@@ -906,6 +922,48 @@ export const COMMANDS: CliCommand[] = [
       if (r.rebuilt.length > 0) parts.push(`重算了聚合表 ${r.rebuilt.join('、')}`);
       io.err(parts.length > 0 ? `bilite rebuild: ${parts.join('；')}\n` : 'bilite rebuild: models/ 里没有派生物（rows: 或 kind: aggregate），什么都没做\n');
       return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'replay',
+    name: 'replay',
+    summary: '标准化层重展对拍：从库内 raw 重展，与 stg 最新批次逐格对拍；结论不含任何值',
+    usage: 'bilite replay <规格.yaml> [--source 源.xlsx]',
+    async run(inv, io) {
+      if (inv.kind !== 'replay') throw new Error('命令表与 Invocation 不匹配');
+      const { diagnoseIngest, parseIngestSpec } = await import('./ingest/types.ts');
+      const { masterCatalog } = await import('./ingest/master.ts');
+      const { replaySpec } = await import('./ingest/replay.ts');
+
+      const text = readSpecFile(inv.specFile);
+      await openDb();
+      const cat = await masterCatalog();
+      // ★ 同一份 ctx 给诊断与解析（与 ingest run 相同的理由：判据不许有两份）
+      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
+      const d = diagnoseIngest(text, lintCtx);
+      if (d.willBeRejected) {
+        jsonTo(io, {
+          from: inv.specFile,
+          ok: false,
+          refused: true,
+          errors: d.issues.filter((i) => i.level === 'error'),
+          note: '规格没通过静态诊断，没有可对拍的对象。',
+        });
+        io.err('bilite replay: 静态诊断没通过，没有对拍\n');
+        return EXIT.FAILED;
+      }
+      const spec = parseIngestSpec(text, lintCtx);
+      const diff = await replaySpec(spec, { source: inv.source ?? undefined });
+      jsonTo(io, { from: inv.specFile, ...diff });
+      io.err(
+        diff.ok
+          ? `bilite replay: 对拍一致 —— ${diff.replayedRows} 行逐格相等（批次 ${diff.batchId}，` +
+            `${diff.mode === 'raw' ? '从库内 raw 重展' : '从源文件重展'}）\n`
+          : `bilite replay: 对拍不一致 —— 库内 ${diff.stgRows} 行 / 重展 ${diff.replayedRows} 行 / ` +
+            `重展缺 ${diff.missingInStg} 行、库内多 ${diff.extraInStg} 行、字段不一致 ${diff.mismatchTotal} 处` +
+            `（坐标见 stdout；按纪律不含值）\n`,
+      );
+      return diff.ok ? EXIT.OK : EXIT.FAILED;
     },
   },
   {

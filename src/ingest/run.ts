@@ -148,11 +148,14 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   //  · source 是执行参数：调用方给的覆盖规格里写的，干跑与落库用同一个值。
   const effSource = opts.source ?? spec.source;
   let openBook: ((absPath: string) => Promise<ReadableWorkbook>) | undefined;
+  let landedHash: string | undefined; // 本批实际读的那份 raw（stg 影子的 file_hash）
   if (landableSource(effSource) && !opts.planOnly) {
     const landed = await landRawFile(effSource);
+    landedHash = landed.fileHash;
     openBook = () => rawWorkbook(landed.fileHash);
   } else {
     const hash = effSource ? await findRawFile(effSource) : undefined;
+    landedHash = hash;
     if (hash) openBook = () => rawWorkbook(hash);
   }
 
@@ -571,6 +574,46 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
           `多半是撞库预检漏掉了一个坐标（ON CONFLICT DO NOTHING 会安静吞掉它）。` +
           `批次 ${batchId} 已整体回滚，没有留下半个批次。`,
       );
+    }
+
+    // ★ 标准化层影子（架构 §4.7）：同一批展开行**同事务**物化进 stg_fact_rows ——
+    //   存归并前的原名与值格坐标，"raw + 接入规格 → 标准行"从此有落盘落点，
+    //   `bilite replay`（重展对拍）据此验证可重放性（源文件删了也能从 raw 重展）。
+    //   stg 与 fact 从同一批内存行双写：落库成功 ⇔ stg 有影子；整体回滚 ⇔ stg 零残留。
+    //   ⚠️ 行数守卫必须走 queryWriter（理由同上：读连接看不到本事务未提交的写）。
+    {
+      const degJsonOf = (r: IngestFactRow): string | null => {
+        const keys = Object.keys(r.deg).sort();
+        return keys.length > 0 ? JSON.stringify(Object.fromEntries(keys.map((k) => [k, r.deg[k]!]))) : null;
+      };
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const chunk = rows.slice(i, i + CHUNK);
+        const values = chunk
+          .map((r) => {
+            const degJson = degJsonOf(r);
+            return (
+              `(${lit(batchId)}, ${lit(target)}, ${lit(spec.id)}, ${lit(landedHash!)}, ${lit(r.sheet)}, ${r.block}, ${r.row}, ${lit(r.col)}, ` +
+              `${lit(r.period)}, ${lit(r.company)}, ${lit(r.metric)}, ` +
+              `${r.periodType === null ? 'NULL' : lit(r.periodType)}, ${r.amount === null ? 'NULL' : String(r.amount)}, ` +
+              `${degJson === null ? 'NULL' : lit(degJson)}, now())`
+            );
+          })
+          .join(',\n');
+        await execute(
+          `INSERT INTO stg_fact_rows (batch_id, target, spec_id, file_hash, sheet, block, row_no, value_col, period, company_raw, metric_raw, period_type, amount, deg, loaded_at)
+           VALUES ${values}`,
+        );
+      }
+      const stgCounted = await queryWriter<{ n: number }>(
+        `SELECT count(*) AS n FROM stg_fact_rows WHERE batch_id = ${lit(batchId)}`,
+      );
+      const stgWritten = Number(stgCounted[0]?.n ?? 0);
+      if (stgWritten !== rows.length) {
+        throw new Error(
+          `标准化层少写了：本批 ${rows.length} 行，stg 只见到 ${stgWritten} 行。` +
+            `批次 ${batchId} 已整体回滚，没有留下半个批次。`,
+        );
+      }
     }
 
     // ★ 列契约与数据**同一个事务**：元数据不可能是"上次同步的"。

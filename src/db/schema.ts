@@ -75,6 +75,30 @@ CREATE TABLE IF NOT EXISTS raw_cell (
   PRIMARY KEY (file_hash, sheet, row_no, col_no)
 );
 
+-- ---------- 标准化层：raw + 接入规格 → 标准行（架构 §4.7）----------
+-- 一张通用表（不按事实表分表：退化列差异用 deg JSON 承载）。
+-- 与 fact 同级安全面：含金额，不进 catalog / MCP / Web / skill 物料（e2e 钉着）。
+-- 边界：stg 之前是纯函数（raw + 规格 → 标准行，可独立重放）；主数据归并与 id 解析
+-- 都发生在 stg → fact 的一步 —— 所以 company/metric 存的是归并前的**原名**。
+CREATE TABLE IF NOT EXISTS stg_fact_rows (
+  batch_id    VARCHAR NOT NULL,      -- → import_batch.batch_id（同事务写入）
+  target      VARCHAR NOT NULL,      -- 目标事实表名（fact_finance 等）
+  spec_id     VARCHAR NOT NULL,      -- 接入规格 id（spec.id）
+  file_hash   VARCHAR NOT NULL,      -- 着陆源（raw_file.file_hash）
+  sheet       VARCHAR NOT NULL,
+  block       INTEGER NOT NULL,
+  row_no      INTEGER NOT NULL,      -- 源行号（1-based，与 raw_cell 一致）
+  value_col   VARCHAR NOT NULL,      -- 值格 Excel 列字母（如 "F"）
+  period      VARCHAR NOT NULL,      -- 标准化后 YYYY-MM
+  company_raw VARCHAR NOT NULL,      -- 归并前原名
+  metric_raw  VARCHAR NOT NULL,
+  period_type VARCHAR,
+  amount      DOUBLE,
+  deg         VARCHAR,               -- 退化列 JSON（键排序规范化）；无退化列 = NULL
+  loaded_at   TIMESTAMP,
+  PRIMARY KEY (batch_id, target, block, row_no, value_col)
+);
+
 -- ---------- 控制面元数据：物理层向语义层 / Agent 自省自己的契约（架构 §7.2）----------
 -- ⚠️ 这段注释里**不能出现反引号** —— 整个 DDL 是一个模板字符串，
 --    写一个反引号进去就会把它提前闭合，报错却是"Expected a semicolon"，指在毫不相干的下一行（踩过一次）。

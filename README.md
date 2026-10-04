@@ -6,7 +6,7 @@
 **两个方向**：Excel →（**接入规格**）→ 本地 DuckDB 星型库 →（**报表规格**）→ 按模板渲染的报送 Excel / 图表。
 **三个入口**：**MCP + skill**（agent 与你对话，把模糊模板敲成规格）、**Web**（浏览器三个页签）、
 **CLI**（`bilite`，给人与脚本：`ingest lint|dry-run|run` · `render` · `query` · `catalog dump|show` ·
-`compact` · **`plan` / `apply` / `rebuild`** · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
+`compact` · **`plan` / `apply` / `rebuild`** · `replay` · `validate` · `skill export`；数据走 stdout、日志走 stderr，退出码即结论）。
 
 财务数据**不以明文进入 LLM 上下文**——这不是靠过滤，是靠架构：agent 根本没有 SQL 权限，
 它只能产出**规格（spec）**，数值第一次出现是在你自己的浏览器里。
@@ -44,7 +44,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 长表/宽表/对齐场景等接入夹具）
-npm run e2e             # ★ 506 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 526 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -339,7 +339,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 506 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 526 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -387,7 +387,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，506 项断言
+npm run e2e        # ★ 唯一门禁，526 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 ```
 
@@ -410,10 +410,11 @@ npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 | 5. 模板 → spec | ✅ 上传模板自动出 spec 草稿（Web + `generate_spec`） |
 | R1. 主数据对齐 | ✅ 两档归并（Tier 1 自动 / Tier 2 人拍板）+ `dim_alias` 表 + Web 待确认卡片 |
 | §7.2 路径 2 | ✅ 自然语言 → spec：靠"spec 语言挡住欠约束"实现（`lint_spec` + 边打字边诊断） |
-| CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `compact` · `plan` / `apply` / `rebuild` · `validate` · `skill export` |
+| CLI 入口 | ✅ `ingest lint/dry-run/run` · `render` · `query` · `catalog dump/show` · `compact` · `plan` / `apply` / `rebuild` · `replay` · `validate` · `skill export` |
 | 聚合表 | ✅ `kind: aggregate`：列由跨表投影、`CREATE OR REPLACE` 全量重算（删了能回来）、落库同事务重建 |
 | 桥接层 | ✅ `kind: bridge` + 声明行 `rows:`：`bilite rebuild` 全量对齐、权重和 =1、聚合 `via:` 加权摊分（守恒对拍） |
 | 维度版本行（SCD2） | ✅ 历史挂侧表 `dim_*_hist`；`dimAsOf` 时点查询；**当前态查询零回归** |
+| 标准化层（stg） | ✅ `stg_fact_rows` 与 fact 同事务双写（影子）；`bilite replay` 从库内 raw 重展对拍，结论只含坐标+字段名 |
 
 ### 已知限制
 

@@ -142,11 +142,11 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 长表/宽表源与规格）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，506 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，526 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 覆盖 36 个阶段 + 三条结构守卫（页面路径↔路由表 /
+- **`npm run e2e` 必须全绿才可提交。** 覆盖 37 个阶段 + 三条结构守卫（页面路径↔路由表 /
   每个 MCP 工具都被真调用 / 六处文档条数自校验）+ 自包含守卫。阶段与断言清单见
   `test/e2e.ts` 分节注释——**刻意不写进文档**（条数以实跑输出为准，那个数字漂过两次）。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`；
@@ -179,7 +179,7 @@ npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127
 ```
 src/
   cli.ts           CLI 入口（三入口之一）：ingest lint|dry-run|run · render · query · catalog dump|show
-                   · compact · plan|apply|rebuild · validate · skill export
+                   · compact · plan|apply|rebuild · replay · validate · skill export
                    ★ parseCliArgs() 纯数据；handler 惰性 import（--help 不加载原生依赖）；
                      stdout=数据 / stderr=日志；命令表自检（注册无 handler 启动即报错）；
                      退出码即结论（被拒/error→1，needsDecision 是待办→0）；query 受众写死 human
@@ -201,9 +201,13 @@ src/
     read.ts        rawWorkbook()（raw → 可读工作簿；清洗/换算不许回写 raw）
   ingest/          接入层：源 Excel → 星型表（规格 YAML 由 agent 产出，这里只确定性执行）
     types.ts       IngestSpec + parseIngestSpec + lintIngest/diagnoseIngest（判据只有一份）
-    dryrun.ts      展开网格 → 事实行（只出形状计数；长表同路；keys[].as 可指退化列；type: date）
+    dryrun.ts      展开网格 → 事实行（只出形状计数；长表同路；keys[].as 可指退化列；type: date）；
+                   每行带值格坐标（col）——stg 影子与 replay 对拍的坐标来源
     run.ts         runIngest()：关卡 0 着陆 → 形状 → 无值格 → 主数据两档 → 落库（事务化）；
-                   ★ 目标表由声明决定（spec.target → declaredFacts），代码里没有表名字符串
+                   ★ 目标表由声明决定（spec.target → declaredFacts），代码里没有表名字符串；
+                   fact + stg_fact_rows 同事务双写（架构 §4.7：少一份当场炸）
+    replay.ts      replaySpec()：按 spec 从库内 raw 重展、与最新批 stg 逐格对拍；
+                   结论只含坐标+字段名（零金额出口），未落库 → SPEC_NOT_INGESTED
     normalize.ts   toHalfWidth / normalizeName / stemCompany
     resolve.ts     两档主数据归并（铁律 16；判据细节在本文件头部）
     master.ts      masterCatalog()（主数据快照唯一实现）
@@ -264,10 +268,11 @@ specs/  models/  templates/  ingest/    # 声明与规格 YAML（版本化）；
 | 聚合表 | ✅ `kind: aggregate`：投影列 / `MODEL_AGG_NONADDABLE` / 全量重算（e2e 第 34 阶段） |
 | 桥接层 | ✅ `kind: bridge` + 声明行 `rows:`：全量对齐 / 权重和 =1 / `via:` 加权摊分（e2e 第 35 阶段） |
 | 语义层自省 + 改写器 | ✅ `introspect`（声明 → 能查什么，零新登记）/ `rewrite`（纯翻译，判据一份）/ `catalog.semantic`（e2e 第 36 阶段） |
-| CLI 入口 | ✅ 命令面走完（`ingest` 三连 · `render` · `query` · `catalog` · `compact` · `plan/apply/rebuild` · `validate` · `skill export`） |
+| 标准化层（stg） | ✅ `stg_fact_rows` 同事务影子（fact+stg 少一份当场炸）/ `bilite replay` 从库内 raw 重展对拍，结论只含坐标+字段名（e2e 第 37 阶段） |
+| CLI 入口 | ✅ 命令面走完（`ingest` 三连 · `render` · `query` · `catalog` · `compact` · `plan/apply/rebuild` · `replay` · `validate` · `skill export`） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**506 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
+**526 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
 由 e2e 末尾的自校验盯着）。
 
 **下一步**：历史施工项全部完成（`docs/开发计划.md` §1 与 §4 刀谱）；未完成与待定看 `docs/开发计划.md` §3。

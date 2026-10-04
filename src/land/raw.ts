@@ -54,8 +54,9 @@ export interface RawLanding {
   cellsWritten: number;
 }
 
-/** SQL 字符串字面量转义。⚠️ 本仓库另有几份同功能实现（compile.ts / semantic/query.ts / ingest/run.ts），待收拢 */
-function lit(v: string): string {
+/** SQL 字符串字面量转义。⚠️ 本仓库另有几份同功能实现（compile.ts / semantic/query.ts / ingest/run.ts），待收拢；
+ *   replay.ts 用的是这一份（重展对拍的查询参数都过它） */
+export function lit(v: string): string {
   return `'${v.replace(/'/g, "''")}'`;
 }
 
