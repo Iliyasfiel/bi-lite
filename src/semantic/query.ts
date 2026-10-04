@@ -170,7 +170,15 @@ export function compileMetrics(
     );
   }
   const tableName = fact?.name ?? DEFAULT_TARGET;
-  const hasPT = fact ? fact.periodTypeColumn !== null : true; // 缺省表带口径列
+  // ★ 刀 23：口径窗口的判据长在**声明**里（calibers）。调用方没注入声明 = 引擎不知道
+  //   这张表的窗口规则 —— 没声明就不出数（fail-closed；67283 判例的查询侧终点）。
+  if (!fact) {
+    throw new QueryRefused(
+      `查询  必须注入 models 声明（declaredFactsOf()）—— 口径窗口的判据长在声明的 calibers 里（铁律 5），没声明就不出数。`,
+      "FACT_NOT_DECLARED",
+    );
+  }
+  const calibers = fact.calibers;
 
   const groupBy = mq.groupBy ?? [];
   for (const d of groupBy) {
@@ -178,17 +186,21 @@ export function compileMetrics(
       throw new QueryRefused(`未注册的维度: ${d}（只允许 ${Object.keys(DIMENSIONS).join(' / ')}）`, 'UNKNOWN_DIMENSION');
     }
     if (!dimAvailableOn(d as DimName, fact)) {
-      throw new QueryRefused(`目标表 ${tableName} 没有「${d}」这个维度。`, 'DIM_NOT_ON_FACT');
+      throw new QueryRefused(`目标表  没有「」这个维度。`, "DIM_NOT_ON_FACT");
+    }
+    // 口径不是行上的列（刀 23）：自由查询的口径钉在每个度量上（measures[].periodType），
+    // 不支持按口径分组 / 过滤 —— 那会跨窗口加总或把窗口当标签用（铁律 5）。
+    if (d === "period_type") {
+      throw new QueryRefused(
+        "自由查询不支持按口径分组/过滤 —— 口径钉在 measures[].periodType 上（铁律 5：口径是窗口声明，不是行上的列）。",
+        "PERIOD_TYPE_NOT_GROUPABLE",
+      );
     }
   }
 
   // ---- 口径白名单 = 该表**声明的 calibers**（铁律 5：口径是窗口声明，不是全局注册表）----
-  //   缺省表（调用方没注入声明）按全局注册表判 —— 那是"fact_finance 形状"的保守回退。
-  const calibers = fact?.calibers ?? [];
   const caliberOfName = (n: string) => calibers.find((c) => c.name === n);
-  const allowedPeriods = new Set<string>(
-    calibers.length ? calibers.map((c) => c.name) : PERIOD_TYPES.map((p) => p.id),
-  );
+  const allowedPeriods = new Set<string>(calibers.map((c) => c.name));
 
   // ---- 窗口平移（铁律 5）：as-of 期间是平移前的 ---- 过滤值要平回去、标签要平出来。
   //   同一查询混不同 shift 是口径错配（一半的月份轴对不上 x 轴），直接拒，不猜。
@@ -232,14 +244,14 @@ export function compileMetrics(
     const agg = m.agg ?? 'sum';
     if (!AGGS.has(agg)) throw new QueryRefused(`不支持的聚合: ${agg}`, 'BAD_AGG');
     if (!m.metric) throw new QueryRefused(`measures[${i}] 需要 metric`, 'BAD_MEASURE');
-    if (hasPT && !m.periodType) {
-      throw new QueryRefused(`measures[${i}] 需要 periodType（口径）`, 'BAD_MEASURE');
-    }
-    if (m.periodType && !hasPT) {
+    if (calibers.length === 0 && m.periodType) {
       throw new QueryRefused(
-        `目标表 ${tableName} 没有口径列，measures[${i}].periodType 无处安放 —— 运营事实表没有口径体系（铁律 8）。`,
-        'PERIOD_TYPE_NOT_ON_FACT',
+        `目标表  没有口径体系（声明的 calibers 为空），measures[].periodType 无处安放 —— 运营事实表没有口径体系（铁律 8）。`,
+        "PERIOD_TYPE_NOT_ON_FACT",
       );
+    }
+    if (calibers.length > 0 && !m.periodType) {
+      throw new QueryRefused(`measures[] 需要 periodType（口径）—— 口径是窗口声明，混窗口加总是无声错（铁律 8）`, "BAD_MEASURE");
     }
     if (m.periodType && !allowedPeriods.has(m.periodType)) {
       throw new QueryRefused(
@@ -281,11 +293,15 @@ export function compileMetrics(
             ? `f.${w} = date_trunc('year', f.${p})`
             : `f.${w} = DATE '${cal.since}-01'`;
       cond = `dim_metric.name = ${q(m.metric)} AND ${rule}`;
+    } else if (m.periodType) {
+      // 口径有声明、表却没有窗口列 = 声明与窗口列不自洽（声明了 calibers 就必须有 windowFrom）
+      throw new QueryRefused(
+        `目标表 ${tableName} 声明了口径「${m.periodType}」却没有窗口列（windowFrom）—— 声明不自洽，拒绝出数（铁律 5）。`,
+        'CALIBER_UNRESOLVABLE',
+      );
     } else {
-      // 没有窗口列的表（缺省形状 / 运营事实）保持旧行为
-      cond = m.periodType
-        ? `dim_metric.name = ${q(m.metric)} AND f.period_type = ${q(m.periodType)}`
-        : `dim_metric.name = ${q(m.metric)}`;
+      // 没有口径体系的表（运营事实）：只按指标取数
+      cond = `dim_metric.name = ${q(m.metric)}`;
     }
     const measureCol = fact?.measureColumn ?? 'amount';
     const valueExpr = ccySel ? `(f.${measureCol} * fx_s.rate / fx_u.rate)` : `f.${measureCol}`;
@@ -313,6 +329,13 @@ export function compileMetrics(
     }
     if (!dimAvailableOn(col as DimName, fact)) {
       throw new QueryRefused(`目标表 ${tableName} 没有「${col}」这个维度。`, 'DIM_NOT_ON_FACT');
+    }
+    // 口径不是行上的列（刀 23）：过滤窗口用 measures[].periodType 钉，不过滤 period_type
+    if (col === 'period_type') {
+      throw new QueryRefused(
+        '自由查询不支持按口径过滤 —— 口径钉在 measures[].periodType 上（铁律 5：口径是窗口声明，不是行上的列）。',
+        'PERIOD_TYPE_NOT_GROUPABLE',
+      );
     }
     const dim = DIMENSIONS[col as DimName];
     const ref = dim.table ? `${dim.table}.${dim.labelCol}` : dim.labelCol;

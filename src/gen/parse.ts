@@ -682,18 +682,27 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
     //   聚合掉口径 = 把"本年累计"与"单月"加在一起 —— 这是错得最安静的那一种：
     //   数字看起来照样是对的量级，只是谁都不知道它已经不对了。
     //   正交维度同理（刀 22）：聚合掉场景 = 实际与预算混加；聚合掉币种 = 人民币与美元混加。
+    //   刀 23：口径的唯一承载是窗口 —— windowFrom 单查（它没有 semantic 标签，
+    //   口径体系长在声明 calibers 上），聚合掉它 = 三种窗口混加，同一条铁律 8。
     const NONADDABLE: Record<string, string> = {
       period: '不同月份',
-      period_type: '本年累计与单月',
       scenario: '实际与预算',
       ccy: '人民币与美元',
     };
     const dropped = src.columns.filter(
       (c) => !t.grain.includes(c.name) && c.semantic !== undefined && c.semantic in NONADDABLE,
     );
+    if (src.windowFrom && !t.grain.includes(src.windowFrom)) {
+      dropped.push(src.columns.find((c) => c.name === src.windowFrom)!);
+    }
     for (const c of dropped) {
+      const why =
+        c.name === src.windowFrom
+          ? '把不同窗口（本年累计与单月）加在一起是无声错'
+          : `把${NONADDABLE[c.semantic!]}加在一起是无声错`;
+      const what = c.name === src.windowFrom ? '口径窗口' : c.semantic === 'period' ? '时间窗' : '场景或币种';
       issues.push(
-        issue('error', 'MODEL_AGG_NONADDABLE', `${t.name}.grain`, `${c.name} 被聚合掉了 —— 把${NONADDABLE[c.semantic!]}加在一起是无声错`, `把 ${c.name} 加进 grain；要换${c.semantic === 'period' || c.semantic === 'period_type' ? '时间窗' : '场景或币种'}是查询侧的事，不是建表侧的事`),
+        issue('error', 'MODEL_AGG_NONADDABLE', `${t.name}.grain`, `${c.name} 被聚合掉了 —— ${why}`, `把 ${c.name} 加进 grain；要换${what}是查询侧的事，不是建表侧的事`),
       );
     }
     // noop 提醒：grain 与 source 主键一致 → 一行都没被加总，这是复制不是聚合

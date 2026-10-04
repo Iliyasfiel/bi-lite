@@ -222,21 +222,37 @@ function lintBlock(b: Block, at: string, out: LintIssue[], fact: DeclaredFact | 
     }
     // ★ 口径名必须是注册过的口径（判例见文件头 ④）。
     //   只查**字面量**：带 {{参数}} 的标签要等替换之后才知道是什么，这里不猜。
+    // ★ 口径名必须在**目标表声明的 calibers**里（刀 23：口径是声明，不是全局注册表）。
+    //   没注入声明时退回 PERIOD_TYPES 词表（fact_finance 形状的保守回退）。
+    //   calculator 口径不落事实表，不能做轴 —— 它在语义层算（改写器）。
+    //   只查**字面量**：带 {{参数}} 的标签要等替换之后才知道是什么，这里不猜。
     if (spec.dim === 'period_type' && order.length) {
-      const registered = new Set(PERIOD_TYPES.map((p) => p.id));
-      const bad = [...new Set(order.map(String).filter((x) => !x.includes('{{') && !registered.has(x)))];
+      const declared = fact && fact.calibers.length > 0;
+      const vocab = declared ? fact!.calibers.filter((c) => !c.calculator).map((c) => c.name) : PERIOD_TYPES.map((p) => p.id);
+      const bad = [...new Set(order.map(String).filter((x) => !x.includes('{{') && !vocab.includes(x)))];
       if (bad.length) {
         out.push({
           level: 'error',
           code: 'PERIODTYPE_UNKNOWN',
           at: `${at}.${axis}.order`,
-          message: `口径名不在注册的口径里：${bad.slice(0, 3).join('、')}。`,
+          message: `口径名不在${declared ? `${factLabel} 声明的 calibers` : '注册的口径'}里：${bad.slice(0, 3).join('、')}。`,
           hint:
-            `已注册的口径：${PERIOD_TYPES.map((p) => p.id).join(' / ')}。`
+            `可用的口径：${vocab.join(' / ')}。`
             + '写错一个字不会被别的判据拦住 —— 而实测那一格会**静默变成空**（本该有数、结果 null），'
-            + '写进报送表就像"这一项没有数"。要新增口径，注册进 src/db/schema.ts 的 PERIOD_TYPES（铁律 5）。',
+            + '写进报送表就像"这一项没有数"。要新增口径，声明进 models/*.yml 的 calibers（铁律 5）。',
         });
       }
+    }
+    // 口径轴只支持做列（刀 23）：口径不落行（period_type 列已退场），行轴没有可分组的坐标；
+    // 转置需求把口径放 cols。编译器同样拒绝（compile.ts）—— 两条路同一判据。
+    if (spec.dim === 'period_type' && axis === 'rows') {
+      out.push({
+        level: 'error',
+        code: 'CALIBER_AXIS_COLS_ONLY',
+        at: `${at}.rows.dim`,
+        message: '口径轴只支持做列（cols.dim: period_type）—— 口径不落行，没有可分组的行坐标（铁律 5）。',
+        hint: '把口径放到 cols：cols: { dim: period_type, order: [本年累计, 去年同期累计] }；行轴放公司 / 指标。',
+      });
     }
   }
 

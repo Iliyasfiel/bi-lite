@@ -395,7 +395,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
 
   // ★ 目标表**没有口径列**时（运营事实表），值列不必说清口径 —— 这个判据由声明决定，
   //   不是"永远是四个坐标"（铁律 18：目标表也是声明）。
-  const needsPeriodTypeFromValues = !dimsOfRows.includes('period_type') && (fact === null || fact.periodTypeColumn !== null);
+  const needsPeriodTypeFromValues = !dimsOfRows.includes('period_type') && (fact === null || fact.calibers.length > 0);
   if (needsPeriodTypeFromValues) {
     const unmapped = valueColumns.filter((v) => v.periodType === null);
     if (unmapped.length > 0) {
@@ -562,7 +562,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     for (const vc of valueColumns) {
       coordTotal++;
       const periodType = dimsOfRows.includes('period_type') ? rowDimOf.get('period_type') ?? null : vc.periodType;
-      const needPt = fact === null || fact.periodTypeColumn !== null;
+      const needPt = fact === null || fact.calibers.length > 0;
       if (!company || !metric || !periodText || (needPt && !periodType) || degMissing) incomplete++;
       else {
         const key = [company, metric, periodText, periodType ?? '', ...degKeys.map((k) => deg[k.as] ?? '')]

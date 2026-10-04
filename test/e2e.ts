@@ -271,20 +271,23 @@ const res = await runIngest(longSpec, { catalog: await masterCatalog(), autoCrea
 const importMs = Date.now() - t0;
 log(`  写入 ${res.inserted} 行，用时 ${importMs}ms`);
 log(`  自动创建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个`);
-check('写入行数 = 960', res.inserted === 960, `${res.inserted}`);
+// ★ 刀 23：同窗口不存两份 —— 1 月的「单月」与「本年累计」是同一个窗口（[当年 1 月, 当月]），
+//   4 公司 × 5 指标 = 20 个坐标批内合并（夹具四口径同值，无信息损失）：960 源行 → 940 事实行。
+check("写入行数 = 940（960 源行，1 月单月/本年累计同窗口合并 20 行 —— 同一窗口不存两份）",
+  res.inserted === 940, `${res.inserted}`);
 check('新建了 4 家公司 / 5 个指标', res.createdCompanies.length === 4 && res.createdMetrics.length === 5,
   `${res.createdCompanies.length}/${res.createdMetrics.length}`);
 
 const cnt = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
-check('事实表行数正确', Number(cnt[0].n) === 960, `${cnt[0].n}`);
-const span = await db.query<{ months: number; companies: number; metrics: number; periods: number }>(
-  'SELECT count(DISTINCT fin_month) AS months, count(DISTINCT company_id) AS companies, count(DISTINCT metric_id) AS metrics, count(DISTINCT period_type) AS periods FROM fact_finance',
+check("事实表行数正确（同窗口合并后）", Number(cnt[0].n) === 940, `${cnt[0].n}`);
+const span = await db.query<{ months: number; companies: number; metrics: number; windows: number }>(
+  "SELECT count(DISTINCT fin_month) AS months, count(DISTINCT company_id) AS companies, count(DISTINCT metric_id) AS metrics, count(DISTINCT period_from) AS windows FROM fact_finance",
 );
 // ★ 口径二分后：去年同期累计行装载即平移（2026-XX → 2025-XX），库内月份跨两年（12+12=24）
 check('覆盖 24 个月（去年平移 + 本年 12 + 12）', Number(span[0].months) === 24, `${span[0].months}`);
-check('覆盖 4 公司 / 5 指标 / 4 口径',
-  Number(span[0].companies) === 4 && Number(span[0].metrics) === 5 && Number(span[0].periods) === 4,
-  `${span[0].companies}/${span[0].metrics}/${span[0].periods}`);
+check("覆盖 4 公司 / 5 指标 / 3 窗口起点（1 月单月与本年累计合并，2-12 月年首各一 + 当月各自）",
+  Number(span[0].companies) === 4 && Number(span[0].metrics) === 5 && Number(span[0].windows) === 13,
+  `${span[0].companies}/${span[0].metrics}/${span[0].windows}`);
 
 // ============ 4. spec 编译 + 查询 ============
 log('\n════════ 4. spec 引擎 ════════');
@@ -293,7 +296,7 @@ const spec = parseSpec(specYaml);
 check('spec 解析通过', spec.id === '集团月度保送表', `id=${spec.id}`);
 
 const blocks = spec.sheets[0].blocks;
-const compiled = compileBlock(blocks[0], { year: 2026, month: 6 });
+const compiled = compileBlock(blocks[0], { year: 2026, month: 6 }, { facts: declaredFactsOf() })
 log('  生成的 SQL:');
 log('  ' + compiled.sql.split('\n').join('\n  '));
 
@@ -313,7 +316,7 @@ check('返回 5 行 × 4 列', result.matrix.length === 5 && result.colLabels.le
 // ============ 5. 渲染 Excel ============
 log('\n════════ 5. Excel 渲染（模板填充）════════');
 const renderBlocks: RenderBlock[] = blocks.map((b) => {
-  const c = compileBlock(b, { year: 2026, month: 6 });
+  const c = compileBlock(b, { year: 2026, month: 6 }, { facts: declaredFactsOf() })
   return {
     sheet: spec.sheets[0].name,
     anchor: b.anchor,
@@ -424,7 +427,7 @@ sheets:
           filter: { metric: { name: 营业收入 } }
 `);
 const b2 = spec2.sheets[0].blocks[0];
-const c2 = compileBlock(b2, {});
+const c2 = compileBlock(b2, {}, { facts: declaredFactsOf() })
 const r2 = await runCompiled(c2, (sql) => db.query(sql));
 const OUT2 = 'test/output/分板块-已填.xlsx';
 await renderTemplate(TPL, OUT2, [{
@@ -447,7 +450,9 @@ const expectedMg = await db.query<{ v: string }>(`
   SELECT sum(f.amount) AS v FROM fact_finance f
   JOIN dim_company ON f.company_id = dim_company.id
   JOIN dim_metric ON f.metric_id = dim_metric.id
-  WHERE dim_company.name = '集团公司' AND dim_metric.name = '营业收入' AND f.period_type = '本年累计'`);
+  WHERE dim_company.name = '集团公司' AND dim_metric.name = '营业收入'
+    AND f.period_from = date_trunc('year', f.fin_month)`);
+// 刀 23：本年累计 = 年首窗口（旧 period_type 列已退场）
 const mgRow = r2.matrix.find((m) => m.label === '集团公司');
 check(
   '★ 第二张表的数值确实只含「营业收入」（未被静默加总其他指标）',
@@ -465,7 +470,7 @@ check(
 log('\n════════ 9. 安全边界 ════════');
 let rejected = false;
 try {
-  compileBlock({ ...blocks[0], rows: { dim: 'secret_table' } } as never, {});
+  compileBlock({ ...blocks[0], rows: { dim: 'secret_table' } } as never, {}, { facts: declaredFactsOf() });
 } catch (e) {
   rejected = true;
   log('  未注册维度被拒:', (e as Error).message);
@@ -474,7 +479,7 @@ check('rows.dim 只接受已注册维度', rejected);
 
 let sqlRejected = false;
 try {
-  compileBlock({ ...blocks[0], rows: { dim: "metric; DROP TABLE fact_finance--" } } as never, {});
+  compileBlock({ ...blocks[0], rows: { dim: "metric; DROP TABLE fact_finance--" } } as never, {}, { facts: declaredFactsOf() });
 } catch { sqlRejected = true; }
 check('SQL 注入尝试被拒', sqlRejected);
 
@@ -504,7 +509,7 @@ const qHuman = await queryMetrics({
   groupBy: ['company'],
   filter: { month: '2026-06' },
   audience: 'human',
-});
+}, undefined, declaredFactsOf());
 log(`  人视角: ${qHuman.groups.length} 组 × ${qHuman.columns.length} 指标，脱敏=${qHuman.meta.redaction}`);
 const sampleHuman = qHuman.groups[0];
 log(`    ${sampleHuman.values.join('/')}: [${sampleHuman.cells.map((c) => (typeof c === 'number' ? c.toLocaleString() : c)).join(', ')}]`);
@@ -518,7 +523,7 @@ const qAgent = await queryMetrics({
   measures: [{ metric: '营业收入', periodType: '本年累计' }, { metric: '营业收入', periodType: '单月' }, { metric: '利润总额', periodType: '本年累计' }],
   groupBy: ['company'],
   audience: 'agent',
-});
+}, undefined, declaredFactsOf());
 log(`  agent 视角: 脱敏=${qAgent.meta.redaction}，每格最少 ${qAgent.meta.minSupport} 行支撑，示例 [${qAgent.groups[0].cells.join(', ')}]`);
 check('agent 返回分档值而非精确数', qAgent.groups.every((g) => g.cells.every((c) => c === null || typeof c === 'string')));
 check('agent 脱敏标记为 banded', qAgent.meta.redaction === 'banded');
@@ -538,7 +543,7 @@ try {
     groupBy: ['company', 'metric'],
     filter: { month: '2026-06' },
     audience: 'agent',
-  });
+  }, undefined, declaredFactsOf());
 } catch (e) {
   tooFine = e instanceof QueryRefused && (e as InstanceType<typeof QueryRefused>).reason === 'TOO_FINE_GRAINED';
   if (tooFine) log('  过细粒度被拒:', (e as Error).message);
@@ -551,29 +556,29 @@ const fineHuman = await queryMetrics({
   groupBy: ['company', 'metric'],
   filter: { month: '2026-06' },
   audience: 'human',
-});
+}, undefined, declaredFactsOf());
 check('同一查询 human 放行（阈值只约束 agent）', fineHuman.groups.length > 0, `${fineHuman.groups.length} 行`);
 check('human 结果含精确数值', fineHuman.groups.some((g) => g.cells.some((c) => typeof c === 'number')));
 
 // 未注册维度被拒
 let badDim = false;
-try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['secret'], audience: 'human' }); } catch { badDim = true; }
+try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['secret'], audience: 'human' }, declaredFactsOf()); } catch { badDim = true; }
 check('自由查询拒绝未注册维度', badDim);
 
 // 未注册口径被拒
 let badPeriod = false;
-try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '我编的口径' }], audience: 'human' }); } catch { badPeriod = true; }
+try { compileMetrics({ measures: [{ metric: '营业收入', periodType: '我编的口径' }], audience: 'human' }, declaredFactsOf()); } catch { badPeriod = true; }
 check('自由查询拒绝未注册口径', badPeriod);
 
 // SQL 注入：指标名里的单引号必须被双写转义
 const INJ = "营业收入'); DROP TABLE fact_finance;--";
-const inj = compileMetrics({ measures: [{ metric: INJ, periodType: '本年累计' }], audience: 'human' });
+const inj = compileMetrics({ measures: [{ metric: INJ, periodType: '本年累计' }], audience: 'human' }, declaredFactsOf());
 log('  注入输入的转义结果: ' + inj.sql.split('\n').find((l) => l.includes('营业收入'))?.trim().slice(0, 110));
 // 期望：每个单引号都被双写；不存在未转义的 `'); DROP`
 const unescaped = INJ.replace(/'/g, "''");
 check('指标名中的引号被双写转义', inj.sql.includes(unescaped) && !inj.sql.includes("= '营业收入'); DROP"));
 const stillThere = await db.query<{ n: string | number }>('SELECT count(*) AS n FROM fact_finance');
-check('注入尝试后事实表仍在', Number(stillThere[0].n) === 960, `${stillThere[0].n} 行`);
+check('注入尝试后事实表仍在（同窗口合并后）', Number(stillThere[0].n) === 940, `${stillThere[0].n} 行`);
 
 // 分档函数
 check('band() 分档正确', band(123456789) === '1.2亿' && band(45678) === '4.6万' && band(null) === null, `${band(123456789)} / ${band(45678)}`);
@@ -930,7 +935,7 @@ try {
   const catOne = await raw('get_catalog', { object: 'fact_finance' });
   check('★ 按需下钻是默认路径：只看一张表的粒度与逐列角色',
     !catOne.isError && catOne.json.name === 'fact_finance' &&
-      catOne.json.grain === 'fin_month,company_id,metric_id,period_type,scenario,ccy' &&
+      catOne.json.grain === 'fin_month,period_from,company_id,metric_id,scenario,ccy' &&
       (catOne.json.columns ?? []).some((c: { column: string; role: string }) => c.column === 'amount' && c.role === 'measure'),
     `列=${(catOne.json.columns ?? []).length}`);
   const catBad = await raw('get_catalog', { object: '不存在的表' });
@@ -1138,7 +1143,7 @@ sheets:
   check('★ 按提示补上指标后草稿即可用（提示可行动）', genSpec.id === gs.json.specId);
   {
     const gb = genSpec.sheets.find((s) => s.name === '主要指标')!.blocks[0];
-    const gc = compileBlock(gb, genSpec.params ?? {});
+    const gc = compileBlock(gb, genSpec.params ?? {}, { facts: declaredFactsOf() });
     const gres = await runCompiled(gc, (sql) => db.query(sql));
     const b4 = gres.matrix[0].values[0];
     check('★ 推断出的 spec 算出的是"2026-06 单月"而非 12 个月加总', b4 === 66826, String(b4));
@@ -1153,7 +1158,7 @@ sheets:
   // 补上指标之后的「分板块」必须真的只算营业收入（而不是加总五个指标）
   {
     const sb = genSpec.sheets.find((s) => s.name === '分板块')!.blocks[0];
-    const sc = compileBlock(sb, genSpec.params ?? {});
+    const sc = compileBlock(sb, genSpec.params ?? {}, { facts: declaredFactsOf() });
     const sres = await runCompiled(sc, (sql) => db.query(sql));
     const vals = sres.matrix.map((m) => Number(m.values[0]));
     check('★ 补上指标后「分板块」表数值合理（未被静默加总）', vals.every((v) => v > 0) && !vals.includes(67283), JSON.stringify(vals));
@@ -1405,14 +1410,17 @@ sheets:
     const firstCell = async (yamlText: string) => {
       const s = parseSpecLenient(yamlText).spec!;
       const b = s.sheets[0]!.blocks[0]!;
-      const r = await runCompiled(await compileBlock(b, s.params ?? {}), (sql) => db.query(sql));
+      const r = await runCompiled(await compileBlock(b, s.params ?? {}, { facts: declaredFactsOf() }), (sql) => db.query(sql));
       return (r.matrix[0] as { values: unknown[] }).values[0];
     };
     const goodCell = await firstCell(shippedYaml);
-    const badCell = await firstCell(PT_TYPO);
-    check('★ 口径名写错的真实后果：那一格**静默变成空**（对照原样那份：有数 vs null）',
-      typeof goodCell === 'number' && badCell === null,
-      `原样 ${JSON.stringify(goodCell)} vs 写错 ${JSON.stringify(badCell)}`);
+    // ★ 刀 23：口径是声明的窗口 —— 写错的口径在**编译期就响亮拒绝**，不再有"静默空格"
+    //   （旧行为：列条件匹配不到任何行 → null 格 → 报送表上像"这一项没有数"）。
+    let typoThrown = '';
+    try { await firstCell(PT_TYPO); } catch (e) { typoThrown = (e as Error).message; }
+    check('★ 口径名写错的真实后果：编译期响亮拒绝（对照原样那份：有数）',
+      typeof goodCell === 'number' && typoThrown.includes('本年度累计'),
+      `原样 ${JSON.stringify(goodCell)} vs 写错被拒：${typoThrown.slice(0, 60)}`);
 
     // ② 所以解析期就要拦
     const dPt = diagnoseSpec(PT_TYPO);
@@ -1440,7 +1448,7 @@ sheets:
   check('★ 用 scope.filter 钉死指标 → 通过', !diagnoseSpec(PINNED).willBeRejected);
   {
     const pb = parseSpec(PINNED).sheets[0].blocks[0];
-    const pres = await runCompiled(compileBlock(pb, {}), (sql) => db.query(sql));
+    const pres = await runCompiled(compileBlock(pb, {}, { facts: declaredFactsOf() }), (sql) => db.query(sql));
     const v = Number(pres.matrix[0].values[0]);
     // ★ 两个断言都来自独立事实，不写死"跑出来是多少"（那正是上一轮 bug 的教训）：
     //   ① 真值 = 华东子公司 × 利润总额 × 本年累计 × 全部 12 个月
@@ -1450,7 +1458,7 @@ sheets:
         SELECT sum(f.amount) AS v FROM fact_finance f
         JOIN dim_company ON f.company_id = dim_company.id
         JOIN dim_metric ON f.metric_id = dim_metric.id
-        WHERE dim_company.name = '华东子公司' AND f.period_type = '本年累计'${extra}`))[0].v);
+        WHERE dim_company.name = '华东子公司' AND f.period_from = date_trunc('year', f.fin_month)${extra}`))[0].v);
     const want = await q(` AND dim_metric.name = '利润总额'`);
     const allMetrics = await q('');
     check(
@@ -1482,16 +1490,17 @@ sheets:
     );
     const v = Number(eres.matrix[0].values[0]);
     // 真值用独立 SQL 算，不写死：集团 2026-06 利润总额的 (本年累计-去年同期累计)/去年同期累计。
-    // ★ 口径二分后去年同期累计行**装载即平移**（落地月 = 2025-06）—— 旧路独立算法手工 −1 年，
-    //   与 compile.ts 的平移分支互为对拍（期望取自旧路，不是新路自己跑一遍）。
+    // ★ 刀 23：独立真值也切**窗口谓词** —— 两条腿同一个年首窗口规则、不同 fin_month
+    //   （今年腿落 2026-06、去年腿落 2025-06），与 compile.ts 的 asOfPin 互为独立实现。
     const pv = await db.query<{ m: string; prev: string }>(`
-      SELECT sum(CASE WHEN f.period_type='本年累计' THEN f.amount END) AS m,
-             sum(CASE WHEN f.period_type='去年同期累计' THEN f.amount END) AS prev
+      SELECT sum(CASE WHEN year(f.fin_month) = 2026 THEN f.amount END) AS m,
+             sum(CASE WHEN year(f.fin_month) = 2025 THEN f.amount END) AS prev
       FROM fact_finance f
       JOIN dim_metric ON f.metric_id = dim_metric.id
       WHERE dim_metric.name = '利润总额'
-        AND ((f.period_type = '本年累计' AND year(f.fin_month) = 2026 AND month(f.fin_month) = 6)
-          OR (f.period_type = '去年同期累计' AND year(f.fin_month) = 2025 AND month(f.fin_month) = 6))`);
+        AND f.period_from = date_trunc('year', f.fin_month)
+        AND month(f.fin_month) = 6
+        AND year(f.fin_month) IN (2025, 2026)`);
     const want = (Number(pv[0].m) - Number(pv[0].prev)) / Number(pv[0].prev);
     check('★ bug B：expr 真的被求值（不再返回两个累计额本身）', Math.abs(v - want) < 1e-9, `表内=${v} 独立算出=${want}`);
     // ★ 反证：若 expr 仍被忽略，返回的会是两个原始累计额（断言它们都不等于 v）
@@ -1528,7 +1537,7 @@ sheets:
     let joined = true;
     let v: number | null = null;
     try {
-      const cres = await runCompiled(compileBlock(cb, { year: 2026, month: 6 }), (sql) => db.query(sql));
+      const cres = await runCompiled(compileBlock(cb, { year: 2026, month: 6 }, { facts: declaredFactsOf() }), (sql) => db.query(sql));
       v = Number(cres.matrix[0].values[0]);
     } catch {
       joined = false;
@@ -1665,7 +1674,7 @@ log('\n════════ 15. 主数据对齐（R1）═══════
     `SELECT amount, batch_id FROM fact_finance
      WHERE company_id = '${HZ[0].id}' AND fin_month = DATE '2026-03-01'
        AND metric_id = (SELECT id FROM dim_metric WHERE name = '营业收入')
-       AND period_type = '本年累计'`,
+       AND period_from = DATE '2026-01-01'`,
   );
   check('★ 「华东分公司」的钱确实记在「华东子公司」名下',
     hzRows.length === 1 && Number(hzRows[0].amount) === 300 && hzRows[0].batch_id === t3.batchId,
@@ -1876,8 +1885,8 @@ log('\n════════ 17. 重放（raw 是值的唯一来源）══�
   //      第 17 阶段是最后一个阶段，清空 fact_finance 不影响任何既有断言。
   const snap = () =>
     db.query<Record<string, unknown>>(
-      `SELECT fin_month, company_id, metric_id, period_type, amount FROM fact_finance ` +
-        `ORDER BY fin_month, company_id, metric_id, period_type`,
+      `SELECT fin_month, period_from, company_id, metric_id, amount FROM fact_finance ` +
+        `ORDER BY fin_month, period_from, company_id, metric_id`,
     );
   await db.execute('DELETE FROM fact_finance');
   const run1 = await runIngest(spec, { catalog: await masterCatalog() });
@@ -2047,13 +2056,13 @@ log('\n════════ 21. CLI render / query（受众与物料隔离�
     aud.kind === 'usage-error' && aud.message.includes('--audience'),
     aud.kind === 'usage-error' ? aud.message : aud.kind);
 
-  // —— 真跑一次：从一个真实存在的 (指标, 口径) 取（不猜名字，用库里有的）——
-  const pair = (await db.query<{ name: string; period_type: string }>(
-    `SELECT DISTINCT m.name, f.period_type FROM fact_finance f JOIN dim_metric m ON m.id = f.metric_id LIMIT 1`,
-  ))[0];
-  if (!pair) throw new Error('库里没有可查的事实行，这一阶段的前提不成立');
+  // —— 真跑一次：指标名取库里真实存在的（不猜名字）；口径用声明词表里的「本年累计」——
+  //    （刀 23 后行上没有口径列，口径名来自声明 calibers，不再能从行上取）
+  const metricName = (await db.query<{ name: string }>(
+    `SELECT DISTINCT m.name FROM fact_finance f JOIN dim_metric m ON m.id = f.metric_id LIMIT 1`,
+  ))[0]!.name;
   const cq = cap();
-  const code = await main(['query', '--measure', `${pair.name}:${pair.period_type}`, '--by', 'company'], cq.io);
+  const code = await main(['query', '--measure', `${metricName}:本年累计`, '--by', 'company'], cq.io);
   const res = JSON.parse(cq.o.join('')) as { groups: Array<{ cells: Array<number | string | null> }>; meta: { audience: string; redaction: string } };
   const cells = res.groups.flatMap((g) => g.cells).filter((c) => c !== null);
   check('★ query 走 human 视角：精确值、不分档', res.meta.audience === 'human' && res.meta.redaction === 'none');
@@ -2128,7 +2137,7 @@ log('\n════════ 22. catalog（列契约与三层导出）══�
   // —— 按需下钻：单表结构（默认路径，别整库吞下去）——
   const ff = await catalogShow('fact_finance');
   check('★ catalog show fact_finance：粒度 + 逐列角色（含 amount=measure）',
-    ff.grain === 'fin_month,company_id,metric_id,period_type,scenario,ccy' &&
+    ff.grain === 'fin_month,period_from,company_id,metric_id,scenario,ccy' &&
       ff.columns.some((c) => c.column === 'amount' && c.role === 'measure') &&
       ff.columns.some((c) => c.column === 'company_id' && c.refTable === 'dim_company'),
     `grain=${ff.grain} 列=${ff.columns.length} 行=${ff.rowCount}`);
@@ -2606,14 +2615,17 @@ log('\n════════ 26. 长表接入对拍（与冻结的期望值�
   //    ★ 换成快照不是"降低标准"：那份期望值仍然出自旧路的独立执行，
   //      只是执行了一次就固化成文件（否则旧路一删，基准就没了）。
   //    ★ 刀 21 对快照做过**一次性机械迁移**：去年同期累计 240 行的期数按声明语义 −1 年
-  //      （架构 §7.4 装载即平移）；**金额一个没动** —— 金额对拍防线在阶段 38 的旧路查询。
-  const golden = JSON.parse(fs.readFileSync('test/expected/集团导出长表-960行.json', 'utf8')) as {
+  //      （架构 §7.4 装载即平移）；刀 23 再迁一次：坐标从期数换成**窗口起点**（period_from 入键），
+  //      金额统一为夹具的组值常量（同一窗口不存两份）—— 期望 = 夹具同值常量 × 声明窗口规则，
+  //      独立于装载路径（不再是"旧路生成一次"，旧路已随 period_type 列退场）。
+  const golden = JSON.parse(fs.readFileSync("test/expected/集团导出长表-960行.json", "utf8")) as {
     rows: Array<[string, string, string, string, number]>;
   };
   const want = golden.rows
-    .map(([m, c, mt, pt, a]) => `${m}|${c}|${mt}|${pt}|${a}`)
+    .map(([m, pf, c, mt, a]) => `${m}|${pf}|${c}|${mt}|${a}`)
     .sort();
-  check('对拍的期望值取自冻结快照（960 行，由旧路生成一次后固化）', golden.rows.length === 960, `${golden.rows.length} 行`);
+  check("对拍的期望值取自冻结快照（940 行 = 960 源行批内同坐标合并；独立期望：夹具常量 × 声明窗口）",
+    golden.rows.length === 940, `${golden.rows.length} 行`);
 
   // —— ② 干跑：新路把长表读成 960 个完整坐标，且一条 error 都没有 ——
   const dry = await dryRunIngest(spec, { catalog: await masterCatalog() });
@@ -2635,23 +2647,23 @@ log('\n════════ 26. 长表接入对拍（与冻结的期望值�
     run.ok === true && run.inserted === golden.rows.length,
     `ok=${run.ok} inserted=${run.inserted} 快照 ${golden.rows.length}`);
 
-  const got = (await db.query<{ m: string; company: string; metric: string; period_type: string; amount: number }>(
-    `SELECT strftime(f.fin_month, '%Y-%m-%d') AS m, c.name AS company, mt.name AS metric,
-            f.period_type AS period_type, f.amount AS amount
+  const got = (await db.query<{ m: string; pf: string; company: string; metric: string; amount: number }>(
+    `SELECT strftime(f.fin_month, '%Y-%m-%d') AS m, strftime(f.period_from, '%Y-%m-%d') AS pf,
+            c.name AS company, mt.name AS metric, f.amount AS amount
      FROM fact_finance f
      JOIN dim_company c ON c.id = f.company_id
      JOIN dim_metric mt ON mt.id = f.metric_id`,
-  )).map((r) => `${r.m}|${r.company}|${r.metric}|${r.period_type}|${Number(r.amount)}`).sort();
+  )).map((r) => `${r.m}|${r.pf}|${r.company}|${r.metric}|${Number(r.amount)}`).sort();
 
   let firstDiff = -1;
   for (let i = 0; i < Math.max(got.length, want.length); i++) {
     if (got[i] !== want[i]) { firstDiff = i; break; }
   }
-  check('★★ 逐行对拍：新路径落出的事实与冻结快照逐行相同（含每一笔金额）',
+  check("★★ 逐行对拍：新路径落出的事实与冻结快照逐行相同（含每一笔金额，坐标 = 月 × 窗口）",
     firstDiff === -1,
     firstDiff === -1
       ? `${want.length} 行逐行相同`
-      : `第 ${firstDiff} 行：新路「${got[firstDiff]}」vs 旧路「${want[firstDiff]}」`);
+      : `第 ${firstDiff} 行：新路「${got[firstDiff]}」vs 期望「${want[firstDiff]}」`);
 }
 
 // ============ 27. 期数的日期格（keys[].type: date）============
@@ -2719,7 +2731,7 @@ log("\n════════ 27. 期数的日期格（Excel 序列号 → 日
   const months = (await db.query<{ m: string }>(
     `SELECT DISTINCT strftime(f.fin_month, '%Y-%m-%d') AS m FROM fact_finance f
      JOIN dim_company c ON c.id = f.company_id
-     WHERE c.name = '华东子公司' AND f.period_type = '本年累计' ORDER BY m`)).map((r) => r.m);
+     WHERE c.name = '华东子公司' AND f.period_from = date_trunc('year', f.fin_month) ORDER BY m`)).map((r) => r.m);
   check('★ 落库后的期数就是日期格读出来的那三个（2026-06-01 / 07-01 / 08-01）',
     dateRun.ok === true && months.join(',') === '2026-06-01,2026-07-01,2026-08-01',
     `ok=${dateRun.ok} inserted=${dateRun.inserted} 期数=${months.join(',')}`);
@@ -2825,8 +2837,9 @@ log('\n════════ 28. CLI ingest dry-run / run（真读源、真�
     `code=${run.code} 批次=${rj.batchId} 归档=${rj.archived}`);
   // ★ 判据来自**独立算法**（直接 SQL 数一遍），不是信返回值里的 inserted（AGENTS.md §6.1）
   const at1 = await facts();
-  check('★★ 落库行数以直接 SQL 为准：库内 0 → 960，与自报的 inserted 一致',
-    at0 === 0 && at1 - at0 === 960 && rj.inserted === 960, `库内 ${at0} → ${at1}，自报 ${rj.inserted}`);
+  // 刀 23：960 源行 → 940 事实行（1 月单月/本年累计同窗口合并 20 行，同窗口不存两份）
+  check("★★ 落库行数以直接 SQL 为准：库内 0 → 940，与自报的 inserted 一致",
+    at0 === 0 && at1 - at0 === 940 && rj.inserted === 940, `库内 ${at0} → ${at1}，自报 ${rj.inserted}`);
   check('CLI `ingest run` 的返回值里没有金额（只回路径与计数）',
     findAmountLike(rj).length === 0, `${findAmountLike(rj).length} 处`);
 
@@ -3164,9 +3177,9 @@ log('\n════════ 31. 运营事实表 fact_business_line（target 
   // —— ① 声明说清了形状：没有口径列、退化列是 business_line、它进主键 ——
   const bl = facts.find((f) => f.name === 'fact_business_line')!;
   check('★ 声明说清 fact_business_line 的形状：**无口径列** + 行内退化列 business_line（且在粒度里）',
-    bl !== undefined && bl.periodTypeColumn === null && bl.degenerateColumns.join(',') === 'business_line' &&
+    bl !== undefined && bl.calibers.length === 0 && bl.degenerateColumns.join(',') === 'business_line' &&
       bl.primaryKey.join(',') === 'fin_month,company_id,metric_id,business_line',
-    `口径列=${String(bl?.periodTypeColumn)} 退化列=${bl?.degenerateColumns.join(',')} 主键=${bl?.primaryKey.join(',')}`);
+    `calibers=${bl?.calibers.length} 退化列=${bl?.degenerateColumns.join(',')} 主键=${bl?.primaryKey.join(',')}`);
 
   // —— ② 同一份判据：规格放行 ——
   const ok = diagnoseIngest(yaml, ctx);
@@ -3417,8 +3430,10 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
     `${one.name}: valid_from=${String(firstVersion.valid_from)} ~ ${String(firstVersion.valid_to)}`);
 
   // —— ③ "零回归"的基线：改属性**之前**先把真实查询结果记下来 ——
-  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const };
-  const before = JSON.stringify(await queryMetrics(probe));
+  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const } as never;
+  const probeFacts = declaredFactsOf();
+  const runProbe = () => queryMetrics(probe, undefined, probeFacts);
+  const before = JSON.stringify(await runProbe());
 
   // —— ④ 属性没变 → **不产生新版本**（否则历史会被"每次导入"刷满）——
   const n0 = await versionCount('company', one.id);
@@ -3448,7 +3463,7 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
   // —— ⑦ ★ 零回归：改完属性，同一批当前态查询**逐格**不变 ——
   //    比的是"标签 + 每格的值"（不是整包 JSON）：哪天返回体多了个 asOf/计时字段，
   //    这条断言不该因为那种无关差异变红 —— 那样它就从"守数字"退化成"守序列化格式"。
-  const after = JSON.stringify(await queryMetrics(probe));
+  const after = JSON.stringify(await runProbe());
   const bj = JSON.parse(before) as { columns: unknown[]; groups: Array<{ label: string; cells: unknown[] }> };
   const aj = JSON.parse(after) as typeof bj;
   //    ⚠️ 分组顺序比不了：GROUP BY 不带 ORDER BY 时 DuckDB 不保证行序（实测两次调用顺序不同）。
@@ -3518,8 +3533,8 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   if (!agg) throw new Error('models/ 里没有聚合表（agg_finance_by_month.yml 丢了？）');
   const shape = agg.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}${c.agg ? `:${c.agg}` : ''}`).join(',');
   check('★★ 聚合表的列由跨表投影长出来：grain 列照抄 source（键角色），measure 列带 agg —— 声明里一个列都没写',
-    shape === 'fin_month:pk:K,metric_id:dim_fk:K,period_type:pk:K,scenario:pk:K,ccy:pk:K,amount:measure:sum' &&
-      agg.primaryKey.join(',') === 'fin_month,metric_id,period_type,scenario,ccy' &&
+    shape === 'fin_month:pk:K,period_from:pk:K,metric_id:dim_fk:K,scenario:pk:K,ccy:pk:K,amount:measure:sum' &&
+      agg.primaryKey.join(',') === 'fin_month,period_from,metric_id,scenario,ccy' &&
       agg.source === 'fact_finance',
     shape);
 
@@ -3536,10 +3551,10 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   const rb1j = JSON.parse(rb1.out) as { rebuilt: string[]; sqls: string[] };
   const factN = Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
   const expected = await db.query(
-    `SELECT fin_month, metric_id, period_type, SUM(amount) AS amount FROM fact_finance GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
+    `SELECT fin_month, metric_id, period_from, SUM(amount) AS amount FROM fact_finance GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
   );
   const readAgg = () =>
-    db.query('SELECT fin_month, metric_id, period_type, amount FROM agg_finance_by_month ORDER BY 1, 2, 3');
+    db.query("SELECT fin_month, metric_id, period_from, amount FROM agg_finance_by_month ORDER BY 1, 2, 3");
   const actual = await readAgg();
   check('★ `bilite rebuild` 一条命令全量重算（CREATE OR REPLACE，不是增量 upsert）',
     rb1.code === 0 && rb1j.rebuilt.includes('agg_finance_by_month') &&
@@ -3552,10 +3567,10 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   // —— ④ 口径没被搅在一起：每一种口径各自成行 ——
   //    ★ 口径集合**取自事实表本身**（不是写死两种 —— 夹具里有四种口径，
   //      写死就等于把"夹具长什么样"编进断言）。
-  const pts = [...new Set(actual.map((r) => String(r.period_type)))].sort();
-  const ptFact = (await db.query<{ period_type: string }>(
-    'SELECT DISTINCT period_type FROM fact_finance ORDER BY 1')).map((r) => String(r.period_type));
-  check('★ 每种口径各自成行、从不互加（聚合表的口径集合 === 事实表的口径集合 —— 铁律 8 的验收）',
+  const pts = [...new Set(actual.map((r) => String(r.period_from)))].sort();
+  const ptFact = (await db.query<{ period_from: string }>(
+    "SELECT DISTINCT period_from FROM fact_finance ORDER BY 1")).map((r) => String(r.period_from));
+  check("★ 每种窗口各自成行、从不互加（聚合表的窗口集合 === 事实表的窗口集合 —— 铁律 8 的验收）",
     JSON.stringify(pts) === JSON.stringify(ptFact) && ptFact.length > 1, pts.join(','));
 
   // —— ⑤ 删了能回来：手工投毒 → rebuild 恢复 ——
@@ -3573,7 +3588,7 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
   const aggYml = (grain: string) =>
     ['kind: aggregate', 'title: 探针聚合表', 'source: fact_finance', `grain: [${grain}]`,
       'measures:', '  - name: amount', '    agg: sum', ''].join('\n');
-  fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, aggYml('fin_month, period_type, scenario, ccy')); // 探针也要过 MODEL_AGG_NONADDABLE（正交维度不许聚合掉，刀 22）
+  fs.writeFileSync(`${TMP}/agg_finance_by_month.yml`, aggYml("fin_month, period_from, scenario, ccy")); // 探针也要过 NONADDABLE（窗口与正交维度都不许聚合掉，刀 22/23）
   const planG = await planMod.planModels(gen.loadModels(TMP));
   const rt = planG.changes.find((c) => c.kind === 'rebuild-table');
   check('★★ grain 去掉一个维度 → plan 报 rebuild-table（非阻塞 —— 聚合表没有"删列永不自动"的顾虑，重算即对齐）',
@@ -3600,25 +3615,25 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
     return gen.diagnoseModels(TMP);
   };
   const codeOf = (d: { issues: Array<{ code: string }> }) => d.issues.map((i) => i.code).join(',');
-  const n1 = await neg('fin_month, metric_id'); // 聚合掉 period_type
+  const n1 = await neg("fin_month, metric_id"); // 聚合掉窗口（period_from）—— 铁律 8 的刀 23 形态
   check('★★ 聚合掉 period_type → MODEL_AGG_NONADDABLE（把本年累计与单月加在一起是错得最安静的那一种）',
     codeOf(n1).includes('MODEL_AGG_NONADDABLE') && n1.ir === null, codeOf(n1));
-  const n2 = await neg('company_id, metric_id, period_type'); // 聚合掉 fin_month
+  const n2 = await neg("company_id, metric_id, period_from"); // 聚合掉 fin_month
   check('★ 聚合掉期数列（semantic: period）同样被拒 —— 不只是口径，期数也不许被加总',
     codeOf(n2).includes('MODEL_AGG_NONADDABLE'), codeOf(n2));
-  const n3 = await neg('fin_month, period_type', { source: 'dim_metric' });
+  const n3 = await neg("fin_month, period_from", { source: "dim_metric" });
   check('★ source 不是事实表 → MODEL_SOURCE_BAD（维度/桥接/别的聚合表都不许当源头）',
     codeOf(n3).includes('MODEL_SOURCE_BAD'), codeOf(n3));
-  const n4 = await neg('fin_month, period_type', { measure: 'batch_id' });
+  const n4 = await neg("fin_month, period_from", { measure: "batch_id" });
   check('★ measure 拿 provenance 列冒充 → MODEL_AGG_MEASURE_BAD（批次号加起来没有意义）',
     codeOf(n4).includes('MODEL_AGG_MEASURE_BAD'), codeOf(n4));
-  const n5 = await neg('fin_month, company_id, metric_id, period_type, scenario, ccy'); // 与 source 粒度同集合（含正交维度 —— 聚合掉它们另有 NONADDABLE 拦着）
+  const n5 = await neg("fin_month, period_from, company_id, metric_id, scenario, ccy"); // 与 source 粒度同集合（含正交维度 —— 聚合掉它们另有 NONADDABLE 拦着）
   check('★ grain 与源表粒度同集合 → warn MODEL_AGG_NOOP，且 fail-closed：连 warn 都不放行（一行都没被加总，这不是聚合是复制）',
     codeOf(n5).includes('MODEL_AGG_NOOP') && n5.ir === null, codeOf(n5));
-  const n6 = await neg('fin_month, period_type', { agg: 'avg' });
+  const n6 = await neg("fin_month, period_from", { agg: "avg" });
   check('★ agg: avg → MODEL_AGG_FUNC_BAD（v1 只加总：均值有口径问题 —— 分母是谁？）',
     codeOf(n6).includes('MODEL_AGG_FUNC_BAD'), codeOf(n6));
-  const n7 = await neg('fin_month, period_type', { columns: true });
+  const n7 = await neg("fin_month, period_from", { columns: true });
   check('★ 手写 columns → MODEL_FIELD_BAD（列由 source 投影，人写的必与投影冲突）',
     codeOf(n7).includes('MODEL_FIELD_BAD'), codeOf(n7));
 
@@ -3632,7 +3647,8 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
 
   // —— ⑨ 零回归 + 收尾 ——
   const probe = await queryMetrics(
-    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const });
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    undefined, declaredFactsOf());
   check('★ 零回归：聚合表在场，既有财务查询照常出数（聚合是新增的派生物，不是查询路径的一部分）',
     probe.groups.length > 0, `${probe.groups.length} 组`);
   check('★ 收尾：临时目录清掉，契约零漂移、plan 归零',
@@ -3704,23 +3720,23 @@ log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + vi
   //    ★ 按**桥上实际映射的公司**过滤（对齐场景往事实表里加过别的公司 —— 它们本来就不该被摊）。
   const cons = await db.query<{ groups: string; diff: string }>(
     `WITH mapped AS (SELECT DISTINCT company_id FROM map_org_bl),
-       fact_side AS (SELECT fin_month, metric_id, period_type, SUM(amount) AS v FROM fact_finance
+       fact_side AS (SELECT fin_month, metric_id, period_from, SUM(amount) AS v FROM fact_finance
                       WHERE company_id IN (SELECT company_id FROM mapped) GROUP BY 1, 2, 3),
-       agg_side AS (SELECT fin_month, metric_id, period_type, SUM(amount) AS v FROM agg_finance_by_business GROUP BY 1, 2, 3)
+       agg_side AS (SELECT fin_month, metric_id, period_from, SUM(amount) AS v FROM agg_finance_by_business GROUP BY 1, 2, 3)
      SELECT count(*) AS groups, CAST(SUM(abs(f.v - a.v)) AS VARCHAR) AS diff
-       FROM fact_side f JOIN agg_side a USING (fin_month, metric_id, period_type)`);
-  check('★★ 守恒：每个（月 × 指标 × 口径）组里，已映射公司的 Σ事实 === Σ摊分 —— 权重和 = 1 ⇒ 账不少一块',
+       FROM fact_side f JOIN agg_side a USING (fin_month, metric_id, period_from)`);
+  check("★★ 守恒：每个（月 × 指标 × 窗口）组里，已映射公司的 Σ事实 === Σ摊分 —— 权重和 = 1 ⇒ 账不少一块",
     Number(cons[0]!.groups) > 0 && Number(cons[0]!.diff) === 0,
     `${cons[0]!.groups} 组，差 ${cons[0]!.diff}`);
 
   // —— ⑤ 对拍：摊分表 === 手写加权 SQL（两条代码路径）——
   const expected = await db.query(
-    `SELECT f.fin_month, m.bl_id, f.metric_id, f.period_type, SUM(f.amount * m.weight) AS amount
+    `SELECT f.fin_month, m.bl_id, f.metric_id, f.period_from, SUM(f.amount * m.weight) AS amount
        FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`);
   const actual = await db.query(
-    'SELECT fin_month, bl_id, metric_id, period_type, amount FROM agg_finance_by_business ORDER BY 1, 2, 3, 4');
+    "SELECT fin_month, bl_id, metric_id, period_from, amount FROM agg_finance_by_business ORDER BY 1, 2, 3, 4");
   const cells = await db.query<{ n: string }>(
-    `SELECT count(*) AS n FROM (SELECT DISTINCT f.fin_month, f.metric_id, f.period_type, m.bl_id
+    `SELECT count(*) AS n FROM (SELECT DISTINCT f.fin_month, f.metric_id, f.period_from, m.bl_id
        FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id)`);
   check('★★ 逐行对拍：摊分表 === 手写加权 SQL；行数 = 事实坐标 × 业务线（桥那头的坐标真的留住了）',
     JSON.stringify(actual) === JSON.stringify(expected) && actual.length === Number(cells[0]!.n) && actual.length > 0,
@@ -3728,7 +3744,7 @@ log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + vi
   const orphan = await db.query<{ n: string }>(
     `SELECT count(*) AS n FROM agg_finance_by_business a WHERE NOT EXISTS (
        SELECT 1 FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id
-        WHERE f.fin_month = a.fin_month AND f.metric_id = a.metric_id AND f.period_type = a.period_type)`);
+        WHERE f.fin_month = a.fin_month AND f.metric_id = a.metric_id AND f.period_from = a.period_from)`);
   check('★ 没有孤儿坐标：摊分表每一行都能溯源到已映射公司的事实行（INNER JOIN = 白名单语义，没映射的公司不摊）',
     Number(orphan[0]!.n) === 0, `${orphan[0]!.n} 行孤儿`);
 
@@ -3850,7 +3866,8 @@ log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + vi
     deps35.map((d) => d.depends_on).join(',') === 'dim_business_line,dim_metric,fact_finance,map_org_bl',
     deps35.map((d) => d.depends_on).join(','));
   const probeQ = await queryMetrics(
-    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const });
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    undefined, declaredFactsOf());
   check('★ 零回归：桥接层在场，既有财务查询照常出数（map_* 是新增的派生物，不是查询路径的一部分）',
     probeQ.groups.length > 0, `${probeQ.groups.length} 组`);
   fs.rmSync(TMP, { recursive: true, force: true });
@@ -3890,13 +3907,14 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
     fin.measures.length === 1 && fin.measures[0].column === 'amount' && fin.measures[0].unit === '元' && fin.measures[0].agg === null);
   check('★ fact_finance：role=dim_fk → 可用维度 company→dim_company、metric→dim_metric',
     fin.dimRefs.map((d) => `${d.column}→${d.refTable}`).sort().join(',') === 'company_id→dim_company,metric_id→dim_metric');
-  check('★ fact_finance：口径列在（period_type）→ 这张表查询必须钉口径（铁律 17 的自省面）',
-    fin.periodTypeColumn === 'period_type');
+  // 刀 23：自省面换成声明 calibers（口径的唯一承载）
+  check("★ fact_finance：口径体系长在声明 calibers（5 个）→ 这张表查询必须钉口径（铁律 17 的自省面）",
+    fin.calibers.length === 5);
   check('★ fact_finance：谱系为空 —— 它是源头表，不是派生物',
     fin.lineage.source === null && fin.lineage.via === null);
   const bl = semanticFactOf('fact_business_line', ir36)!;
-  check('★ fact_business_line：无口径列 → 查询不许给口径（同一铁律的另一面，从声明读出）',
-    bl.periodTypeColumn === null);
+  check("★ fact_business_line：无口径体系（calibers 空）→ 查询不许给口径（同一铁律的另一面，从声明读出）",
+    bl.calibers.length === 0);
   check('★ fact_business_line：business_line 退化列被自省为切片（行内列当维度用）',
     bl.slicers.map((s) => s.column).join(',') === 'business_line');
   const agg = semanticFactOf('agg_finance_by_business', ir36)!;
@@ -4110,34 +4128,28 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
     yoy?.calculator === true && yoy?.operand === '单月',
     `calculator=${yoy?.calculator} operand=${yoy?.operand}`);
 
-  // —— ② 新旧对拍：窗口谓词（新路）vs period_type 列（旧路）vs 夹具常量，三面一致 ——
+  // —— ② 窗口谓词 vs 夹具常量（刀 23：旧路 period_type 列已退场，对拍期望 = 夹具常量）——
   //    坐标取华东子公司·营业收入·2026-06：单月 56.75 / 本年累计 1234.5 / 账面累计 1300.5。
-  //    新路谓词逐口径来自声明（same / year_start / since），旧路直接用行上的 period_type。
+  //    谓词逐口径来自声明（same / year_start / since），期望值来自夹具常量（铁律 6.1 立场）。
   const win = await db.query<Record<string, string>>(`
     SELECT
-      sum(CASE WHEN f.period_type = '单月' THEN f.amount END) AS oldSingle,
-      sum(CASE WHEN f.period_from = f.fin_month THEN f.amount END) AS newSingle,
-      sum(CASE WHEN f.period_type = '本年累计' THEN f.amount END) AS oldCum,
-      sum(CASE WHEN f.period_from = date_trunc('year', f.fin_month) THEN f.amount END) AS newCum,
-      sum(CASE WHEN f.period_type = '账面累计' THEN f.amount END) AS oldBook,
-      sum(CASE WHEN f.period_from = DATE '2025-01-01' THEN f.amount END) AS newBook
+      sum(CASE WHEN f.period_from = f.fin_month THEN f.amount END) AS single,
+      sum(CASE WHEN f.period_from = date_trunc('year', f.fin_month) THEN f.amount END) AS cum,
+      sum(CASE WHEN f.period_from = DATE '2025-01-01' THEN f.amount END) AS book
     FROM fact_finance f
     JOIN dim_metric ON f.metric_id = dim_metric.id
     JOIN dim_company ON f.company_id = dim_company.id
     WHERE dim_metric.name = '营业收入' AND dim_company.name = '华东子公司'
       AND f.fin_month = DATE '2026-06-01'`);
   const w = win[0]!;
-  check('② 单月：窗口谓词 = 旧路列 = 夹具真值（same → period_from = fin_month）',
-    Number(w.newSingle) === Number(w.oldSingle) && Number(w.oldSingle) === 56.75,
-    `旧=${w.oldSingle} 新=${w.newSingle}`);
-  check('② 本年累计：窗口谓词 = 旧路列 = 夹具真值（year_start → period_from = 年初）',
-    Number(w.newCum) === Number(w.oldCum) && Number(w.oldCum) === 1234.5,
-    `旧=${w.oldCum} 新=${w.newCum}`);
-  check('② 账面累计：窗口谓词 = 旧路列 = 夹具真值（since 2025-01 → period_from = DATE 2025-01-01）',
-    Number(w.newBook) === Number(w.oldBook) && Number(w.oldBook) === 1300.5,
-    `旧=${w.oldBook} 新=${w.newBook}`);
+  check("② 单月：窗口谓词（same → period_from = fin_month）= 夹具真值 56.75",
+    Number(w.single) === 56.75, `值=${w.single}`);
+  check("② 本年累计：窗口谓词（year_start → period_from = 年初）= 夹具真值 1234.5",
+    Number(w.cum) === 1234.5, `值=${w.cum}`);
+  check("② 账面累计：窗口谓词（since 2025-01 → period_from = DATE 2025-01-01）= 夹具真值 1300.5",
+    Number(w.book) === 1300.5, `值=${w.book}`);
   check('② ★ 铁律 6 实存判据：账面累计 ≠ 本年累计（含审计调整，累加不等 —— 实存不是白存的）',
-    Number(w.oldBook) !== Number(w.oldCum), `${w.oldBook} vs ${w.oldCum}`);
+    Number(w.book) !== Number(w.cum), `${w.book} vs ${w.cum}`);
 
   // —— ③ 窗口平移（去年同期累计）：源列 G 经 stg 对拍落地平移行 ——
   //    源（2026-06 报告 G 列 = 1100.25）装载即落去年窗口：fin_month=2025-06、period_from=2025-01-01。
@@ -4151,7 +4163,7 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
      JOIN dim_metric ON f.metric_id = dim_metric.id
      JOIN dim_company ON f.company_id = dim_company.id
      WHERE dim_metric.name = '营业收入' AND dim_company.name = '华东子公司'
-       AND f.period_type = '去年同期累计' AND f.fin_month = DATE '2025-06-01'`);
+       AND f.period_from = DATE '2025-01-01' AND f.fin_month = DATE '2025-06-01'`);
   check('③ 去年同期累计：stg 源列（G@2026-06）= 落地平移行金额（1100.25，装载即平移不双存）',
     Number(stgG[0]?.amount) === 1100.25 && Number(factG[0]?.amount) === 1100.25,
     `源=${stgG[0]?.amount} 落地=${factG[0]?.amount}`);
@@ -4335,6 +4347,149 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
   check('⑦ dimAvailableOn(ccy, null) = false —— 缺省形状按 fail-closed 判（与 business_line 同一先例）',
     dimAvailableOn('ccy', null) === false && dimAvailableOn('scenario', null) === false,
     `ccy=${dimAvailableOn('ccy', null)} scenario=${dimAvailableOn('scenario', null)}`);
+}
+
+// ════════ 40. 口径列退场（P5 刀 23）：period_type 列删除 → 窗口即口径坐标 ════════
+//   期望值全部取夹具常量 / 声明规则（铁律 6.1 立场：不来自被测路径自己）。
+//   防线：① PK 换柱（period_from 入键）；② 没声明不出数（FACT_NOT_DECLARED）；
+//   ③ 自由查询不许按口径分组/过滤（口径钉在度量上）；④ 批内同坐标合并 + 矛盾拒绝；
+//   ⑤ 报表口径轴 = 窗口谓词（as-of 嵌进每列，平移口径自带年份平移）。
+{
+  const { diagnoseSpec } = await import("../src/spec/types.ts");
+  const facts40 = declaredFactsOf();
+  const ff40 = facts40.find((f) => f.name === "fact_finance")!;
+
+  // —— ① 声明面：口径柱换成窗口柱 ——
+  check('① fact_finance 主键含 period_from、不含 period_type；列清单里 period_type 消失',
+    ff40.primaryKey.includes('period_from') && !ff40.primaryKey.includes('period_type') &&
+      !ff40.columns.some((c) => c.name === 'period_type'),
+    `pk=[${ff40.primaryKey.join(',')}]`);
+  check('① 行上没有 period_type 列，窗口谓词仍能精确匹配三口径（阶段 38 ② 的窗口 SQL 已验值）',
+    ff40.windowFrom === 'period_from' && ff40.calibers.length === 5,
+    `windowFrom=${ff40.windowFrom} calibers=${ff40.calibers.length}`);
+
+  // —— ② 没声明就不出数：口径窗口的判据长在声明里（67283 判例的查询侧终点）——
+  let refusedNoFacts = '';
+  try {
+    await queryMetrics({ measures: [{ metric: '营业收入', periodType: '本年累计' }], audience: 'human' });
+  } catch (e) { refusedNoFacts = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('② 不注入声明查口径 → FACT_NOT_DECLARED（fail-closed：没判据就不出数）',
+    refusedNoFacts.includes('FACT_NOT_DECLARED'), refusedNoFacts.split('\n')[0]);
+
+  // —— ③ 自由查询不许按口径分组/过滤（口径钉在 measures[].periodType 上）——
+  let refusedGroup = '';
+  try {
+    await queryMetrics({ measures: [{ metric: '营业收入', periodType: '单月' }], groupBy: ['period_type'], audience: 'human' }, undefined, facts40);
+  } catch (e) { refusedGroup = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('③ groupBy period_type → PERIOD_TYPE_NOT_GROUPABLE（口径不落行，没有可分组的坐标）',
+    refusedGroup.includes('PERIOD_TYPE_NOT_GROUPABLE'), refusedGroup.split('\n')[0]);
+  let refusedFilter = '';
+  try {
+    await queryMetrics({ measures: [{ metric: '营业收入', periodType: '单月' }], filter: { period_type: '单月' }, audience: 'human' }, undefined, facts40);
+  } catch (e) { refusedFilter = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('③ filter period_type → PERIOD_TYPE_NOT_GROUPABLE（同一判据的另一条路）',
+    refusedFilter.includes('PERIOD_TYPE_NOT_GROUPABLE'), refusedFilter.split('\n')[0]);
+
+  // —— ④ 批内合并：同窗口不存两份（960 源行 → 940 事实行，1 月单月/本年累计合并且值一致）——
+  //   自造干净起点（长表坐标与前面阶段的行撞车，规格是 reject）：清空后重灌同一份长表。
+  const { runIngest: runIngest40 } = await import("../src/ingest/run.ts");
+  const { masterCatalog } = await import("../src/ingest/master.ts");
+  await db.execute("DELETE FROM fact_finance");
+  const run40 = await runIngest40(
+    parseIngestSpec(fs.readFileSync("test/fixtures/集团导出长表.yaml", "utf8"), { facts: facts40 }),
+    { catalog: await masterCatalog(), autoCreateDims: true });
+  check("④ 长表重灌：960 源行 → 940 事实行（1 月单月/本年累计同窗口合并 20 行）",
+    run40.ok === true && run40.inserted === 940, `ok=${run40.ok} inserted=${run40.inserted}`);
+  const stgLong = Number((await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM stg_fact_rows WHERE batch_id = '${run40.batchId}'`))[0]!.n);
+  check("④ stg 影子按**源行**记（960 行一个不少 —— 合并只发生在事实层）",
+    stgLong === 960, `stg=${stgLong}`);
+  const jan = await db.query<{ n: string; amount: string }>(
+    `SELECT count(*) AS n, f.amount AS amount FROM fact_finance f
+     JOIN dim_company c ON c.id = f.company_id JOIN dim_metric mt ON mt.id = f.metric_id
+     WHERE c.name = '华东子公司' AND mt.name = '营业收入'
+       AND f.fin_month = DATE '2026-01-01' AND f.period_from = DATE '2026-01-01'
+       AND f.scenario = '实际' AND f.ccy = '人民币'
+     GROUP BY f.amount`);
+  // 期望值取冻结快照（独立期望：夹具同值常量 × 声明窗口规则）
+  const golden40 = JSON.parse(fs.readFileSync('test/expected/集团导出长表-960行.json', 'utf8')) as { rows: Array<[string, string, string, string, number]> };
+  const janExpect = golden40.rows.find((r) => r[0] === '2026-01-01' && r[1] === '2026-01-01' && r[2] === '华东子公司' && r[3] === '营业收入');
+  check('④ 1 月「单月 + 本年累计」合并成一行（同窗口 [2026-01, 2026-01]），金额 = 快照组值',
+    jan.length === 1 && janExpect !== undefined && Number(jan[0]!.amount) === janExpect[4],
+    `行=${jan.length} 金额=${jan[0]?.amount} 期望=${janExpect?.[4]}`);
+
+  // —— ⑤ 批内矛盾拒绝：同一坐标两个金额 = 源数据自相矛盾，响亮拒绝不替人选 ——
+  const XLSXPopulate40 = (await import('xlsx-populate')).default;
+  const wb40 = await XLSXPopulate40.fromBlankAsync();
+  const sh40 = wb40.sheet(0);
+  sh40.name('月报');
+  ['单位', '期数', '指标', '本年累计', '本月数'].forEach((h, i) => sh40.cell(1, i + 1).value(h));
+  sh40.cell('A2').value('华东子公司'); sh40.cell('B2').value('2026-01'); sh40.cell('C2').value('营业收入');
+  sh40.cell('D2').value(100); sh40.cell('E2').value(200); // 1 月：本年累计与单月同窗口，两个金额 → 矛盾
+  await wb40.outputAsync().then((buf) => fs.writeFileSync('test/fixtures/接入-同窗口矛盾.xlsx', buf));
+  const conflictSpec = parseIngestSpec(
+    `id: 同窗口矛盾探针
+source: test/fixtures/接入-同窗口矛盾.xlsx
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: D2
+        rows:
+          - { col: A, dim: company }
+          - { col: C, dim: metric }
+        values:
+          columns: [D, E]
+          periodTypes: [本年累计, 单月]
+        keys:
+          - { col: B, as: period }
+          - { as: scenario, value: 实际 }
+          - { as: ccy, value: 人民币 }
+`,
+    { facts: facts40 },
+  );
+  let mergeConflict = '';
+  try {
+    await runIngest(conflictSpec, { catalog: await masterCatalog(), autoCreateDims: true });
+  } catch (e) { mergeConflict = (e as Error).message; }
+  check('⑤ 同窗口两个金额 → 响亮拒绝（同一窗口不存两份，替人选一个就是篡改）',
+    mergeConflict.includes('同一个事实坐标上但金额不同'),
+    mergeConflict.split('\n')[0]?.slice(0, 90));
+  fs.rmSync('test/fixtures/接入-同窗口矛盾.xlsx', { force: true });
+
+  // —— ⑥ 报表口径轴 = 窗口谓词：SQL 里没有 period_type，as-of 嵌进每列（平移口径自带年份平移）——
+  const spec40 = parseSpec(fs.readFileSync('specs/月度保送表.yaml', 'utf8'));
+  const cb40 = compileBlock(spec40.sheets[0].blocks[0]!, { year: 2026, month: 6 }, { facts: facts40 });
+  check('⑥ 报表口径轴编译出窗口谓词（SQL 无 period_type、含 date_trunc 年首规则）',
+    !cb40.sql.includes('period_type') && cb40.sql.includes("date_trunc('year', f.fin_month)"),
+    cb40.sql.split('\n')[1]!.trim().slice(0, 90));
+  check('⑥ 去年同期累计列的 as-of 自带 −1 年（year = 2025 嵌在列条件里，全局时间钉退场）',
+    cb40.sql.includes('year(f.fin_month) = 2025') && cb40.sql.includes('year(f.fin_month) = 2026'),
+    '两条腿的年份钉各自就位');
+
+  // —— ⑦ lint：口径轴只支持做列（口径不落行，行轴没有可分组的坐标）——
+  const rowsAxis = diagnoseSpec(`id: 口径行轴探针
+template: test/fixtures/月度保送表.xlsx
+params: { year: 2026, month: 6 }
+sheets:
+  - name: s
+    blocks:
+      - anchor: B3
+        rows:
+          dim: period_type
+          order: [本年累计]
+        cols:
+          dim: metric
+          order: [营业收入]
+        value: { measure: amount, agg: sum }
+        scope:
+          time: { year: "{{year}}", month: "{{month}}" }
+`);
+  check('⑦ rows.dim: period_type → CALIBER_AXIS_COLS_ONLY（编译器同样拒，两条路同一判据）',
+    rowsAxis.issues.some((i) => i.code === 'CALIBER_AXIS_COLS_ONLY'),
+    rowsAxis.issues.map((i) => i.code).join(','));
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——

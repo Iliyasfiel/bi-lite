@@ -1,7 +1,9 @@
-# 财务事实：三维交点 × 口径 × 正交维度（口径是**窗口声明**不是行上字符串，铁律 5"五值拆三件"）
+# 财务事实：三维交点 × 窗口 × 正交维度（口径是**窗口声明**不是行上字符串，铁律 5"五值拆三件"）
+# ★ 刀 23：period_type 列退场 —— 口径的唯一承载是窗口（period_from），**窗口即口径坐标**（入主键）：
+#   同一 fin_month 下三种窗口互斥成三行；同一窗口不存两份（重复申报 = 同坐标，撞库拒绝）。
 kind: fact
-title: 财务事实（公司 × 指标 × 期间 × 口径 × 场景 × 币种）
-grain: [fin_month, company_id, metric_id, period_type, scenario, ccy]
+title: 财务事实（公司 × 指标 × 期间 × 窗口 × 场景 × 币种）
+grain: [fin_month, period_from, company_id, metric_id, scenario, ccy]
 # 口径体系（铁律 5）：窗口起点落在 period_from，终点 ≡ fin_month（semantic: period 那列）。
 # - 窗口实存（单月 / 本年累计 / 账面累计）：行上存窗口，查询展开成 period_from 谓词；
 # - 窗口平移（去年同期累计）：装载即落去年窗口（shift: -1），查询期标签 +1 年对齐 x 轴
@@ -30,8 +32,9 @@ keys:
     semantic: period
   - name: period_from
     type: date
+    key: true
     notNull: true
-    comment: 窗口起点（终点 ≡ fin_month）——口径是窗口声明（铁律 5），不是行上字符串
+    comment: 窗口起点（终点 ≡ fin_month）——口径是窗口声明（铁律 5），窗口即口径坐标（刀 23 升键）
   - name: company_id
     type: varchar
     role: dim_fk
@@ -46,12 +49,6 @@ keys:
     refs: dim_metric
     notNull: true
     semantic: metric
-  - name: period_type
-    type: varchar
-    key: true
-    notNull: true
-    semantic: period_type
-    comment: 过渡态列：刀 23 对拍独立算法（新旧两路对上才删列重灌，开发计划 §3.2）
   - name: scenario
     type: varchar
     key: true
