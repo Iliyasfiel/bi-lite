@@ -33,6 +33,7 @@ import {
 } from './resolve.ts';
 import { dryRunIngest, type IngestFactRow, type IngestShape, type MasterCatalog } from './dryrun.ts';
 import { DEFAULT_TARGET, type DimDecision, type IngestIssue, type IngestSpec } from './types.ts';
+import { nameHash } from '../gen/ir.ts';
 
 export interface IngestRunOptions {
   /** 主数据快照（来自 `catalog()`，调用方注入 → 本模块可脱库测试） */
@@ -82,14 +83,10 @@ export interface IngestRunResult {
   note?: string;
 }
 
-/** git 里 `hash()` 同源：新建实体的 id 是名字的纯函数（阶段 1 无需写库即可算出） */
-function hash(s: string): string {
-  let h = 0;
-  for (const ch of s) h = (h * 31 + ch.codePointAt(0)!) >>> 0;
-  return h.toString(36).slice(0, 8);
-}
+/** 新建实体的 id 是名字的纯函数（阶段 1 无需写库即可算出）。哈希本体在 IR 层（`nameHash`），
+ *  与 sync 的声明行 id 同源 —— 两处存量 id 一起绑在这一个函数上，谁也别想单独改。 */
 function entityId(kind: DimKind, raw: string): string {
-  return `${kind === 'company' ? 'c' : 'm'}_${hash(raw)}`;
+  return `${kind === 'company' ? 'c' : 'm'}_${nameHash(raw)}`;
 }
 function lit(v: string): string {
   return `'${v.replace(/'/g, "''")}'`;
@@ -587,8 +584,9 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     //   声明坏了就在这里抛：整个批次连同聚合一起回滚，不留半批（fail-closed）。
     const { loadModels } = await import('../gen/parse.ts');
     const { aggregateTablesOf, executeRebuilds } = await import('../gen/rebuild.ts');
-    const aggs = aggregateTablesOf(loadModels(), target);
-    if (aggs.length > 0) await executeRebuilds(aggs);
+    const models = loadModels();
+    const aggs = aggregateTablesOf(models, target);
+    if (aggs.length > 0) await executeRebuilds(aggs, models);
     rebuiltAggregates = aggs.map((t) => t.name);
 
     await execute(`UPDATE import_batch SET status = 'committed' WHERE batch_id = ${lit(batchId)}`);

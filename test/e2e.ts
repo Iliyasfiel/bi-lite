@@ -2994,7 +2994,7 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
   // —— ② 业务表真由声明长出来（e2e 的库就是 open() 空库引导建起的）——
   const bizTables = await db.query<{ n: number }>(
     `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
-      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
+      AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'map_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
   );
   const modelRows = await db.query<{ n: number }>('SELECT count(*) AS n FROM _model');
   const deps = await db.query<{ depends_on: string }>(
@@ -3024,7 +3024,7 @@ log('\n════════ 30. 生成器 P2（声明 → IR → plan / appl
       try {
         const r = await c.runAndReadAll(
           `SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = 'main'
-            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
+            AND (table_name LIKE 'dim_%' OR table_name LIKE 'fact_%' OR table_name LIKE 'map_%' OR table_name LIKE 'agg_%') AND table_name <> 'dim_alias'`,
         );
         return Number((r.getRowObjectsJson() as Array<{ n: unknown }>)[0]!.n);
       } finally { c.closeSync(); }
@@ -3496,7 +3496,7 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
 
   // —— ① 列由投影长出来（声明里一个列都没写）——
   const ir = gen.loadModels();
-  const agg = ir.tables.find((t) => t.kind === 'aggregate');
+  const agg = ir.tables.find((t) => t.name === 'agg_finance_by_month');
   if (!agg) throw new Error('models/ 里没有聚合表（agg_finance_by_month.yml 丢了？）');
   const shape = agg.columns.map((c) => `${c.name}:${c.role}${c.key ? ':K' : ''}${c.agg ? `:${c.agg}` : ''}`).join(',');
   check('★★ 聚合表的列由跨表投影长出来：grain 列照抄 source（键角色），measure 列带 agg —— 声明里一个列都没写',
@@ -3619,6 +3619,222 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
     probe.groups.length > 0, `${probe.groups.length} 组`);
   check('★ 收尾：临时目录清掉，契约零漂移、plan 归零',
     (await metaProblems()).length === 0 && planEnd.pending === false);
+  fs.rmSync(TMP, { recursive: true, force: true });
+}
+
+// ============ 35. 桥接层（P3 第二刀）：map_* —— 声明内嵌行 + via 加权摊分 ============
+log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + via 加权摊分）════════');
+{
+  // ★ 这一阶段守的是 map_* 的全部承诺（`docs/开发计划.md` §3.1 P3 第二刀）：
+  //   ① 声明内嵌行（rows:）是"声明的另一面"：写路径唯一 = `bilite rebuild` 全量对齐，审计走 git diff；
+  //   ② 维度行的 id 是名字的纯函数（不手写）、桥接行的外键写名字（sync 时解析，错名整批响亮报错）；
+  //   ③ 权重和 = 1 是摊分的守恒前提（DECIMAL 精确校验，没有容差）；
+  //   ④ via 摊分：JOIN 穿桥接表 SUM(amount × weight)，join 键自动推导；摊分不丢钱、没映射的公司不摊。
+  const gen = await import('../src/gen/parse.ts');
+  const { nameHash } = await import('../src/gen/ir.ts');
+  const { main } = await import('../src/cli.ts');
+  const { queryMetrics } = await import('../src/semantic/query.ts');
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① 声明形状 ——
+  const ir35 = gen.loadModels();
+  const bridge = ir35.tables.find((t) => t.name === 'map_org_bl');
+  const blDim = ir35.tables.find((t) => t.name === 'dim_business_line');
+  const viaAgg = ir35.tables.find((t) => t.name === 'agg_finance_by_business');
+  check('★★ 桥接表形状：恰好两个外键进主键 + 恰一个权重列，行内嵌在声明里（5 条边）',
+    !!bridge && bridge.rows!.length === 5 &&
+      bridge.columns.filter((c) => c.role === 'dim_fk' && c.key).length === 2 &&
+      bridge.columns.filter((c) => c.role === 'measure').length === 1,
+    bridge ? `${bridge.rows!.length} 行 / ${bridge.columns.length} 列` : 'map_org_bl 丢了');
+  check('★ 维度声明行不写 id（名字的纯函数）+ via 指向桥接、grain 留了桥那头的坐标 bl_id',
+    !!blDim && blDim.rows!.every((r) => Object.keys(r).join(',') === 'name') &&
+      viaAgg?.via === 'map_org_bl' && viaAgg.grain.includes('bl_id'),
+    `via=${viaAgg?.via} / grain=${viaAgg?.grain.join(',')}`);
+
+  // —— ② rebuild 一条命令：行同步（维度在前、桥接在后）+ 聚合重算，同一事务 ——
+  const rb = await runCli(['rebuild']);
+  const rbj = JSON.parse(rb.out) as { synced: Array<{ table: string; rows: number }>; rebuilt: string[]; sqls: string[] };
+  check('★★ `bilite rebuild` 全量对齐：同步声明行（dim×2、map×5）+ 重算聚合表，一个事务',
+    rb.code === 0 && rbj.synced.find((s) => s.table === 'dim_business_line')?.rows === 2 &&
+      rbj.synced.find((s) => s.table === 'map_org_bl')?.rows === 5 &&
+      rbj.rebuilt.includes('agg_finance_by_business'),
+    JSON.stringify(rbj.synced));
+  const viaSql = rbj.sqls.find((s) => s.includes('agg_finance_by_business')) ?? '';
+  check('★ via 摊分的 SQL 形态：JOIN 穿桥接表、度量 = SUM(amount × weight)（join 键自动推导，声明里没写）',
+    /JOIN map_org_bl m ON f\.company_id = m\.company_id/.test(viaSql) && /SUM\(f\.amount \* m\.weight\)/.test(viaSql),
+    viaSql.slice(0, 88) + '…');
+
+  // —— ③ 行是声明的投影 ——
+  const blRows = await db.query<{ id: string; name: string }>('SELECT id, name FROM dim_business_line ORDER BY name');
+  check('★★ 维度行的 id 是名字的纯函数（business_line_ + nameHash），库里长出来的与再算一遍的一致',
+    blRows.length === 2 && blRows.every((r) => r.id === `business_line_${nameHash(r.name)}`),
+    blRows.map((r) => `${r.name}→${r.id}`).join('、'));
+  const mapRows = await db.query<{ company: string; bl: string; w: string }>(
+    `SELECT c.name AS company, b.name AS bl, CAST(m.weight AS VARCHAR) AS w FROM map_org_bl m
+       JOIN dim_company c ON c.id = m.company_id JOIN dim_business_line b ON b.id = m.bl_id ORDER BY 1, 2`);
+  const badW = await db.query<{ n: string }>(
+    'SELECT count(*) AS n FROM (SELECT company_id FROM map_org_bl GROUP BY 1 HAVING SUM(weight) <> 1)');
+  check('★ 桥接行按名字解析成 id（JOIN 回两张维表 5 条边全对上）+ 每家公司的权重和精确 = 1',
+    mapRows.length === 5 && Number(badW[0]!.n) === 0,
+    mapRows.map((r) => `${r.company}→${r.bl}:${r.w}`).join('、'));
+
+  // —— ④ 守恒：摊分不丢钱 ——
+  //    ★ 按**桥上实际映射的公司**过滤（对齐场景往事实表里加过别的公司 —— 它们本来就不该被摊）。
+  const cons = await db.query<{ groups: string; diff: string }>(
+    `WITH mapped AS (SELECT DISTINCT company_id FROM map_org_bl),
+       fact_side AS (SELECT fin_month, metric_id, period_type, SUM(amount) AS v FROM fact_finance
+                      WHERE company_id IN (SELECT company_id FROM mapped) GROUP BY 1, 2, 3),
+       agg_side AS (SELECT fin_month, metric_id, period_type, SUM(amount) AS v FROM agg_finance_by_business GROUP BY 1, 2, 3)
+     SELECT count(*) AS groups, CAST(SUM(abs(f.v - a.v)) AS VARCHAR) AS diff
+       FROM fact_side f JOIN agg_side a USING (fin_month, metric_id, period_type)`);
+  check('★★ 守恒：每个（月 × 指标 × 口径）组里，已映射公司的 Σ事实 === Σ摊分 —— 权重和 = 1 ⇒ 账不少一块',
+    Number(cons[0]!.groups) > 0 && Number(cons[0]!.diff) === 0,
+    `${cons[0]!.groups} 组，差 ${cons[0]!.diff}`);
+
+  // —— ⑤ 对拍：摊分表 === 手写加权 SQL（两条代码路径）——
+  const expected = await db.query(
+    `SELECT f.fin_month, m.bl_id, f.metric_id, f.period_type, SUM(f.amount * m.weight) AS amount
+       FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`);
+  const actual = await db.query(
+    'SELECT fin_month, bl_id, metric_id, period_type, amount FROM agg_finance_by_business ORDER BY 1, 2, 3, 4');
+  const cells = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM (SELECT DISTINCT f.fin_month, f.metric_id, f.period_type, m.bl_id
+       FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id)`);
+  check('★★ 逐行对拍：摊分表 === 手写加权 SQL；行数 = 事实坐标 × 业务线（桥那头的坐标真的留住了）',
+    JSON.stringify(actual) === JSON.stringify(expected) && actual.length === Number(cells[0]!.n) && actual.length > 0,
+    `${actual.length} 行摊分 = ${cells[0]!.n} 个坐标 × 业务线`);
+  const orphan = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM agg_finance_by_business a WHERE NOT EXISTS (
+       SELECT 1 FROM fact_finance f JOIN map_org_bl m ON f.company_id = m.company_id
+        WHERE f.fin_month = a.fin_month AND f.metric_id = a.metric_id AND f.period_type = a.period_type)`);
+  check('★ 没有孤儿坐标：摊分表每一行都能溯源到已映射公司的事实行（INNER JOIN = 白名单语义，没映射的公司不摊）',
+    Number(orphan[0]!.n) === 0, `${orphan[0]!.n} 行孤儿`);
+
+  // —— ⑥ 删了能回来：行也是派生物（投毒声明行 → rebuild 恢复）——
+  await db.execute('UPDATE map_org_bl SET weight = 0.123');
+  await db.execute("DELETE FROM dim_business_line WHERE name = '消费'");
+  const rb2 = await runCli(['rebuild']);
+  const healedW = await db.query<{ n: string }>(
+    "SELECT count(*) AS n FROM map_org_bl WHERE CAST(weight AS VARCHAR) NOT IN ('0.4000', '0.6000', '1.0000')");
+  const healedDim = await db.query<{ n: string }>('SELECT count(*) AS n FROM dim_business_line');
+  check('★★ 声明行也是派生物：投毒权重 + 删维度行 → `bilite rebuild` 全量对齐回来',
+    rb2.code === 0 && Number(healedW[0]!.n) === 0 && Number(healedDim[0]!.n) === 2,
+    `权重越轨 ${healedW[0]!.n} 行 / 维度 ${healedDim[0]!.n} 行`);
+
+  // —— ⑦ 运行期负例：权重和 ≠ 1 → 整批回滚 ——
+  const TMP = 'test/output/map-models';
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.cpSync('models', TMP, { recursive: true });
+  fs.writeFileSync(`${TMP}/map_org_bl.yml`,
+    fs.readFileSync(`${TMP}/map_org_bl.yml`, 'utf8').replace('    weight: 0.4', '    weight: 0.5'));
+  const rb3 = await runCli(['rebuild', '--models', TMP]);
+  const untouched = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM map_org_bl m JOIN dim_company c ON c.id = m.company_id
+      WHERE c.name = '华东子公司' AND CAST(m.weight AS VARCHAR) = '0.4000'`);
+  check('★★ 权重和 ≠ 1 → 整批响亮报错且回滚（华东的 0.4 还在 —— 摊分要么完整、要么整个不摊）',
+    rb3.code !== 0 && rb3.err.includes('权重和不是 1') && Number(untouched[0]!.n) === 1,
+    (rb3.err.split('\n').find((l) => l.includes('权重和')) ?? '').slice(0, 80));
+
+  // —— ⑧ 错名：解析期就拒（一次给全，不碰库）——
+  fs.cpSync('models', TMP, { recursive: true });
+  fs.writeFileSync(`${TMP}/map_org_bl.yml`,
+    fs.readFileSync(`${TMP}/map_org_bl.yml`, 'utf8').replace('    bl_id: 消费', '    bl_id: 服务业'));
+  const rb4 = await runCli(['rebuild', '--models', TMP]);
+  check('★ 桥接行写错维表名字 → 运行期名字解析就拒（一次给全清单，库一根汗毛没动）',
+    rb4.code !== 0 && (rb4.out + rb4.err).includes('服务业'),
+    ((rb4.out + rb4.err).split('\n').find((l) => l.includes('服务业')) ?? '').slice(0, 80));
+
+  // —— ⑨ 解析负例（fail-closed）：行与桥的全部错误形态，一个不许溜 ——
+  //    ★ 列一律用块式列表写法（与 models/ 一致）—— 内联 flow-map 会把 `decimal(18,2)` 截成
+  //      `decimal(18`（mini 解析器按逗号切对），探针就死在无关的 MODEL_TYPE_BAD 上，守不到要守的那条。
+  const w = (file: string, lines: string[]) => fs.writeFileSync(`${TMP}/${file}`, lines.join('\n') + '\n');
+  w('fact_rows.yml', ['kind: fact', 'title: 探针（fact 带 rows）', 'grain: [fin_month, company_id, metric_id, period_type]',
+    'keys:',
+    '  - name: fin_month', '    type: date', '    key: true', '    notNull: true', '    semantic: period',
+    '  - name: company_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    '  - name: metric_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_metric', '    notNull: true',
+    '  - name: period_type', '    type: varchar', '    key: true', '    notNull: true',
+    'measures:', '  - name: amount', '    type: decimal(18,2)',
+    'rows:', '  - fin_month: 2025-01-01']);
+  w('dim_id.yml', ['kind: dimension', 'title: 探针（手写 id）', 'keys:',
+    '  - name: id', '    type: varchar', '    key: true', '    notNull: true',
+    '  - name: name', '    type: varchar', '    notNull: true',
+    'rows:', '  - { id: bl_x, name: 工业 }']);
+  w('dim_dup.yml', ['kind: dimension', 'title: 探针（重名）', 'keys:',
+    '  - name: id', '    type: varchar', '    key: true', '    notNull: true',
+    '  - name: name', '    type: varchar', '    notNull: true',
+    'rows:', '  - { name: 工业 }', '  - { name: 工业 }']);
+  w('fact_owner.yml', ['kind: fact', 'title: 探针（事实引用带 rows 的维表）', 'grain: [fin_month, bl, metric_id, period_type]',
+    'keys:',
+    '  - name: fin_month', '    type: date', '    key: true', '    notNull: true', '    semantic: period',
+    '  - name: bl', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_business_line', '    notNull: true',
+    '  - name: metric_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_metric', '    notNull: true',
+    '  - name: period_type', '    type: varchar', '    key: true', '    notNull: true',
+    'measures:', '  - name: amount', '    type: decimal(18,2)']);
+  w('map_shape.yml', ['kind: bridge', 'title: 探针（三端外键）', 'keys:',
+    '  - name: a', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    '  - name: b', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_metric', '    notNull: true',
+    '  - name: c', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_period', '    notNull: true',
+    'measures:', '  - name: weight', '    type: decimal(5,4)']);
+  w('agg_viafact.yml', ['kind: aggregate', 'title: 探针（via 指到事实表）', 'source: fact_finance', 'via: fact_contract',
+    'grain: [fin_month, company_id, metric_id, period_type]', 'measures:', '  - name: amount', '    agg: sum']);
+  w('agg_vianope.yml', ['kind: aggregate', 'title: 探针（via 没声明过）', 'source: fact_finance', 'via: map_nope',
+    'grain: [fin_month, company_id, metric_id, period_type]', 'measures:', '  - name: amount', '    agg: sum']);
+  w('agg_noviacol.yml', ['kind: aggregate', 'title: 探针（grain 没留桥那头的坐标）', 'source: fact_finance', 'via: map_org_bl',
+    'grain: [fin_month, metric_id, period_type]', 'measures:', '  - name: amount', '    agg: sum']);
+  w('map_join.yml', ['kind: bridge', 'title: 探针（两端引用同一张维表）', 'keys:',
+    '  - name: company_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    '  - name: company_id2', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    'measures:', '  - name: weight', '    type: decimal(5,4)']);
+  w('fact_join.yml', ['kind: fact', 'title: 探针（两个公司外键）', 'grain: [fin_month, company_id, company_id2, metric_id, period_type]',
+    'keys:',
+    '  - name: fin_month', '    type: date', '    key: true', '    notNull: true', '    semantic: period',
+    '  - name: company_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    '  - name: company_id2', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_company', '    notNull: true',
+    '  - name: metric_id', '    type: varchar', '    role: dim_fk', '    key: true', '    refs: dim_metric', '    notNull: true',
+    '  - name: period_type', '    type: varchar', '    key: true', '    notNull: true',
+    'measures:', '  - name: amount', '    type: decimal(18,2)']);
+  w('agg_join.yml', ['kind: aggregate', 'title: 探针（join 键不唯一）', 'source: fact_join', 'via: map_join',
+    'grain: [fin_month, company_id2, metric_id, period_type]', 'measures:', '  - name: amount', '    agg: sum']);
+  const probe = (file: string, code: string) => {
+    const d = gen.diagnoseModels(TMP);
+    // 单文件守卫的 at 是完整路径（…/dim_x.yml.rows[0]），跨表守卫的 at 用表名（agg_x.via）——
+    // 用去扩展名的词干做 includes，两种都能接住
+    return d.ir === null && d.issues.some((i) => i.code === code && i.at.includes(file.replace(/\.yml$/, '')));
+  };
+  check('★★ 事实表带 rows → MODEL_FIELD_BAD（接入装载行，声明写行就是开第二条写路径）',
+    probe('fact_rows.yml', 'MODEL_FIELD_BAD'));
+  check('★ 维度行手写 id → MODEL_ROWS_BAD（id 是名字的纯函数，手写会在改名时漂移）',
+    probe('dim_id.yml', 'MODEL_ROWS_BAD'));
+  check('★ 维度行重名 → MODEL_ROWS_DUP（名字撞 = id 撞）',
+    probe('dim_dup.yml', 'MODEL_ROWS_DUP'));
+  check('★★ 事实表引用带 rows 的维表 → MODEL_ROWS_OWNER_BAD（接入归并与 rebuild 对齐是两条写路径，会互相覆盖）',
+    probe('fact_owner.yml', 'MODEL_ROWS_OWNER_BAD'));
+  check('★ 桥接表三个外键 → MODEL_BRIDGE_SHAPE_BAD（少一端不叫桥，多一端也不叫桥）',
+    probe('map_shape.yml', 'MODEL_BRIDGE_SHAPE_BAD'));
+  check('★ via 指到事实表 → MODEL_AGG_VIA_BAD（摊分穿的是桥接表）',
+    probe('agg_viafact.yml', 'MODEL_AGG_VIA_BAD'));
+  check('★ via 没声明过 → MODEL_AGG_VIA_BAD',
+    probe('agg_vianope.yml', 'MODEL_AGG_VIA_BAD'));
+  check('★★ 穿了桥却不在 grain 里留桥那头的坐标 → MODEL_AGG_VIA_BAD（摊出去的钱没有去处）',
+    probe('agg_noviacol.yml', 'MODEL_AGG_VIA_BAD'));
+  check('★ join 键不唯一（两个外键引用同一张维表）→ MODEL_AGG_VIA_BAD（不知道按谁摊）',
+    probe('agg_join.yml', 'MODEL_AGG_VIA_BAD'));
+
+  // —— ⑩ 依赖图 + 零回归 + 收尾 ——
+  const deps35 = await db.query<{ depends_on: string }>(
+    `SELECT DISTINCT depends_on FROM _model_dep WHERE name = 'agg_finance_by_business' ORDER BY 1`);
+  check('★ _model_dep 有摊分聚合的全部四条边：两张维表 + source + via（派生关系可查）',
+    deps35.map((d) => d.depends_on).join(',') === 'dim_business_line,dim_metric,fact_finance,map_org_bl',
+    deps35.map((d) => d.depends_on).join(','));
+  const probeQ = await queryMetrics(
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const });
+  check('★ 零回归：桥接层在场，既有财务查询照常出数（map_* 是新增的派生物，不是查询路径的一部分）',
+    probeQ.groups.length > 0, `${probeQ.groups.length} 组`);
   fs.rmSync(TMP, { recursive: true, force: true });
 }
 

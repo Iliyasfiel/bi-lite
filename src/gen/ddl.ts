@@ -6,7 +6,7 @@
  * ★ 生成的 DDL 里**不出现反引号**（`src/db/schema.ts` 那次的教训：模板字符串会被提前闭合），
  *   虽然这里是运行时拼字符串、没有那个风险，但保持同一条习惯 —— 想要样式就用中文引号。
  */
-import type { Ir, IrColumn, IrTable } from './ir.ts';
+import { viaJoinCandidates, type Ir, type IrColumn, type IrTable } from './ir.ts';
 
 /** 一列的定义片段（不含逗号、不含注释）：`name TYPE [NOT NULL] [DEFAULT x]` */
 export function columnHead(c: IrColumn): string {
@@ -60,23 +60,46 @@ export function ddlOf(ir: Ir): string {
  *   （SUM(DECIMAL(18,2)) 在 DuckDB 里是 DECIMAL(38,2)），所以 plan 对聚合表只比**列名**不比类型。
  * ★ 这条 SQL 会把建壳时的 PRIMARY KEY 一起换掉（CTAS 声明不了主键）—— 没关系：
  *   没有任何写入路径往聚合表里 INSERT，主键对它没有幂等职责（幂等靠"整个换掉"本身）。
+ *
+ * 两种形态：
+ * - 直聚：`FROM source GROUP BY grain`（grain 没出现的源维度被 SUM 加总）。
+ * - **via 加权摊分**：`FROM source f JOIN 桥接表 m ON f.k = m.k SELECT grain, SUM(f.amount × m.weight)`
+ *   （join 键由 `viaJoinCandidates` 从声明推导，人只写 `via: map_org_bl`）。
+ *   摊分守恒由 sync 保证：每家公司的权重和必须 = 1（`gen/sync.ts` 落行时校验），
+ *   所以 `SUM(×weight)` 在业务线之间加总 = 原值 —— 少一行权重就是漏钱，≠1 就是虚增。
  */
-export function rebuildTableSql(t: IrTable): string {
-  const grain = t.grain.join(', ');
-  const measures = t.columns
+export function rebuildTableSql(t: IrTable, ir?: Ir): string {
+  if (!t.via || !ir) {
+    const grain = t.grain.join(', ');
+    const measures = t.columns
+      .filter((c) => c.role === 'measure')
+      .map((c) => `${(c.agg ?? 'sum').toUpperCase()}(${c.name}) AS ${c.name}`)
+      .join(', ');
+    return `CREATE OR REPLACE TABLE ${t.name} AS SELECT ${grain}, ${measures} FROM ${t.source} GROUP BY ${grain}`;
+  }
+  const via = ir.tables.find((x) => x.name === t.via)!;
+  const viaCols = new Set(via.columns.map((c) => c.name));
+  const weight = via.columns.find((c) => c.role === 'measure')!;
+  const join = viaJoinCandidates(t, ir)[0];
+  const grainSql = t.grain.map((g) => (viaCols.has(g) ? `m.${g}` : `f.${g}`));
+  const expr = t.columns
     .filter((c) => c.role === 'measure')
-    .map((c) => `${(c.agg ?? 'sum').toUpperCase()}(${c.name}) AS ${c.name}`)
+    .map((c) => `SUM(f.${c.name} * m.${weight.name}) AS ${c.name}`)
     .join(', ');
-  return `CREATE OR REPLACE TABLE ${t.name} AS SELECT ${grain}, ${measures} FROM ${t.source} GROUP BY ${grain}`;
+  const grainList = grainSql.join(', ');
+  return `CREATE OR REPLACE TABLE ${t.name} AS SELECT ${grainList}, ${expr} FROM ${t.source} f JOIN ${t.via} m ON f.${join.sourceCol} = m.${join.viaCol} GROUP BY ${grainList}`;
 }
 
 /**
  * 外键依赖对（给 `_model_dep` 用）。
- * 聚合表多一条**表级依赖**：source（column 记 'source'，指声明里的 `source:` 字段 —— 聚合没有
- * 哪一列引用源头，但整张表从它派生，依赖图里缺这条边，重建顺序就说不清）。
+ * 聚合表多两条**表级依赖**（column 记字段名，指声明里的字段 —— 聚合没有哪一列引用源头，
+ * 但整张表从它们派生，依赖图里缺这条边，重建顺序就说不清）：
+ * - `source:` —— 从哪张事实表聚合；
+ * - `via:` —— JOIN 穿过哪张桥接表（仅在加权摊分形态下有）。
  */
 export function depsOf(t: IrTable): Array<{ refs: string; column: string }> {
   const deps = t.foreignKeys.map((f) => ({ refs: f.refs, column: f.column }));
   if (t.source) deps.push({ refs: t.source, column: 'source' });
+  if (t.via) deps.push({ refs: t.via, column: 'via' });
   return deps;
 }

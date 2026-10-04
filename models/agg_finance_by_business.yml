@@ -1,0 +1,20 @@
+# 财务业务线摊分（P3 第二刀：via 加权摊分的第二种聚合形态）——
+# 从 fact_finance 出发，穿过 map_org_bl 桥接表，把每家公司的数字按权重摊到业务线上：
+#   SUM(fact.amount × bridge.weight)。
+#
+# ★ 与 agg_finance_by_month 的两点不同：
+#   1. `via:` —— JOIN 键不写，自动推导（fact_finance 与 map_org_bl 的外键里引用同一张
+#      维表 dim_company 的那一对：company_id = company_id；不止一对就报 MODEL_AGG_VIA_BAD）；
+#   2. grain 里的 bl_id 来自**桥接那头**（不在 fact_finance 上）—— 穿了桥必须留坐标，
+#      摊出去的钱才有去处（parse 守卫）。
+#
+# ★ 口径守卫照旧：fin_month / period_type 留在 grain（MODEL_AGG_NONADDABLE）；
+#   company_id 被 SUM 掉 —— 这正是"摊分"的定义：公司维换了业务线维，账没有少一块。
+kind: aggregate
+title: 财务业务线摊分（月 × 业务线 × 指标 × 口径）
+source: fact_finance
+via: map_org_bl
+grain: [fin_month, bl_id, metric_id, period_type]
+measures:
+  - name: amount
+    agg: sum

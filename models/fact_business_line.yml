@@ -6,8 +6,9 @@
 #   不是由代码里写死的字符串决定（接入规格的 `target:` 指到哪张表，就按哪张表的声明校验）。
 #
 # ★ `business_line` 是**行内携带的退化列**（degenerate）：低基数、只用来切片、不值得单独建维。
-#   真正的 `dim_business_line` + `map_org_bl`（公司→业务线的分摊权重）属于 P3 的 map_* 那一层，
-#   不在本轮范围 —— 到那时这张表会多一个 `business_line_id` 外键列。
+#   公司→业务线的分摊（dim_business_line + map_org_bl）在 P3 桥接层：那张维表的行是声明内嵌的
+#   （写路径唯一 = `bilite rebuild`），而这张事实表的行来自接入 —— 两条写路径不许交汇
+#   （MODEL_ROWS_OWNER_BAD），所以这里不加指向 dim_business_line 的外键，摊分走 fact_finance 侧。
 kind: fact
 title: 业务线事实（运营指标）
 grain: [fin_month, company_id, metric_id, business_line]
