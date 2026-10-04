@@ -279,7 +279,8 @@ check('事实表行数正确', Number(cnt[0].n) === 960, `${cnt[0].n}`);
 const span = await db.query<{ months: number; companies: number; metrics: number; periods: number }>(
   'SELECT count(DISTINCT fin_month) AS months, count(DISTINCT company_id) AS companies, count(DISTINCT metric_id) AS metrics, count(DISTINCT period_type) AS periods FROM fact_finance',
 );
-check('覆盖 12 个月', Number(span[0].months) === 12, `${span[0].months}`);
+// ★ 口径二分后：去年同期累计行装载即平移（2026-XX → 2025-XX），库内月份跨两年（12+12=24）
+check('覆盖 24 个月（去年平移 + 本年 12 + 12）', Number(span[0].months) === 24, `${span[0].months}`);
 check('覆盖 4 公司 / 5 指标 / 4 口径',
   Number(span[0].companies) === 4 && Number(span[0].metrics) === 5 && Number(span[0].periods) === 4,
   `${span[0].companies}/${span[0].metrics}/${span[0].periods}`);
@@ -1469,16 +1470,24 @@ sheets:
         scope: { time: { year: "{{year}}", month: "{{month}}" } }`;
   {
     const eb = parseSpec(EXPR).sheets[0].blocks[0];
-    const eres = await runCompiled(compileBlock(eb, { year: 2026, month: 6 }), (sql) => db.query(sql));
+    // 口径窗口声明长在 models 声明的 calibers 上——编译必须带声明，否则平移分支拿不到 shift（见 compile.ts）
+    const { declaredFactsOf } = await import('../src/gen/parse.ts');
+    const eres = await runCompiled(
+      compileBlock(eb, { year: 2026, month: 6 }, { facts: declaredFactsOf() }),
+      (sql) => db.query(sql),
+    );
     const v = Number(eres.matrix[0].values[0]);
-    // 真值用独立 SQL 算，不写死：集团 2026-06 利润总额的 (本年累计-去年同期累计)/去年同期累计
+    // 真值用独立 SQL 算，不写死：集团 2026-06 利润总额的 (本年累计-去年同期累计)/去年同期累计。
+    // ★ 口径二分后去年同期累计行**装载即平移**（落地月 = 2025-06）—— 旧路独立算法手工 −1 年，
+    //   与 compile.ts 的平移分支互为对拍（期望取自旧路，不是新路自己跑一遍）。
     const pv = await db.query<{ m: string; prev: string }>(`
       SELECT sum(CASE WHEN f.period_type='本年累计' THEN f.amount END) AS m,
              sum(CASE WHEN f.period_type='去年同期累计' THEN f.amount END) AS prev
       FROM fact_finance f
       JOIN dim_metric ON f.metric_id = dim_metric.id
-      JOIN dim_period ON dim_period.fin_month = f.fin_month
-      WHERE dim_metric.name = '利润总额' AND dim_period.year = 2026 AND dim_period.month = 6`);
+      WHERE dim_metric.name = '利润总额'
+        AND ((f.period_type = '本年累计' AND year(f.fin_month) = 2026 AND month(f.fin_month) = 6)
+          OR (f.period_type = '去年同期累计' AND year(f.fin_month) = 2025 AND month(f.fin_month) = 6))`);
     const want = (Number(pv[0].m) - Number(pv[0].prev)) / Number(pv[0].prev);
     check('★ bug B：expr 真的被求值（不再返回两个累计额本身）', Math.abs(v - want) < 1e-9, `表内=${v} 独立算出=${want}`);
     // ★ 反证：若 expr 仍被忽略，返回的会是两个原始累计额（断言它们都不等于 v）
@@ -2372,14 +2381,14 @@ sheets:
         typeof dry.note === 'string' && dry.note.includes('可以落库'),
       `事实行 ${before4} → ${await facts()}；inserted=${dry.inserted}`);
     const blk = dry.shape?.blocks?.[0];
-    check('④ 干跑报出形状：4 行数据 × 2 个值列 = 8 个坐标，一个都不缺',
-      blk?.dataRows === 4 && blk?.coordinates.total === 8 && blk?.coordinates.incomplete === 0,
+    check('④ 干跑报出形状：8 行数据（2026 报告 4 行 + 2025 单月 4 行）× 4 个值列 = 32 个坐标，一个都不缺',
+      blk?.dataRows === 8 && blk?.coordinates.total === 32 && blk?.coordinates.incomplete === 0,
       `dataRows=${blk?.dataRows} 坐标=${blk?.coordinates.total} 不完整=${blk?.coordinates.incomplete}`);
     const vcols = (blk?.valueColumns ?? []).map((v: any) => `${v.col}→${v.periodType}`).join(',');
     check('④ 值列口径按位置对上、派生列被跳过、合计行被 drop（形状就摆在眼前）',
-      vcols === 'D→本年累计,E→单月' &&
+      vcols === 'D→本年累计,E→单月,G→去年同期累计,H→账面累计' &&
         (blk?.skipped ?? []).map((s: any) => s.col).join(',') === 'F' &&
-        (blk?.dropped ?? []).some((d: any) => d.row === 6),
+        (blk?.dropped ?? []).some((d: any) => d.row === 10),
       `值列=${vcols} 跳过=${(blk?.skipped ?? []).map((s: any) => s.col).join(',')} drop=${(blk?.dropped ?? []).map((d: any) => d.row).join(',')}`);
     check('④ ★ 干跑返回值里没有任何金额（走与 MCP 同款的那道兜底扫描）',
       findAmountLike(dry).length === 0, `${findAmountLike(dry).length} 处`);
@@ -2410,7 +2419,7 @@ sheets:
         if (vws.cell(r, 1).value() === '华南子公司') { vws.cell(r, 1).value('华南本部'); renamed++; }
       }
       await vwb.toFileAsync(V);
-      check('⑤ 变体源生成（同一家公司换了个写法：「华南子公司」→「华南本部」）', renamed === 2, `${renamed} 行`);
+      check('⑤ 变体源生成（同一家公司换了个写法：「华南子公司」→「华南本部」）', renamed === 4, `${renamed} 行`);
 
       const vup = await up2('e2e-接入变体.xlsx', fs.readFileSync(V));
       vupFile = vup.file;
@@ -2418,10 +2427,11 @@ sheets:
 
       const vdry = await post2('/api/ingest/dry-run', { yaml: vYaml, decisions: [] });
       const need = vdry.needsDecision ?? [];
+      // rows = 该名字在展开网格里出现的事实行数（resolve.ts describeUnresolved 按值出现次数统计）：
+      // 2026 报告 2 行 × 4 值列 = 8 + 2025 单月 2 行 = 10。
       check('⑤ ★ 干跑把「看起来像已有的名字」交给人拍板，并带 kind（丢了它按钮就永远点不动）',
-        need.length === 1 && need[0].kind === 'company' && need[0].raw === '华南本部' && need[0].rows === 4,
-        (need as any[]).map((d) => `${d.kind}|${d.raw}|${d.rows}`).join(', ') || '（没有待确认项）');
-      check('⑤ 候选自带依据（why）—— 不给人看依据的推荐等于让他猜',
+        need.length === 1 && need[0].kind === 'company' && need[0].raw === '华南本部' && need[0].rows === 10,
+        (need as any[]).map((d) => `${d.kind}|${d.raw}|${d.rows}`).join(', ') || '（没有待确认项）');      check('⑤ 候选自带依据（why）—— 不给人看依据的推荐等于让他猜',
         need[0]?.candidates?.[0]?.name === '华南子公司' &&
           String(need[0]?.candidates?.[0]?.why).includes('字号'),
         `${need[0]?.candidates?.[0]?.name}（${need[0]?.candidates?.[0]?.why}）`);
@@ -2438,8 +2448,8 @@ sheets:
         kind: d.kind, raw: d.raw, action: 'merge', targetId: d.candidates[0].id,
       }));
       done = await post2('/api/ingest/run', { yaml: vYaml, decisions: decs });
-      check('⑤ ★★ 拍板后落库成功：写入 8 行，事实表正好多 8 行',
-        done.ok === true && done.inserted === 8 && (await facts()) === before5 + 8,
+      check('⑤ ★★ 拍板后落库成功：写入 20 行（2026 四列 + 2025 单月），事实表正好多 20 行',
+        done.ok === true && done.inserted === 20 && (await facts()) === before5 + 20,
         `inserted=${done.inserted} 事实行=${await facts()}`);
       check('⑤ ★ 归档成功（archived 字段 —— 铁律 12 那个静默失效的回归防线）',
         done.archived === true, `archived=${done.archived}`);
@@ -2589,6 +2599,8 @@ log('\n════════ 26. 长表接入对拍（与冻结的期望值�
   // —— ① 期望值：**冻结的黄金快照**（由旧长表路径在它被删除前生成过一次）——
   //    ★ 换成快照不是"降低标准"：那份期望值仍然出自旧路的独立执行，
   //      只是执行了一次就固化成文件（否则旧路一删，基准就没了）。
+  //    ★ 刀 21 对快照做过**一次性机械迁移**：去年同期累计 240 行的期数按声明语义 −1 年
+  //      （架构 §7.4 装载即平移）；**金额一个没动** —— 金额对拍防线在阶段 38 的旧路查询。
   const golden = JSON.parse(fs.readFileSync('test/expected/集团导出长表-960行.json', 'utf8')) as {
     rows: Array<[string, string, string, string, number]>;
   };
@@ -4067,6 +4079,140 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
   check('★ catalog 导出不含 stg_fact_rows（含金额面与 fact 同级隔离：不进 catalog/MCP/Web/skill 物料）',
     !cat37dump.objects.some((o) => o.name.startsWith('stg_')),
     cat37dump.objects.filter((o) => o.name.startsWith('stg_')).map((o) => o.name).join(','));
+}
+
+// ============================================================
+// —— 阶段 38 · 口径二分（P5 刀 21）：窗口声明 vs 行上旧路，同库对拍 ——
+//    docs/需求与架构.md §7.4「五值拆三件」：窗口实存（period_from）/ 窗口平移（装载即
+//    落去年窗口）/ calculator（语义层算）。对拍纪律：**期望值全部来自旧路（period_type
+//    列）与夹具常量**，不是新路自己再跑一遍 —— 否则对拍形同虚设（AGENTS §6.1 教训）。
+// ============================================================
+{
+  const { semanticFactOf } = await import('../src/semantic/introspect.ts');
+  const { runSemanticQuery, compileSemanticQuery } = await import('../src/semantic/rewrite.ts');
+  const { compileMetrics } = await import('../src/semantic/query.ts');
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+
+  // —— ① 声明面：口径长在 models/*.yml 的 calibers 上，自省原样导出（零新登记，架构 §7.1）——
+  const sf = semanticFactOf('fact_finance')!;
+  const calNames = sf.calibers.map((c) => c.name);
+  check('★ 口径白名单来自声明（windowFrom + 5 个口径，自省零新登记）',
+    sf.windowFrom === 'period_from' && calNames.length === 5,
+    `windowFrom=${sf.windowFrom} calibers=[${calNames.join(',')}]`);
+  const yoy = sf.calibers.find((c) => c.name === '单月同比');
+  check('★ calculator 口径带操作数（单月同比 → operand 单月；铁律 5 第三件的声明形态）',
+    yoy?.calculator === true && yoy?.operand === '单月',
+    `calculator=${yoy?.calculator} operand=${yoy?.operand}`);
+
+  // —— ② 新旧对拍：窗口谓词（新路）vs period_type 列（旧路）vs 夹具常量，三面一致 ——
+  //    坐标取华东子公司·营业收入·2026-06：单月 56.75 / 本年累计 1234.5 / 账面累计 1300.5。
+  //    新路谓词逐口径来自声明（same / year_start / since），旧路直接用行上的 period_type。
+  const win = await db.query<Record<string, string>>(`
+    SELECT
+      sum(CASE WHEN f.period_type = '单月' THEN f.amount END) AS oldSingle,
+      sum(CASE WHEN f.period_from = f.fin_month THEN f.amount END) AS newSingle,
+      sum(CASE WHEN f.period_type = '本年累计' THEN f.amount END) AS oldCum,
+      sum(CASE WHEN f.period_from = date_trunc('year', f.fin_month) THEN f.amount END) AS newCum,
+      sum(CASE WHEN f.period_type = '账面累计' THEN f.amount END) AS oldBook,
+      sum(CASE WHEN f.period_from = DATE '2025-01-01' THEN f.amount END) AS newBook
+    FROM fact_finance f
+    JOIN dim_metric ON f.metric_id = dim_metric.id
+    JOIN dim_company ON f.company_id = dim_company.id
+    WHERE dim_metric.name = '营业收入' AND dim_company.name = '华东子公司'
+      AND f.fin_month = DATE '2026-06-01'`);
+  const w = win[0]!;
+  check('② 单月：窗口谓词 = 旧路列 = 夹具真值（same → period_from = fin_month）',
+    Number(w.newSingle) === Number(w.oldSingle) && Number(w.oldSingle) === 56.75,
+    `旧=${w.oldSingle} 新=${w.newSingle}`);
+  check('② 本年累计：窗口谓词 = 旧路列 = 夹具真值（year_start → period_from = 年初）',
+    Number(w.newCum) === Number(w.oldCum) && Number(w.oldCum) === 1234.5,
+    `旧=${w.oldCum} 新=${w.newCum}`);
+  check('② 账面累计：窗口谓词 = 旧路列 = 夹具真值（since 2025-01 → period_from = DATE 2025-01-01）',
+    Number(w.newBook) === Number(w.oldBook) && Number(w.oldBook) === 1300.5,
+    `旧=${w.oldBook} 新=${w.newBook}`);
+  check('② ★ 铁律 6 实存判据：账面累计 ≠ 本年累计（含审计调整，累加不等 —— 实存不是白存的）',
+    Number(w.oldBook) !== Number(w.oldCum), `${w.oldBook} vs ${w.oldCum}`);
+
+  // —— ③ 窗口平移（去年同期累计）：源列 G 经 stg 对拍落地平移行 ——
+  //    源（2026-06 报告 G 列 = 1100.25）装载即落去年窗口：fin_month=2025-06、period_from=2025-01-01。
+  const stgG = await db.query<{ amount: string }>(
+    `SELECT amount FROM stg_fact_rows
+     WHERE target = 'fact_finance' AND period_type = '去年同期累计' AND period = '2026-06'
+       AND metric_raw = '营业收入' AND company_raw = '华东子公司' AND value_col = 'G'`);
+  const factG = await db.query<{ amount: string; period_from: string; fin_month: string }>(
+    `SELECT f.amount, f.period_from, strftime(f.fin_month, '%Y-%m') AS fin_month
+     FROM fact_finance f
+     JOIN dim_metric ON f.metric_id = dim_metric.id
+     JOIN dim_company ON f.company_id = dim_company.id
+     WHERE dim_metric.name = '营业收入' AND dim_company.name = '华东子公司'
+       AND f.period_type = '去年同期累计' AND f.fin_month = DATE '2025-06-01'`);
+  check('③ 去年同期累计：stg 源列（G@2026-06）= 落地平移行金额（1100.25，装载即平移不双存）',
+    Number(stgG[0]?.amount) === 1100.25 && Number(factG[0]?.amount) === 1100.25,
+    `源=${stgG[0]?.amount} 落地=${factG[0]?.amount}`);
+  check('③ 平移行的窗口与标签：fin_month 落 2025-06、period_from 落 2025-01-01（去年窗口起点）',
+    factG[0]?.fin_month === '2025-06' && factG[0]?.period_from === '2025-01-01',
+    `fin_month=${factG[0]?.fin_month} period_from=${factG[0]?.period_from}`);
+
+  // —— ④ 查询路：去年同期累计口径（过滤平移 + 标签前移，判据在 compileMetrics 一处）——
+  const declaredFacts = declaredFactsOf();
+  const qShift = await runSemanticQuery(
+    { metrics: ['营业收入'], caliber: '去年同期累计', by: ['month'], filter: { month: '2026-06', company: '华东子公司' }, audience: 'human' },
+    (sql) => db.query(sql),
+    declaredFacts,
+  );
+  check('④ 去年同期累计查询：过滤值平移到 2025-06、标签前移回 2026-06、金额对上源列',
+    qShift.groups.length === 1 && qShift.groups[0]!.values[0] === '2026-06' &&
+      qShift.groups[0]!.cells[0] === 1100.25,
+    `组=${JSON.stringify(qShift.groups[0]?.values)} 值=${qShift.groups[0]?.cells[0]}`);
+
+  // —— ⑤ calculator（单月同比）：语义层组合两条正规查询，期望取夹具常量 ——
+  //    夹具 2025-06 单月与 2026-06 同值 → 比率 0；独立真值 = (56.75−56.75)/56.75。
+  const qYoy = await runSemanticQuery(
+    { metrics: ['营业收入', '净利润'], caliber: '单月同比', filter: { month: '2026-06' }, audience: 'human' },
+    (sql) => db.query(sql),
+    declaredFacts,
+  );
+  check('⑤ 单月同比：两格比率 = 夹具真值 0（(本月−去年同月)/去年同月，两条腿各自走全部防线）',
+    qYoy.groups.length === 1 && qYoy.groups[0]!.cells[0] === 0 && qYoy.groups[0]!.cells[1] === 0,
+    `cells=${JSON.stringify(qYoy.groups[0]?.cells)}`);
+  check('⑤ calculator 输出是比率不是金额：列标签带口径、redaction=none（比率不进 band）',
+    qYoy.columns.every((c) => c.periodType === '单月同比') && qYoy.meta.redaction === 'none',
+    `labels=[${qYoy.columns.map((c) => c.label).join(',')}] redaction=${qYoy.meta.redaction}`);
+
+  // —— ⑥ 拒绝面：calculator 不许从行上查、缺去年腿响亮拒、未声明口径拒 ——
+  //    （拒绝判据看 QueryRefused.code，不看 message 文案 —— 文案是给人看的，代码才是判据）
+  let refusedCalc = '';
+  try { compileMetrics(compileSemanticQuery({ metrics: ['营业收入'], caliber: '单月同比', audience: 'human' }), declaredFacts); }
+  catch (e) { refusedCalc = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('⑥ calculator 口径从 compileMetrics 走查询 → 拒（铁律 5：calculator 不占事实表列）',
+    refusedCalc.includes('CALIBER_IS_CALCULATOR'), refusedCalc.split('\n')[0]);
+  let refusedOperand = '';
+  try {
+    await runSemanticQuery(
+      { metrics: ['营业收入'], caliber: '单月同比', filter: { month: '2026-07' }, audience: 'human' },
+      (sql) => db.query(sql),
+      declaredFacts,
+    );
+  } catch (e) { refusedOperand = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('⑥ 缺去年腿 → CALIBER_OPERAND_MISSING（缺操作数不静默，铁律 14 同一立场）',
+    refusedOperand.includes('CALIBER_OPERAND_MISSING'), refusedOperand.split('\n')[0]);
+  let refusedUnknown = '';
+  try { compileMetrics(compileSemanticQuery({ metrics: ['营业收入'], caliber: '不存在的口径', audience: 'human' }), declaredFacts); }
+  catch (e) { refusedUnknown = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('⑥ 白名单之外没有口径：未声明的口径名 → UNKNOWN_PERIOD_TYPE（白名单=声明）',
+    refusedUnknown.includes('UNKNOWN_PERIOD_TYPE'), refusedUnknown.split('\n')[0]);
+
+  // —— ⑦ 受众分级对比率仍然生效：agent 每格支撑不足 → 整体拒绝，不降级出数 ——
+  let refusedAgent = '';
+  try {
+    await runSemanticQuery(
+      { metrics: ['营业收入'], caliber: '单月同比', filter: { month: '2026-06' }, audience: 'agent' },
+      (sql) => db.query(sql),
+      declaredFacts,
+    );
+  } catch (e) { refusedAgent = (e as { reason?: string }).reason ?? (e as Error).message; }
+  check('⑦ agent 拿比率：每格明细支撑不足 3 行 → TOO_FINE_GRAINED（腿 A 先炸，比率拿不到）',
+    refusedAgent.includes('TOO_FINE_GRAINED'), refusedAgent.split('\n')[0]);
 }
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——

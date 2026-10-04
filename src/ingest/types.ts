@@ -330,7 +330,9 @@ export function requiredCoordsOf(fact: DeclaredFact | null): string[] {
   if (!fact) return [...REQUIRED_COORDS];
   const out = ['company', 'metric', 'period'];
   if (fact.periodTypeColumn) out.push('period_type');
-  out.push(...fact.degenerateColumns);
+  // 窗口列（windowFrom）不在必需坐标里：它的值由口径规则在装载时推导（run.ts），
+  // 来源是声明里的 calibers，不是网格 —— 让规格去绑它反而会绑出错的窗口（铁律 5）。
+  out.push(...fact.degenerateColumns.filter((c) => c !== fact.windowFrom));
   return out;
 }
 

@@ -57,10 +57,12 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
    一律不动，只往数据格写值（`docs/需求与架构.md` §5.3.4 坑 7）。
 4. **`cell.style(...)` 是写路径，不是读路径。** 读单元格样式一律走 `readNumberFormat()`
    （`src/render/excel.ts`）。根因与实测见 `docs/判例与环境坑.md` §3.1。
-5. **口径是列不是行。** `fact_finance.period_type` 是列；新增口径 = 注册进 `src/db/schema.ts` 的
-   `PERIOD_TYPES`，不是新增表或列。
-6. **账面累计必须实存，不得从单月派生。** 它含审计调整，累加不等；`PERIOD_TYPES` 里
-   `derivable: false` 的项都不许在代码里"顺手算出来"。
+5. **口径是窗口声明，不是行上字符串。** 五种口径拆三件（P5）：**窗口实存**（单月 / 本年累计 /
+   账面累计，行上存 `period_from`、终点 ≡ `fin_month`，规则声明在 `models/fact_finance.yml`
+   的 `calibers`）、**窗口平移**（去年同期累计：装载即落去年窗口、查询期标签 +1 年，不单独存行）、
+   **calculator**（单月同比，语义层算，不占事实表列）。判据单一在 `compileMetrics`。
+6. **账面累计必须实存，不得从单月派生。** 它含审计调整，累加不等；`calibers` 声明里
+   非 calculator 的窗口口径都不许在代码里"顺手算出来"。
 7. **执行链路的每一行都不经过 LLM。** 两种规格 YAML 由 agent（或人）产出，引擎只做**确定性执行**
    与**确定性拒绝**：`src/ingest/`、`src/spec/`、`src/render/` 下任何代码不得引用 LLM/MCP 相关模块，
    也不得为了"跑通"而放宽判据。
@@ -142,11 +144,11 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 长表/宽表源与规格）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，526 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，541 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 覆盖 37 个阶段 + 三条结构守卫（页面路径↔路由表 /
+- **`npm run e2e` 必须全绿才可提交。** 覆盖 38 个阶段 + 三条结构守卫（页面路径↔路由表 /
   每个 MCP 工具都被真调用 / 六处文档条数自校验）+ 自包含守卫。阶段与断言清单见
   `test/e2e.ts` 分节注释——**刻意不写进文档**（条数以实跑输出为准，那个数字漂过两次）。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`；
@@ -272,7 +274,7 @@ specs/  models/  templates/  ingest/    # 声明与规格 YAML（版本化）；
 | CLI 入口 | ✅ 命令面走完（`ingest` 三连 · `render` · `query` · `catalog` · `compact` · `plan/apply/rebuild` · `replay` · `validate` · `skill export`） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**526 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
+**541 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
 由 e2e 末尾的自校验盯着）。
 
 **下一步**：历史施工项全部完成（`docs/开发计划.md` §1 与 §4 刀谱）；未完成与待定看 `docs/开发计划.md` §3。

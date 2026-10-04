@@ -10,12 +10,12 @@
  *   sem_metric   → SemanticFact.measures（role=measure 自动可选指标，带 unit）
  *   sem_dim_ref  → SemanticFact.dimRefs（role=dim_fk 自动可用维度）+ slicers（行内退化列切片）
  *   sem_lineage  → SemanticFact.lineage（聚合表的 source / via 派生边）
- *   sem_caliber  → 只暴露「口径列在不在」：在 = 查询必须钉口径（铁律 17）；
- *                  成员清单沿用 PERIOD_TYPES 唯一注册表（semantic/query.ts 的 staticCatalog），
- *                  selector/calculator 二分是 P5 的事。
+ *   sem_caliber  → calibers（铁律 5"五值拆三件"的声明面）：窗口实存（from/since）/
+ *                  窗口平移（shift）/ calculator 一并导出；查询白名单 = 声明的 calibers
+ *                  （semantic/query.ts compileMetrics），PERIOD_TYPES 注册表只留给 spec 语言 lint。
  */
 import { loadModels } from '../gen/parse.ts';
-import type { Ir, IrColumn, IrTable } from '../gen/ir.ts';
+import type { Ir, IrCaliber, IrColumn, IrTable } from '../gen/ir.ts';
 
 export interface SemanticMeasure {
   column: string;
@@ -38,6 +38,9 @@ export interface SemanticSlicer {
   semantic: string | null;
 }
 
+/** 口径声明（铁律 5）：窗口实存 / 窗口平移 / calculator 三件，规则只在 models/*.yml 一处 */
+export type SemanticCaliber = IrCaliber;
+
 export interface SemanticFact {
   name: string;
   kind: 'fact' | 'aggregate';
@@ -46,8 +49,13 @@ export interface SemanticFact {
   measures: SemanticMeasure[];
   /** 时间列（semantic=period）；无则该表不可按月/年切片 */
   periodColumn: string | null;
-  /** 口径列（semantic=period_type）。非 null = 铁律 17：查询必须钉住口径 */
+  /** 口径列（semantic=period_type）。非 null = 铁律 17：查询必须钉住口径。
+   *  P5 过渡态：列与 calibers 并存（刀 23 删列），查询白名单已切到 calibers */
   periodTypeColumn: string | null;
+  /** 窗口起点列（yml windowFrom）。null = 该表没有窗口口径 */
+  windowFrom: string | null;
+  /** 口径声明（铁律 5）。查询侧的口径白名单就是这份清单 */
+  calibers: SemanticCaliber[];
   dimRefs: SemanticDimRef[];
   slicers: SemanticSlicer[];
   /** 派生谱系：聚合表的 source（声明的 fact）与 via（穿桥摊分）；事实表为 null */
@@ -75,6 +83,8 @@ function toSemanticFact(t: IrTable): SemanticFact {
       .map((c) => ({ column: c.name, unit: c.unit ?? null, agg: c.agg ?? null })),
     periodColumn: periodColumnOf(t.columns),
     periodTypeColumn: periodTypeColumnOf(t.columns),
+    windowFrom: t.windowFrom ?? null,
+    calibers: (t.calibers ?? []).map((c) => ({ ...c })),
     dimRefs: t.columns
       .filter((c) => c.role === 'dim_fk' && c.refs)
       .map((c) => ({ column: c.name, refTable: c.refs!, semantic: c.semantic ?? null })),
