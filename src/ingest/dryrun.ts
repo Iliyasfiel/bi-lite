@@ -71,6 +71,8 @@ export interface IngestFactRow {
   block: number;
   /** 源文件里的行号（报错与追溯用） */
   row: number;
+  /** 值格的 Excel 列字母（如 "F"）—— stg 标准化层溯源到格用 */
+  col: string;
   company: string;
   metric: string;
   /** 归一成 `YYYY-MM`（期数列与 facts.period 都要能落库） */
@@ -566,6 +568,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
             sheet: sheet.name(),
             block: bi,
             row: r,
+            col: vc.col,
             company,
             metric,
             period: p ? `${p.year}-${String(p.month).padStart(2, '0')}` : periodText,

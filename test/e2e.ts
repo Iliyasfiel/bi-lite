@@ -3930,9 +3930,145 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
     findAmountLike(cat36.semantic).length === 0);
 }
 
-// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
-// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
-// —— 文档里写的断言条数，必须与实际跑出来的一致 ——
+// ════════ 37. 标准化层 stg_fact_rows（架构 §4.7）════════
+//    ★ 主张只有一条：**落库成功 ⇔ stg 有同事务影子**；replay 用 raw 独立重展对拍，
+//      结论只含坐标+字段名（零金额出口）。
+{
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { replaySpec } = await import('../src/ingest/replay.ts');
+  const { landRawFile } = await import('../src/land/raw.ts');
+  const { parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { main } = await import('../src/cli.ts');
+  const runCli37 = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+  const SPEC37 = 'test/fixtures/月度经营接入.yaml';
+  const spec37 = parseIngestSpec(fs.readFileSync(SPEC37, 'utf8'));
+  const cat37 = await masterCatalog();
+
+  // —— ① 同事务影子：落库成功 ⇔ stg 有批次（自造干净起点）——
+  await db.execute('DELETE FROM fact_finance');
+  const r37 = await runIngest(spec37, { catalog: cat37, autoCreateDims: true });
+  check('前置：夹具规格重跑成功落库（本阶段干净起点）',
+    r37.ok === true && r37.inserted > 0, `inserted=${r37.inserted}`);
+  const stgOf = (b: string) =>
+    db.query<{ spec_id: string; target: string; file_hash: string; sheet: string; block: string; row_no: number; value_col: string; period: string | null; company_raw: string | null; metric_raw: string | null; amount: number | null; deg: string | null }>(
+      `SELECT spec_id, target, file_hash, sheet, block, row_no, value_col, period, company_raw, metric_raw, amount, deg
+       FROM stg_fact_rows WHERE batch_id = '${b}'`);
+  const stg37 = await stgOf(r37.batchId!);
+  check('★★ 同事务影子：stg 行数 = 事实插入行数（少写任何一格都该当场炸）',
+    stg37.length === r37.inserted, `stg=${stg37.length} fact=${r37.inserted}`);
+  const landed37 = await landRawFile('test/fixtures/月度经营接入源.xlsx');
+  check('★ 溯源三字段齐：spec_id / target / file_hash 都能对回本批（stg 不做哑数据）',
+    stg37.every((s) => s.spec_id === spec37.id && s.target === 'fact_finance' && s.file_hash === landed37.fileHash),
+    [...new Set(stg37.map((s) => `${s.spec_id}/${s.target}`))].join(' '));
+  const letterToCol = (v: string) => v.split('').reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0);
+  const probe37 = stg37[0]!;
+  const rawCell37 = await db.query<{ n: number }>(
+    `SELECT count(*) AS n FROM raw_cell WHERE file_hash = '${probe37.file_hash}'
+     AND sheet = '${probe37.sheet}' AND row_no = ${probe37.row_no} AND col_no = ${letterToCol(probe37.value_col)}`);
+  check('★ 坐标回指 raw_cell：任取一行（file_hash,sheet,row_no,值格列号）都能在 raw 找到出处',
+    Number(rawCell37[0]!.n) === 1, `${probe37.sheet}!${probe37.value_col}${probe37.row_no}`);
+  check('★ 值格列号是 Excel 字母、原始主数据非空（replay 的坐标可读可对）',
+    stg37.every((s) => /^[A-Z]+$/.test(s.value_col) && s.company_raw !== null && s.metric_raw !== null));
+
+  // —— ② 源文件不在：关卡 0 拒绝，stg 一行不多 ——
+  const stgTotal37 = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM stg_fact_rows'))[0]!.n);
+  const total37 = await stgTotal37();
+  const ghost = { ...spec37, source: 'test/fixtures/不存在.xlsx' };
+  const rGhost = await runIngest(ghost, { catalog: cat37, autoCreateDims: true });
+  check('★ 源文件不在 → 关卡 0 拒绝，stg 一行不多（影子不是"事后补的账"）',
+    rGhost.ok === false && (await stgTotal37()) === total37,
+    rGhost.errors.map((e) => e.code).join(','));
+
+  // —— ③ replace 重跑：fact 只留最终值，stg 留每个批次 ——
+  const factCount37 = async () =>
+    Number((await db.query<{ n: number }>('SELECT count(*) AS n FROM fact_finance'))[0]!.n);
+  const fact37 = await factCount37();
+  const batchCount37 = async () =>
+    Number((await db.query<{ n: number }>(
+      `SELECT count(DISTINCT batch_id) AS n FROM stg_fact_rows WHERE spec_id = '${spec37.id}'`))[0]!.n);
+  const batches37 = await batchCount37();
+  const rReplace = await runIngest({ ...spec37, onConflict: 'replace' }, { catalog: cat37, autoCreateDims: true });
+  check('★ replace 重跑：fact 行数不变（还是那些坐标，值被覆盖）',
+    rReplace.ok === true && (await factCount37()) === fact37, `fact=${await factCount37()}`);
+  check('★ stg 留每个批次：批次数 +1（fact 只留最终值，stg 是接入历史）',
+    (await batchCount37()) === batches37 + 1, `批次 ${batches37}→${await batchCount37()}`);
+
+  // —— ④ replay 对拍：从库内 raw 重展，逐格全等 ——
+  const d37 = await replaySpec(spec37);
+  check('★★ replay（默认从库内 raw）：重展与最新批逐格全等',
+    d37.ok === true && d37.mode === 'raw' && d37.stgRows === d37.replayedRows &&
+      d37.missingInStg === 0 && d37.extraInStg === 0 && d37.mismatchTotal === 0,
+    `stg=${d37.stgRows} 重展=${d37.replayedRows}`);
+  const dSrc37 = await replaySpec(spec37, { source: 'test/fixtures/月度经营接入源.xlsx' });
+  check('★ replay --source（显式从源文件）：同样全等（两条重展路互相印证）',
+    dSrc37.ok === true && dSrc37.mode === 'source-file' && dSrc37.mismatchTotal === 0);
+
+  // —— ⑤ 篡改一个值格 → 响亮红：坐标+字段名，且结论零金额 ——
+  const latest37 = (await db.query<{ batch_id: string; sheet: string; block: string; row_no: number; value_col: string; amount: number }>(
+    `SELECT batch_id, sheet, block, row_no, value_col, amount FROM stg_fact_rows
+     WHERE spec_id = '${spec37.id}' AND amount IS NOT NULL ORDER BY loaded_at DESC, row_no LIMIT 1`))[0]!;
+  await db.execute(
+    `UPDATE stg_fact_rows SET amount = amount + 7.31 WHERE batch_id = '${latest37.batch_id}'
+     AND sheet = '${latest37.sheet}' AND row_no = ${latest37.row_no} AND value_col = '${latest37.value_col}'`);
+  const dTamper37 = await replaySpec(spec37);
+  check('★ 篡改一个值格 → 对拍响亮红：mismatch 带坐标+字段名 amount',
+    dTamper37.ok === false && dTamper37.mismatchTotal >= 1 &&
+      dTamper37.mismatches.some((m) => m.field === 'amount' && m.sheet === latest37.sheet &&
+        m.row === latest37.row_no && m.valueCol === latest37.value_col),
+    dTamper37.mismatches.map((m) => `${m.sheet}!${m.valueCol}${m.row}:${m.field}`).join(' '));
+  check('★ 对拍结论零金额（只含坐标与字段名，不回显值）',
+    findAmountLike(dTamper37).length === 0 && findAmountLike(d37).length === 0);
+  const cliTamper37 = await runCli37(['replay', SPEC37]);
+  check('★ CLI bilite replay：对拍不一致退 1（退出码即结论）', cliTamper37.code === 1, `code=${cliTamper37.code}`);
+  await db.execute(
+    `UPDATE stg_fact_rows SET amount = ${latest37.amount} WHERE batch_id = '${latest37.batch_id}'
+     AND sheet = '${latest37.sheet}' AND row_no = ${latest37.row_no} AND value_col = '${latest37.value_col}'`);
+  const dRestore37 = await replaySpec(spec37);
+  check('★ 还原后对拍再绿（篡改用例不污染后续断言）', dRestore37.ok === true);
+
+  // —— ⑥ 缺行：stg 少一行 → missingInStg ——
+  await db.execute(
+    `DELETE FROM stg_fact_rows WHERE batch_id = '${latest37.batch_id}'
+     AND sheet = '${latest37.sheet}' AND row_no = ${latest37.row_no} AND value_col = '${latest37.value_col}'`);
+  const dMissing37 = await replaySpec(spec37);
+  check('★ stg 缺一行 → missingInStg=1（重展多出来的那行，对拍不肯沉默）',
+    dMissing37.ok === false && dMissing37.missingInStg === 1,
+    `missing=${dMissing37.missingInStg} extra=${dMissing37.extraInStg}`);
+
+  // —— ⑦ 重跑 replace 造干净新批：对拍再绿且对准新批 ——
+  const rFix37 = await runIngest({ ...spec37, onConflict: 'replace' }, { catalog: cat37, autoCreateDims: true });
+  const dFix37 = await replaySpec(spec37);
+  check('★ 重跑 replace 后新批干净：对拍再绿且对准的就是新批',
+    rFix37.ok === true && dFix37.ok === true && dFix37.batchId === rFix37.batchId,
+    `batch=${dFix37.batchId}`);
+  const cliReplay37 = await runCli37(['replay', SPEC37]);
+  const rj37 = JSON.parse(cliReplay37.out) as { ok: boolean; mode: string };
+  check('★ CLI bilite replay：对拍一致退 0，结论可解析', cliReplay37.code === 0 && rj37.ok === true && rj37.mode === 'raw');
+
+  // —— ⑧ 未落库的规格：响亮报，不当"空对空"通过 ——
+  let threw37 = '';
+  try { await replaySpec({ ...spec37, id: 'e2e-从未落库的规格' }); } catch (e) { threw37 = (e as Error).message; }
+  check('★ 未落库的规格 → SPEC_NOT_INGESTED（不静默当"空对空"通过）',
+    threw37.includes('SPEC_NOT_INGESTED'), threw37.split('\n')[0]);
+
+  // —— ⑨ 退化列进 stg + catalog 面隔离 ——
+  const deg37 = await db.query<{ deg: string | null }>(
+    `SELECT deg FROM stg_fact_rows WHERE target = 'fact_business_line' AND deg IS NOT NULL LIMIT 1`);
+  check('★ 退化列进 stg（fact_business_line 的 deg JSON 带 business_line；一张通用表装所有目标）',
+    deg37.length === 1 && JSON.parse(deg37[0]!.deg!).business_line !== undefined, deg37[0]?.deg ?? '无');
+  const { catalogDump } = await import('../src/meta/catalog.ts');
+  const cat37dump = await catalogDump();
+  check('★ catalog 导出不含 stg_fact_rows（含金额面与 fact 同级隔离：不进 catalog/MCP/Web/skill 物料）',
+    !cat37dump.objects.some((o) => o.name.startsWith('stg_')),
+    cat37dump.objects.filter((o) => o.name.startsWith('stg_')).map((o) => o.name).join(','));
+}
+
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
 //     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 一直是没人管的那份**：
