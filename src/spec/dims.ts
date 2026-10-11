@@ -66,7 +66,8 @@ export function isRegisteredDim(d: string): d is DimName {
 export function dimAvailableOn(dim: DimName, fact: DeclaredFact | null): boolean {
   const d = DIMENSIONS[dim];
   if (d.table !== null) return true; // 维表（metric / company）：任何事实表都带外键
-  if (dim === 'period_type') return fact ? fact.periodTypeColumn !== null : true;
+  // 口径体系（刀 23）：period_type 列退场，口径唯一承载是声明 calibers —— 有声明即有口径轴
+  if (dim === 'period_type') return fact ? fact.calibers.length > 0 : true;
   if (dim === 'month' || dim === 'year') return fact ? fact.periodColumn !== null : true;
   // 行内退化列维：目标表的声明里真有这一列才可用
   return fact ? fact.degenerateColumns.includes(d.idCol) : false;

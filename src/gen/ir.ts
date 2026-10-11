@@ -146,8 +146,6 @@ export interface DeclaredFact {
   companyColumn: string;
   /** 指标外键列（refs = dim_metric） */
   metricColumn: string;
-  /** 口径列（semantic = period_type）；**运营事实表通常没有它** */
-  periodTypeColumn: string | null;
   /** 行内携带的**退化列** —— 由规格的 `keys[].as` 提供（见下面怎么挑的） */
   degenerateColumns: string[];
   measureColumn: string;
@@ -178,8 +176,9 @@ export function declaredFacts(ir: Ir): DeclaredFact[] {
       periodColumn: period.name,
       companyColumn: company.name,
       metricColumn: metric.name,
-      periodTypeColumn: t.columns.find((c) => c.semantic === 'period_type')?.name ?? null,
-      // ★ 判据是"**谁来填**"而不是"声明里写了什么角色"：除了期数/公司/指标/口径/度量/溯源，
+      // ★ 刀 23：period_type 列退场，口径的唯一承载是窗口（windowFrom + calibers）——
+      //   IR 上不再有"口径列"概念；行上的 period_type 留在 stg_fact_rows（源侧溯源），不进事实表。
+      // ★ 判据是"**谁来填**"而不是"声明里写了什么角色"：除了期数/公司/指标/度量/溯源，
       //   剩下的列只能由**行内携带**（如 fact_business_line 的 business_line）——
       //   它们必须出现在规格的 keys[].as 里，漏一个就会被 COORD_MISSING 拦下。
       //   用角色判会漏：business_line 既在粒度里、又是退化维，人给它标 pk 或 degenerate 都合理。
@@ -190,8 +189,7 @@ export function declaredFacts(ir: Ir): DeclaredFact[] {
             c.role !== 'provenance' &&
             c.name !== period.name &&
             c.name !== company.name &&
-            c.name !== metric.name &&
-            c.semantic !== 'period_type',
+            c.name !== metric.name,
         )
         .map((c) => c.name),
       measureColumn: measure.name,

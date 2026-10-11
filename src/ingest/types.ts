@@ -333,7 +333,8 @@ export { DEFAULT_TARGET };
 export function requiredCoordsOf(fact: DeclaredFact | null): string[] {
   if (!fact) return [...REQUIRED_COORDS];
   const out = ['company', 'metric', 'period'];
-  if (fact.periodTypeColumn) out.push('period_type');
+  // 刀 23：口径体系 = calibers 声明（period_type 列已退场）—— 有口径体系的表要求规格映射值列口径
+  if (fact && fact.calibers.length > 0) out.push('period_type');
   // 窗口列（windowFrom）不在必需坐标里：它的值由口径规则在装载时推导（run.ts），
   // 来源是声明里的 calibers，不是网格 —— 让规格去绑它反而会绑出错的窗口（铁律 5）。
   out.push(...fact.degenerateColumns.filter((c) => c !== fact.windowFrom));
@@ -695,7 +696,7 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
       const bindings = bindingsOf(block ?? ({} as IngestBlock));
       // 目标表没有口径列，而规格却声明了值列口径 → 那是"按财务事实的写法写运营事实"，
       // 静默忽略的话这几个表头映射会变成没人看的摆设（写的人以为它在起作用）。
-      if (fact && !fact.periodTypeColumn && (v.periodTypes?.length || Object.keys(v.periodTypeFromHeader ?? {}).length > 0)) {
+      if (fact && fact.calibers.length === 0 && (v.periodTypes?.length || Object.keys(v.periodTypeFromHeader ?? {}).length > 0)) {
         err('TARGET_NO_PERIOD_TYPE', `${at}.values`,
           `${fact.name} 没有口径列（period_type），但规格声明了值列口径。`,
           '运营事实表没有"本年累计 / 单月"这套口径体系（铁律 8）：删掉 values.periodTypes / periodTypeFromHeader，值列就按行落数。');

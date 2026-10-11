@@ -10,7 +10,7 @@
 kind: aggregate
 title: 财务月度汇总（月 × 指标 × 口径，全公司）
 source: fact_finance
-grain: [fin_month, metric_id, period_type, scenario, ccy]
+grain: [fin_month, period_from, metric_id, scenario, ccy]
 measures:
   - name: amount
     agg: sum

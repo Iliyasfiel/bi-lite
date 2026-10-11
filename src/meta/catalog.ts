@@ -1,5 +1,5 @@
 /**
- * catalog：把「库里现在有什么」导出给 **Agent**（架构 §8.2 的 ②③、§8.5）。
+ +* catalog：把「库里现在有什么」导出给 **Agent**（架构 §8.2 的 ②③、§8.5）。
  *
  * 三层，各自回答一个不同的问题 —— 三种 YAML 要的不是同一份东西：
  *   L1 业务成员  「这个 code 已经有了吗？」  → 防止造出重复指标（`receivable_amount` vs `account.receivable`）
@@ -143,7 +143,7 @@ export function catalogPrompt(c: Catalog): string {
     ...c.semantic.facts.map(
       (f) => `  ${f.name}  度量 ${f.measures.map((m) => `${m.column}${m.unit ? `(${m.unit})` : ''}${m.agg ? `[${m.agg}]` : ''}`).join('/') || '—'}` +
         ` · 维度 ${[...f.dimRefs.map((d) => `${d.column}→${d.refTable}`), ...f.slicers.map((s) => s.column)].join('/') || '—'}` +
-        ` · 口径 ${f.periodTypeColumn ? `${f.periodTypeColumn}（必须钉）` : '无'}` +
+        ` · 口径 ${f.calibers.length ? `声明 ${f.calibers.length} 个（必须钉）` : '无'}` +
         (f.lineage.source ? ` · 派生 ← ${f.lineage.source}${f.lineage.via ? ` via ${f.lineage.via}` : ''}` : ''),
     ),
   ];

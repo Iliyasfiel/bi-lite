@@ -51,7 +51,6 @@ export interface SemanticFact {
   periodColumn: string | null;
   /** 口径列（semantic=period_type）。非 null = 铁律 17：查询必须钉住口径。
    *  P5 过渡态：列与 calibers 并存（刀 23 删列），查询白名单已切到 calibers */
-  periodTypeColumn: string | null;
   /** 窗口起点列（yml windowFrom）。null = 该表没有窗口口径 */
   windowFrom: string | null;
   /** 口径声明（铁律 5）。查询侧的口径白名单就是这份清单 */
@@ -67,11 +66,6 @@ function periodColumnOf(columns: IrColumn[]): string | null {
   return c ? c.name : null;
 }
 
-function periodTypeColumnOf(columns: IrColumn[]): string | null {
-  const c = columns.find((c) => c.semantic === 'period_type');
-  return c ? c.name : null;
-}
-
 function toSemanticFact(t: IrTable): SemanticFact {
   return {
     name: t.name,
@@ -82,7 +76,6 @@ function toSemanticFact(t: IrTable): SemanticFact {
       .filter((c) => c.role === 'measure')
       .map((c) => ({ column: c.name, unit: c.unit ?? null, agg: c.agg ?? null })),
     periodColumn: periodColumnOf(t.columns),
-    periodTypeColumn: periodTypeColumnOf(t.columns),
     windowFrom: t.windowFrom ?? null,
     calibers: (t.calibers ?? []).map((c) => ({ ...c })),
     dimRefs: t.columns

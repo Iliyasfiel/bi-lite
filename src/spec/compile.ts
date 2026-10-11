@@ -107,6 +107,12 @@ export function compileBlock(
   const colsDim = ident(block.cols.dim);
   needDim(rowsDim, 'rows.dim');
   needDim(colsDim, 'cols.dim');
+  // 口径轴只支持做列（刀 23，与 lint 同一判据）：口径不落行，行轴没有可分组的坐标
+  if (rowsDim === 'period_type') {
+    throw new Error(
+      '口径轴只支持做列（cols.dim: period_type）—— 口径不落行，行轴没有可分组的行坐标（铁律 5）。',
+    );
+  }
   const agg = block.value.agg ?? 'sum';
   const measure = block.value.measure ?? fact?.measureColumn ?? 'amount';
 
@@ -126,9 +132,56 @@ export function compileBlock(
 
   const rowExpr = labelRef(rowsDim);
 
-  // 列：条件聚合
+  // ---- 口径轴特判（刀 23：period_type 列退场，口径的唯一承载是窗口）----
+  //   cols.dim: period_type 的每个列值 = 一个口径名 → 展开成**窗口谓词**（声明 calibers，铁律 5），
+  //   scope.time 的 as-of 期**嵌进每个列自己的条件**：平移口径（如去年同期累计）的落窗月
+  //   = as-of 期 + shift 年 —— 历史月份钉不能是全局 WHERE（会把平移行的 fin_month 钉掉）。
+  //   判据只有一份：窗口规则与 shift 全部来自 fact.calibers 声明，这里不做第二份口径知识。
+  const caliberWindowRule = (name: string): { rule: string; shift: number } => {
+    const cal = (fact?.calibers ?? []).find((x) => x.name === name);
+    if (!cal || cal.calculator) {
+      throw new Error(
+        `口径「${name}」不在 ${tableName} 的声明 calibers 里（calculator 口径不落事实表，铁律 5）—— 列口径必须从声明的 calibers 取。`,
+      );
+    }
+    const w = fact!.windowFrom!;
+    const p = fact!.periodColumn;
+    return {
+      rule:
+        cal.from === 'same'
+          ? `f.${w} = f.${p}`
+          : cal.from === 'year_start'
+            ? `f.${w} = date_trunc('year', f.${p})`
+            : `f.${w} = DATE '${cal.since}-01'`,
+      shift: cal.shift ?? 0,
+    };
+  };
+  /** as-of 期（scope.time 钉的年/月）按口径 shift 平移后的 fin_month 谓词片段 */
+  const asOfPin = (shift: number): string[] => {
+    const pins: string[] = [];
+    const yRaw = block.scope?.time?.year;
+    if (yRaw !== undefined) {
+      const y = Number(substitute(String(yRaw), params));
+      if (Number.isNaN(y)) throw new Error('scope.time.year 平移失败：不是数字');
+      pins.push(`year(f.fin_month) = ${y + shift}`);
+    }
+    const mRaw = block.scope?.time?.month;
+    if (mRaw !== undefined) {
+      // month 兼容 'MM' 与 'YYYY-MM'：取月号（年份由 year 钉单独管）
+      const m = Number(String(substitute(String(mRaw), params)).slice(-2));
+      if (Number.isNaN(m)) throw new Error('scope.time.month 平移失败：不是数字');
+      pins.push(`month(f.fin_month) = ${m}`);
+    }
+    return pins;
+  };
+  const caliberCond = (name: string): string => {
+    const { rule, shift } = caliberWindowRule(name);
+    return [rule, ...asOfPin(shift)].join(' AND ');
+  };
+
+  // 列：条件聚合。口径轴 → 窗口谓词；其余轴 → 维表/列标签等值（原行为）
   const colExprs = colLabels.map((c, i) => {
-    const cond = `${labelRef(colsDim)} = ${q(c)}`;
+    const cond = colsDim === 'period_type' ? caliberCond(c) : `${labelRef(colsDim)} = ${q(c)}`;
     // 别名用序号，避免中文别名在不同驱动下的引用问题
     return `${agg}(CASE WHEN ${cond} THEN f.${measure} END) AS c${i}`;
   });
@@ -161,35 +214,22 @@ export function compileBlock(
     addFilter(ident(dim), f);
   }
 
-  // ★ 口径二分过渡态（刀 21 落地，刀 23 删列后本分支随旧路一起退场）：
-  //   去年同期累计行**装载即平移**（架构 §7.4：落地月 = 报告月 − shift 年），
-  //   旧路（period_type 列）的独立算法 = 把声明里的 shift 手工落进时间谓词。
-  //   平移行不在报告月，全局时间钉必须给它们留一条按声明平移的 OR 分支，否则同比列全空。
-  //   哪个口径平移、平移几年，判据来自 models/*.yml 的同一份 calibers 声明 —— 不是第二份口径知识；
-  //   旧路作为**独立实现**参与对拍（期望取自旧路），两路数字一致才放行删列。
-  const shiftedCalibers = (fact?.calibers ?? []).filter((c) => (c.shift ?? 0) !== 0);
-  const timePin: string[] = [];
-  if (block.scope?.time?.year !== undefined) {
-    timePin.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
-    joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
-  }
-  if (block.scope?.time?.month !== undefined) {
-    timePin.push(`dim_period.month = ${q(substitute(String(block.scope.time.month), params))}`);
-    joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
-  }
-  if (shiftedCalibers.length > 0 && timePin.length > 0) {
-    const shiftNames = shiftedCalibers.map((c) => q(c.name)).join(', ');
-    const shift = shiftedCalibers[0]!.shift ?? 0;
-    const y = Number(substitute(String(block.scope?.time?.year ?? ''), params));
-    if (Number.isNaN(y)) throw new Error('scope.time.year 平移失败：不是数字');
-    const shiftedY = y + shift;
-    const mRaw = block.scope?.time?.month;
-    const branch =
-      mRaw === undefined
-        ? `f.period_type IN (${shiftNames}) AND CAST(year(f.fin_month) AS VARCHAR) = '${shiftedY}'`
-        : `f.period_type IN (${shiftNames}) AND year(f.fin_month) = ${shiftedY} AND month(f.fin_month) = ${Number(substitute(String(mRaw), params))}`;
-    where.push(`(( ${timePin.join(' AND ')} AND f.period_type NOT IN (${shiftNames}) ) OR ( ${branch} ))`);
-  } else {
+  // ★ scope.time 时间钉（刀 23 重写）：
+  //   口径轴（cols.dim: period_type）上，as-of 期已按列嵌入窗口条件（caliberCond ——
+  //   平移口径的落窗月 = as-of + shift），全局时间钉**不再 push**：全局钉会把平移列的
+  //   落窗月（fin_month = as-of − 1 年）钉掉。dim_period join 也随之不需要（asOfPin 直接用
+  //   f.fin_month，年份/月份不需要 dim_period 的映射）。
+  //   非口径轴的 block（运营事实表报表）：时间钉保持全局 WHERE（dim_period join）。
+  if (colsDim !== 'period_type') {
+    const timePin: string[] = [];
+    if (block.scope?.time?.year !== undefined) {
+      timePin.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
+      joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
+    }
+    if (block.scope?.time?.month !== undefined) {
+      timePin.push(`dim_period.month = ${q(substitute(String(block.scope.time.month), params))}`);
+      joins.add('JOIN dim_period ON dim_period.fin_month = f.fin_month');
+    }
     where.push(...timePin);
   }
 

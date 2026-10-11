@@ -125,9 +125,16 @@ let n = 0;
 for (const month of MONTHS) {
   for (const company of COMPANIES) {
     for (const metric of METRICS) {
+      // ★ 刀 23 起同一 (月, 公司, 指标) 的四个口径行必须是**同一个值**：
+      //   1 月的「单月」与「本年累计」是同一个窗口（[当年 1 月, 当月]），同窗口不存两份 ——
+      //   两个值会在装载时被响亮拒绝（金额不同的两次申报 = 源数据自相矛盾）。
+      //   rnd() 仍按旧节奏消耗 4 次（保持后续取值序列与历史夹具一致，减小断言漂移面）。
+      const base = metric === '营业成本' || metric === '期间费用' ? 6000 : 12000;
+      const v = Math.round((base + rnd() * 3000) * (1 + MONTHS.indexOf(month) * 0.03));
+      rnd();
+      rnd();
+      rnd();
       for (const period of PERIODS) {
-        const base = metric === '营业成本' || metric === '期间费用' ? 6000 : 12000;
-        const v = Math.round((base + rnd() * 3000) * (1 + MONTHS.indexOf(month) * 0.03));
         ls.addRow([month, company, metric, period, v]);
         n++;
       }

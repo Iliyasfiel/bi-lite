@@ -8,13 +8,13 @@
 #   2. grain 里的 bl_id 来自**桥接那头**（不在 fact_finance 上）—— 穿了桥必须留坐标，
 #      摊出去的钱才有去处（parse 守卫）。
 #
-# ★ 口径守卫照旧：fin_month / period_type 留在 grain（MODEL_AGG_NONADDABLE）；
+# ★ 口径守卫照旧：fin_month / period_from（窗口）留在 grain（MODEL_AGG_NONADDABLE）；
 #   company_id 被 SUM 掉 —— 这正是"摊分"的定义：公司维换了业务线维，账没有少一块。
 kind: aggregate
 title: 财务业务线摊分（月 × 业务线 × 指标 × 口径）
 source: fact_finance
 via: map_org_bl
-grain: [fin_month, bl_id, metric_id, period_type, scenario, ccy]
+grain: [fin_month, period_from, bl_id, metric_id, scenario, ccy]
 measures:
   - name: amount
     agg: sum

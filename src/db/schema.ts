@@ -147,7 +147,10 @@ CREATE TABLE IF NOT EXISTS _model_dep (
 /** 口径的类型：哪些可由单月派生，哪些必须实存
  *
  * ⚠️ id 必须与集团导出 Excel 里「口径」列的**字面值**完全一致 ——
- * 它是 fact_finance.period_type 的实际取值，也是语义层校验的依据。
+ * 它是 stg_fact_rows.period_type（源侧溯源）与接入规格 values.periodTypes 的取值词表，
+ * 也是 spec 语言口径轴在**未注入声明时**的保守回退词表。
+ * ★ 刀 23：运行时判据唯一在 models/*.yml 的 calibers 声明（窗口谓词按声明展开）——
+ * 这份注册表只是 spec 语言的词表，不再是行上列的取值依据。
  * （曾误写为 '累计'，与数据里的 '本年累计' 不符，会导致合法数据被拒。）
  */
 export const PERIOD_TYPES = [

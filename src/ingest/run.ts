@@ -443,7 +443,9 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     fact.primaryKey
       .map((col) => {
         if (col === fact.periodColumn) return day(r.window?.period ?? r.period);
-        if (col === fact.periodTypeColumn) return r.periodType ?? '';
+        // 窗口列（刀 23 起是主键的一部分 —— 窗口即口径坐标）：值由口径规则推导（已是 YYYY-MM-DD，
+        // 不走 day() —— 它是给 'YYYY-MM' 期数用的，再拼一次会变成 '2026-01-01-01'，撞库预检全漏）
+        if (col === fact.windowFrom) return r.window?.from ?? '';
         if (col === fact.companyColumn) return assigned.get(`company|${r.company}`) ?? '';
         if (col === fact.metricColumn) return assigned.get(`metric|${r.metric}`) ?? '';
         if (fact.degenerateColumns.includes(col)) return r.deg[col] ?? '';
@@ -451,11 +453,38 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       })
       .join('|');
 
+  // ★ 批内同坐标合并（刀 23：同一窗口不存两份）—— PK 里的口径柱换成窗口后，
+  //   两个源行可能落在**同一个事实坐标**上：典型是 1 月的「单月」与「本年累计」
+  //   （窗口都是 [当年 1 月 1 日, 当月] —— 1 月的累计就是 1 月本身）。
+  //   值一致 → 合并成一行（这不是丢数据，是同一个事实的两次申报）；
+  //   值不同 → 响亮拒绝（同一坐标两个金额 = 源数据自相矛盾，替人选一个就是篡改）。
+  //   合并只影响事实 INSERT；stg 影子按源行记（960 源行 → 940 事实行是合法状态）。
+  const factRows: IngestFactRow[] = [];
+  {
+    const byPk = new Map<string, IngestFactRow>();
+    for (const r of rows) {
+      const k = pkKeyOf(r);
+      const prev = byPk.get(k);
+      if (prev === undefined) {
+        byPk.set(k, r);
+        continue;
+      }
+      const same = prev.amount === r.amount && (prev.window?.from ?? '') === (r.window?.from ?? '');
+      if (!same) {
+        throw new Error(
+          `本批第 ${prev.row} 行与第 ${r.row} 行落在同一个事实坐标上但金额不同（${prev.amount} vs ${r.amount}）—— ` +
+            `同一窗口不存两份（刀 23），两个值必须由人先在源上对齐。`,
+        );
+      }
+    }
+    factRows.push(...byPk.values());
+  }
+
   // 撞库检查（只在 'reject' 下做）：同一坐标已存在 → 拒绝整批，而不是静默覆盖。
   // 旧实现是 `ON CONFLICT DO UPDATE`，"后写赢"这件事没有任何人看得见。
   if (onConflict === 'reject') {
     // 平移口径的落库期数 ≠ 源期间 —— 撞库预检必须按**落库**坐标查，否则漏检
-    const periods = [...new Set(rows.map((r) => r.window?.period ?? r.period))];
+    const periods = [...new Set(factRows.map((r) => r.window?.period ?? r.period))];
     // 期数列拿出来时统一成 `YYYY-MM-DD`（与 pkKeyOf 的 day(period) 对齐）——
     // 不这么做的话，'2026-06-01' 与 '2026-06' 看起来就是两个坐标，撞库预检会漏。
     const selectPk = fact.primaryKey
@@ -465,7 +494,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       `SELECT ${selectPk} FROM ${target} ` +
       `WHERE ${fact.periodColumn} IN (${periods.map((p) => `${lit(day(p))}::DATE`).join(', ')})`;
     const hits = await queryHits(sql, fact.primaryKey);
-    const collide = rows.filter((r) => hits.has(pkKeyOf(r)));
+    const collide = factRows.filter((r) => hits.has(pkKeyOf(r)));
     if (collide.length > 0) {
       // 同一行可能有两个值列撞库，示例只按行去重（人要看的是"哪几行"）
       const sample = [...new Set(collide.map((r) => r.row))].slice(0, 5).map((r) => `第 ${r} 行`).join('、');
@@ -596,9 +625,6 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       }
       if (col === fact.companyColumn) return lit(dimIdOf('company', r.company, r));
       if (col === fact.metricColumn) return lit(dimIdOf('metric', r.metric, r));
-      if (fact.periodTypeColumn && col === fact.periodTypeColumn) {
-        return r.periodType === null ? 'NULL' : lit(r.periodType);
-      }
       if (fact.provenanceColumn && col === fact.provenanceColumn) return lit(batch);
       if (col === fact.measureColumn) return r.amount === null ? 'NULL' : String(r.amount);
       if (fact.degenerateColumns.includes(col)) return lit(r.deg[col] ?? '');
@@ -607,8 +633,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       );
     }
 
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      const chunk = rows.slice(i, i + CHUNK);
+    for (let i = 0; i < factRows.length; i += CHUNK) {
+      const chunk = factRows.slice(i, i + CHUNK);
       const values = chunk
         .map((r) => `(${fact.columns.map((c) => valueOfColumn(c.name, r, batchId)).join(', ')})`)
         .join(',\n');
@@ -637,9 +663,9 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       }`,
     );
     inserted = Number(counted[0]?.n ?? 0);
-    if (inserted !== rows.length) {
+    if (inserted !== factRows.length) {
       throw new Error(
-        `事实装载少写了：本批 ${rows.length} 行，库内只见到 ${inserted} 行。` +
+        `事实装载少写了：本批 ${factRows.length} 行（源行 ${rows.length}，批内同坐标已合并），库内只见到 ${inserted} 行。` +
           `多半是撞库预检漏掉了一个坐标（ON CONFLICT DO NOTHING 会安静吞掉它）。` +
           `批次 ${batchId} 已整体回滚，没有留下半个批次。`,
       );
