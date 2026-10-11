@@ -271,13 +271,16 @@ specs/  models/  templates/  ingest/    # 声明与规格 YAML（版本化）；
 | 桥接层 | ✅ `kind: bridge` + 声明行 `rows:`：全量对齐 / 权重和 =1 / `via:` 加权摊分（e2e 第 35 阶段） |
 | 语义层自省 + 改写器 | ✅ `introspect`（声明 → 能查什么，零新登记）/ `rewrite`（纯翻译，判据一份）/ `catalog.semantic`（e2e 第 36 阶段） |
 | 标准化层（stg） | ✅ `stg_fact_rows` 同事务影子（fact+stg 少一份当场炸）/ `bilite replay` 从库内 raw 重展对拍，结论只含坐标+字段名（e2e 第 37 阶段） |
+| P5 窗口口径与正交维度 | ✅ period_from / scenario / ccy 入键，事实表 period_type 列退场（第 38–40 阶段） |
+| P6 治理收口 | 刀 1 ✅ 覆盖留痕 + 漂移前置（第 41 阶段）；DQ 与语义视图待实现 |
 | CLI 入口 | ✅ 命令面走完（`ingest` 三连 · `render` · `query` · `catalog` · `compact` · `plan/apply/rebuild` · `replay` · `validate` · `skill export`） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
 **575 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
 由 e2e 末尾的自校验盯着）。
 
-**下一步**：历史施工项全部完成（`docs/开发计划.md` §1 与 §4 刀谱）；未完成与待定看 `docs/开发计划.md` §3。
+**下一步**：已交付项见 `docs/开发计划.md` §1 与 §4 刀谱；未完成与待定看 §3。
+窗口跨终点累计相加、场景/币种混加、缺汇率丢行是已验证待修缺口（§3.5），575 项门禁全绿不代表它们已被覆盖。
 
 ## 7. 测试纪律
 
