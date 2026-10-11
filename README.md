@@ -44,7 +44,7 @@ node --version          # 需要 ≥ 22.6（本项目用 Node 原生跑 .ts，�
 npm install
 
 npm run fixtures        # 生成测试假数据（模板 + 长表/宽表/对齐场景等接入夹具）
-npm run e2e             # ★ 567 项断言全流程验收（唯一的门禁）
+npm run e2e             # ★ 575 项断言全流程验收（唯一的门禁）
 npm start               # 打开 http://127.0.0.1:4319
 ```
 
@@ -339,7 +339,7 @@ curl -s -X POST http://127.0.0.1:4319/api/report/render \
 | Excel 模板填充 | **xlsx-populate 1.21.0** | 只改 XML 节点，保真度最高 |
 | 图表 | **ECharts**（从 node_modules 直供） | 离线可用，无 CDN |
 | Web | **node:http + 原生 JS** | 零框架、零外部服务 |
-| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 567 项断言，一条命令验收 |
+| 测试 | **Node 原生 `node:test` 风格的自研 harness** | 575 项断言，一条命令验收 |
 
 **版本锁死**：`@duckdb/node-api` 用 `1.5.5-r.5`（不带 `^`）——1.3.3 系列曾被投毒
 （CVE-2025-59037）。
@@ -387,7 +387,7 @@ data/                ⚠️ 真实财务数据，永不提交
 
 ```bash
 npm run fixtures   # 生成测试假数据到 test/fixtures/
-npm run e2e        # ★ 唯一门禁，567 项断言
+npm run e2e        # ★ 唯一门禁，575 项断言
 npm start          # 本地 Web 服务（默认 http://127.0.0.1:4319）
 ```
 
