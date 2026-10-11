@@ -75,6 +75,10 @@ export interface IngestRunResult {
   shape: IngestShape;
   /** Parquet 归档是否成功（失败不影响落库，但要说出来） */
   archived: boolean;
+  /** `replace` 下实际覆盖的行数（撞库预检同样跑，只计数、不拒绝 —— 覆盖要让人看见，P6 刀 1） */
+  replaced: number;
+  /** 被顶掉的旧批次（`replaced` 那些行覆盖前挂的 batch_id，去重排序后的清单） */
+  replacedBatches: string[];
   /** 本次落库**同事务重建**的聚合表名（以本次 target 为 source 的那些；空 = 没有聚合管这张表） */
   rebuiltAggregates: string[];
   /** 只会有值于 planOnly：按当前规格与快照，这次会**新建**哪些主数据 */
@@ -184,6 +188,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     errors,
     shape,
     archived: false,
+    replaced: 0,
+    replacedBatches: [],
     rebuiltAggregates: [],
   };
 
@@ -436,7 +442,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   }
 
   /**
-   * 一条事实行的**主键元组**（与 `queryHits` 里 SELECT 出来的列序一致）——
+   * 一条事实行的**主键元组**（与下面撞库预检里 SELECT 出来的列序一致）——
    * 撞库预检拿它跟库里的已有坐标比。
    */
   const pkKeyOf = (r: IngestFactRow): string =>
@@ -480,22 +486,35 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     factRows.push(...byPk.values());
   }
 
-  // 撞库检查（只在 'reject' 下做）：同一坐标已存在 → 拒绝整批，而不是静默覆盖。
+  // 撞库预检（reject 与 replace 都跑 —— P6 刀 1：replace 的覆盖不再隐身，只计数、不拒绝）。
   // 旧实现是 `ON CONFLICT DO UPDATE`，"后写赢"这件事没有任何人看得见。
-  if (onConflict === 'reject') {
-    // 平移口径的落库期数 ≠ 源期间 —— 撞库预检必须按**落库**坐标查，否则漏检
+  // 平移口径的落库期数 ≠ 源期间 —— 撞库预检必须按**落库**坐标查，否则漏检
+  let replaced = 0;
+  let replacedBatches: string[] = [];
+  {
     const periods = [...new Set(factRows.map((r) => r.window?.period ?? r.period))];
     // 期数列拿出来时统一成 `YYYY-MM-DD`（与 pkKeyOf 的 day(period) 对齐）——
     // 不这么做的话，'2026-06-01' 与 '2026-06' 看起来就是两个坐标，撞库预检会漏。
     const selectPk = fact.primaryKey
       .map((c) => (c === fact.periodColumn ? `strftime(${c}, '%Y-%m-%d') AS ${c}` : c))
       .join(', ');
+    // ★ 被顶掉的旧批次也要查出来（只取 batch_id，不取金额 —— 铁律 1）：
+    //   有溯源列才有"旧批次"可言，没有溯源列的表只计数。
+    const batchSel = fact.provenanceColumn ? `, ${fact.provenanceColumn} AS __old_batch` : '';
     const sql =
-      `SELECT ${selectPk} FROM ${target} ` +
+      `SELECT ${selectPk}${batchSel} FROM ${target} ` +
       `WHERE ${fact.periodColumn} IN (${periods.map((p) => `${lit(day(p))}::DATE`).join(', ')})`;
-    const hits = await queryHits(sql, fact.primaryKey);
+    const hitRows = await query<Record<string, unknown>>(sql);
+    const hits = new Set<string>();
+    const oldBatchOf = new Map<string, string>();
+    for (const h of hitRows) {
+      const k = fact.primaryKey.map((c) => String(h[c] ?? '')).join('|');
+      hits.add(k);
+      const b = h['__old_batch'];
+      if (typeof b === 'string' && b !== '') oldBatchOf.set(k, b);
+    }
     const collide = factRows.filter((r) => hits.has(pkKeyOf(r)));
-    if (collide.length > 0) {
+    if (onConflict === 'reject' && collide.length > 0) {
       // 同一行可能有两个值列撞库，示例只按行去重（人要看的是"哪几行"）
       const sample = [...new Set(collide.map((r) => r.row))].slice(0, 5).map((r) => `第 ${r} 行`).join('、');
       return {
@@ -512,6 +531,10 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
           },
         ],
       };
+    }
+    if (onConflict === 'replace' && collide.length > 0) {
+      replaced = collide.length;
+      replacedBatches = [...new Set(collide.map((r) => oldBatchOf.get(pkKeyOf(r)) ?? '').filter((b) => b !== ''))].sort();
     }
   }
 
@@ -533,9 +556,15 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
 
   await execute('BEGIN');
   try {
+    // ★ replace 的覆盖要让人看见（P6 刀 1）：note 写清覆盖行数与被顶掉的旧批次 ——
+    //   批次表是人查"这次发生了什么"的第一落点，JSON 回传的 replaced 只是第二落点。
+    const replaceNote =
+      replaced > 0
+        ? `；replace 覆盖 ${replaced} 行（被顶掉旧批次：${replacedBatches.length > 0 ? replacedBatches.join('、') : '无溯源列，只计数'})`
+        : '';
     await execute(
       `INSERT INTO import_batch (batch_id, source_file, row_count, imported_at, status, note)
-       VALUES (${lit(batchId)}, ${lit(effSource ?? '')}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}`)})`,
+       VALUES (${lit(batchId)}, ${lit(effSource ?? '')}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}${replaceNote}`)})`,
     );
 
     // ★ 版本行的生效日 = **本批最早的期数**（不是 now()）：重放要确定性 ——
@@ -771,15 +800,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     errors: [],
     shape,
     archived,
+    replaced,
+    replacedBatches,
     rebuiltAggregates,
   };
-}
-
-/**
- * 查"这些期间里已经存在哪些坐标"（**只取坐标，不取金额**）。
- * 主键列由调用方按声明传进来 —— 判据不写死任何列名（铁律 18：目标表是声明）。
- */
-async function queryHits(sql: string, pk: string[]): Promise<Set<string>> {
-  const hits = await query<Record<string, unknown>>(sql);
-  return new Set(hits.map((r) => pk.map((c) => String(r[c] ?? "")).join("|")));
 }

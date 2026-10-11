@@ -47,7 +47,7 @@ export async function applyModels(ir: Ir): Promise<ApplyResult> {
       applied: [],
       blocked: plan.blocking,
       note:
-        `有 ${plan.blocking.length} 项**不会自动做**（删列 / 改类型 / 加 NOT NULL 列 / 无主的语义表）：` +
+        `有 ${plan.blocking.length} 项**不会自动做**（删列 / 改类型 / 加 NOT NULL 列 / 无主的语义表 / 存量契约漂移）：` +
         `一行都没动。先看 \`bilite plan\` 的清单，改声明或手工处理库。`,
     };
   }

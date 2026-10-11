@@ -25,6 +25,7 @@ export type ChangeKind =
   | 'type-changed'
   | 'rebuild-table'
   | 'undeclared-table'
+  | 'meta-drift'
   | 'register-meta';
 
 export interface ModelChange {
@@ -66,6 +67,8 @@ async function readCurrent(): Promise<{
   modelRows: Map<string, { kind: string; ddl_hash: string }>;
   metaObjects: Map<string, string>;
   metaColumns: Set<string>;
+  /** 存量 `_meta_columns` 的原始坐标（table.column）—— P6 刀 1 漂移门只比"存不存在"，不比角色语义 */
+  metaColsRaw: Set<string>;
 }> {
   const live = await query<LiveColumn>(
     `SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'main'`,
@@ -83,13 +86,16 @@ async function readCurrent(): Promise<{
     metaObjects.set(r.object_name, r.sig);
   }
   const metaColumns = new Set<string>();
-  for (const r of await query<{ sig: string }>(
+  const metaColsRaw = new Set<string>();
+  for (const r of await query<{ sig: string; raw: string }>(
     `SELECT table_name || '.' || column_name || '|' || role || '|' || coalesce(semantic,'') || '|' ||
-            coalesce(unit,'') || '|' || coalesce(ref_table,'') AS sig FROM _meta_columns`,
+            coalesce(unit,'') || '|' || coalesce(ref_table,'') AS sig,
+            table_name || '.' || column_name AS raw FROM _meta_columns`,
   )) {
     metaColumns.add(r.sig);
+    metaColsRaw.add(r.raw);
   }
-  return { live, modelRows, metaObjects, metaColumns };
+  return { live, modelRows, metaObjects, metaColumns, metaColsRaw };
 }
 
 /** 契约投影的比较签名（与 `_meta_objects` / `_meta_columns` 里存的那两份对齐） */
@@ -222,6 +228,34 @@ export async function planModels(ir: Ir): Promise<ModelPlan> {
         kind: 'undeclared-table',
         table: t,
         detail: `库里有语义表 ${t}，但没有任何声明管它 —— 生成器不会去动它`,
+        blocking: true,
+      });
+    }
+  }
+
+  // ★ P6 刀 1 漂移门：存量 `_meta_columns` vs `information_schema` 对拍 ——
+  //   有人在生成器之外动过表结构（手写 ALTER / 换库文件 / 探针没清干净），`apply` 开工前整单不动。
+  //   只比"存不存在"（坐标集合），不比角色语义：语义对拍是 `metaProblems()` 的事，判据不写两份。
+  //   只查"表还在库里"的声明表：表都不在就是 create-table 的事；`_meta` 空（全新库）也不报 ——
+  //   空库引导是 `ensureModels` 的第 ② 条，不该被门挡住。
+  for (const t of ir.tables) {
+    if (!liveTables.has(t.name)) continue;
+    const liveNames = new Set(cur.live.filter((c) => c.table_name === t.name).map((c) => c.column_name));
+    if (liveNames.size === 0) continue;
+    const storedNames = new Set(
+      [...cur.metaColsRaw].filter((k) => k.startsWith(`${t.name}.`)).map((k) => k.slice(t.name.length + 1)),
+    );
+    if (storedNames.size === 0) continue;
+    const extraLive = [...liveNames].filter((n) => !storedNames.has(n));
+    const extraStored = [...storedNames].filter((n) => !liveNames.has(n));
+    if (extraLive.length > 0 || extraStored.length > 0) {
+      const bits: string[] = [];
+      if (extraLive.length > 0) bits.push(`库里有但契约没记：${extraLive.join('、')}`);
+      if (extraStored.length > 0) bits.push(`契约记了但库里没有：${extraStored.join('、')}`);
+      changes.push({
+        kind: 'meta-drift',
+        table: t.name,
+        detail: `${t.name} 的存量列契约与库结构不一致（${bits.join('；')}) —— 有人在生成器之外动过结构，apply 整单不动`,
         blocking: true,
       });
     }

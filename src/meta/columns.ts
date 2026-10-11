@@ -68,6 +68,16 @@ export async function registerMeta(meta: readonly MetaObject[] = META): Promise<
         `(${lit(obj.name)}, ${lit(obj.kind)}, ${obj.grain ? lit(obj.grain.join(',')) : 'NULL'}, ${lit(API_VERSION)}) ` +
         `ON CONFLICT (object_name) DO UPDATE SET kind = EXCLUDED.kind, grain = EXCLUDED.grain, api_version = EXCLUDED.api_version`,
     );
+    // ★ 契约与声明精确对齐：声明里已没有的列，旧契约行一并清掉 ——
+    //   否则"声明列减少"（聚合表 grain 改小是常态，plan 标 rebuild-table 非阻塞）后，
+    //   `_meta` 留着旧列行，下一次 plan 的漂移门（存量契约 vs information_schema）就会误报，
+    //   apply 整单不动、谁也修不好 —— 门把"自愈的路"堵死了（P6 刀 1 实测）。
+    //   只删"传入表声明之外的行"：rebuild 传 aggs 子集时，其他表的契约原样不动。
+    const keep = obj.columns.map((c) => lit(c.column)).join(',');
+    await execute(
+      `DELETE FROM _meta_columns WHERE table_name = ${lit(obj.name)}` +
+        (keep ? ` AND column_name NOT IN (${keep})` : ''),
+    );
     for (const c of obj.columns) {
       await execute(
         `INSERT INTO _meta_columns (table_name, column_name, role, semantic, unit, ref_table) VALUES ` +

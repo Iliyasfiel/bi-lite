@@ -4492,6 +4492,75 @@ sheets:
     rowsAxis.issues.map((i) => i.code).join(','));
 }
 
+// ============ 41. P6 刀 1：仲裁可视 + 漂移前置 ============
+//   ① replace 覆盖不再隐身：撞库预检同样跑（计数不拒绝），note + 回传双落点；
+//   ② 漂移门：存量 `_meta_columns` vs `information_schema` 对拍，不一致 apply 整单不动。
+//   载体是小表 fact_business_line（4 行）：测的是"覆盖看得见"，不该顺手把大表的基线改出新行。
+{
+  const { parseIngestSpec } = await import('../src/ingest/types.ts');
+  const { runIngest } = await import('../src/ingest/run.ts');
+  const { masterCatalog } = await import('../src/ingest/master.ts');
+  const { declaredFactsOf } = await import('../src/gen/parse.ts');
+  const planMod = await import('../src/gen/plan.ts');
+  const applyMod = await import('../src/gen/apply.ts');
+  const gen = await import('../src/gen/parse.ts');
+  const { main } = await import('../src/cli.ts');
+  const facts41 = declaredFactsOf();
+  const runCli = async (argv: string[]) => {
+    const o: string[] = []; const e: string[] = [];
+    const code = await main(argv, { out: (t) => void o.push(t), err: (t) => void e.push(t) });
+    return { code, out: o.join(''), err: e.join('') };
+  };
+
+  // —— ① replace 可视：清空后首灌（无覆盖）→ 同规格重灌（4 行全撞）——
+  await db.execute('DELETE FROM fact_business_line');
+  const replaceYaml = fs.readFileSync('test/fixtures/接入-业务线.yaml', 'utf8')
+    .replace('onConflict: reject', 'onConflict: replace');
+  const spec41 = parseIngestSpec(replaceYaml, { facts: facts41 });
+  const first41 = await runIngest(spec41, { catalog: await masterCatalog(), autoCreateDims: true });
+  check('① 空表 replace 首灌：inserted=4 / replaced=0（无覆盖可记）',
+    first41.ok === true && first41.inserted === 4 && first41.replaced === 0 && first41.replacedBatches.length === 0,
+    `inserted=${first41.inserted} replaced=${first41.replaced}`);
+  const second41 = await runIngest(spec41, { catalog: await masterCatalog(), autoCreateDims: true });
+  check('① 同规格 replace 重灌：4 行全撞库 → replaced=4，被顶掉旧批次 = 首灌 batchId',
+    second41.ok === true && second41.inserted === 4 && second41.replaced === 4 &&
+      second41.replacedBatches.length === 1 && second41.replacedBatches[0] === first41.batchId,
+    `replaced=${second41.replaced} 旧批次=${second41.replacedBatches.join(',')}`);
+
+  // —— ① CLI 回传面：同一个 replace 规格走 CLI，JSON 同样带 replaced（spread 透传）——
+  fs.writeFileSync('test/output/接入-业务线-replace.yaml', replaceYaml);
+  const cli41 = await runCli(['ingest', 'run', 'test/output/接入-业务线-replace.yaml']);
+  const cj41 = JSON.parse(cli41.out) as { ok: boolean; inserted: number; replaced: number; replacedBatches: string[]; batchId: string };
+  check('① CLI 回传面同样带 replaced（用户可见出口，计数只含坐标不含金额）',
+    cli41.code === 0 && cj41.replaced === 4 &&
+      cj41.replacedBatches.length === 1 && cj41.replacedBatches[0] === second41.batchId,
+    `replaced=${cj41.replaced} 旧批次=${cj41.replacedBatches.join(',')}`);
+  const note41 = (await db.query<{ note: string }>(
+    `SELECT note AS note FROM import_batch WHERE batch_id = '${cj41.batchId}'`))[0]!.note;
+  check('① 批次表 note 写清覆盖行数与被顶掉旧批次（人查"发生了什么"的第一落点）',
+    note41.includes('replace 覆盖 4 行') && note41.includes(second41.batchId!),
+    note41.slice(0, 80));
+  fs.rmSync('test/output/接入-业务线-replace.yaml', { force: true });
+
+  // —— ② 漂移门：生成器之外手写 ALTER → plan 报 meta-drift（blocking），apply 整单不动 ——
+  const clean41 = await planMod.planModels(gen.loadModels());
+  check('② 漂移门前置：正常库 plan 无阻塞（门不误伤干净库）',
+    clean41.blocking.length === 0, `blocking=${clean41.blocking.length}`);
+  await db.execute('ALTER TABLE fact_business_line ADD COLUMN probe_col VARCHAR');
+  const drift41 = await planMod.planModels(gen.loadModels());
+  check('② 库外动过结构 → plan 报 meta-drift 阻塞（只比存不存在，不比角色语义）',
+    drift41.blocking.some((c) => c.kind === 'meta-drift' && c.table === 'fact_business_line'),
+    drift41.blocking.map((c) => c.kind).join(','));
+  const apply41 = await applyMod.applyModels(gen.loadModels());
+  check('② apply 见漂移整单不动（applied 为空，blocked 带 meta-drift）',
+    apply41.applied.length === 0 && apply41.blocked.some((c) => c.kind === 'meta-drift'),
+    `applied=${apply41.applied.length} blocked=${apply41.blocked.map((c) => c.kind).join(',')}`);
+  await db.execute('ALTER TABLE fact_business_line DROP COLUMN probe_col');
+  const cleanAgain41 = await planMod.planModels(gen.loadModels());
+  check('② 探针列清掉后 plan 恢复干净（漂移门不留痕）',
+    cleanAgain41.blocking.length === 0, `blocking=${cleanAgain41.blocking.length}`);
+}
+
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
 //     它在项目里漂过两次（231 与 247 对不上过一次），而且 **README 一直是没人管的那份**：

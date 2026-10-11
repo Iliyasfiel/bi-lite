@@ -144,11 +144,11 @@ bi-lite = **开源、轻量的本地 BI 引擎**：一份 Excel 加一份 YAML �
 
 ```bash
 npm run fixtures   # 生成测试假数据（模板 + 长表/宽表源与规格）到 test/fixtures/
-npm run e2e        # ★ 全链路验收，567 项断言，唯一的门禁
+npm run e2e        # ★ 全链路验收，575 项断言，唯一的门禁
 npm start          # 启动本地 Web 服务（src/server.ts，默认 http://127.0.0.1:4319）
 ```
 
-- **`npm run e2e` 必须全绿才可提交。** 覆盖 40 个阶段 + 三条结构守卫（页面路径↔路由表 /
+- **`npm run e2e` 必须全绿才可提交。** 覆盖 41 个阶段 + 三条结构守卫（页面路径↔路由表 /
   每个 MCP 工具都被真调用 / 六处文档条数自校验）+ 自包含守卫。阶段与断言清单见
   `test/e2e.ts` 分节注释——**刻意不写进文档**（条数以实跑输出为准，那个数字漂过两次）。
 - 服务端**只监听 127.0.0.1**，数据不出本机。`src/server.ts` 导出 `start(port)` / `stop()`；
@@ -274,7 +274,7 @@ specs/  models/  templates/  ingest/    # 声明与规格 YAML（版本化）；
 | CLI 入口 | ✅ 命令面走完（`ingest` 三连 · `render` · `query` · `catalog` · `compact` · `plan/apply/rebuild` · `replay` · `validate` · `skill export`） |
 
 五步全部完成，已由 `src/server.ts` + `src/web/` + `src/mcp/` 打通到人与 agent 两个入口，
-**567 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
+**575 项 e2e 断言**守着（阶段与断言清单见 `test/e2e.ts` 分节注释——刻意不在此复述，条数漂过两次，
 由 e2e 末尾的自校验盯着）。
 
 **下一步**：历史施工项全部完成（`docs/开发计划.md` §1 与 §4 刀谱）；未完成与待定看 `docs/开发计划.md` §3。
