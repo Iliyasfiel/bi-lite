@@ -70,6 +70,8 @@ export interface IrTable {
    * 非 calculator 的窗口口径不许在代码里"顺手算出来"）。
    */
   calibers?: IrCaliber[];
+  /** 查询省略正交维度时的明确成员选择；不影响物理 DDL。 */
+  queryDefaults?: Record<string, string>;
   /**
    * kind='aggregate' 时：从哪张事实表聚合（grain 里没出现的源维度就是被加总的）。
    * 聚合表的**列不是人写的**——由 parse 在跨表校验阶段从 source 投影出来
@@ -156,6 +158,7 @@ export interface DeclaredFact {
   windowFrom: string | null;
   /** 口径声明（无 = 这张表没有口径体系；有 = 查询白名单按它收窄） */
   calibers: IrCaliber[];
+  queryDefaults?: Record<string, string>;
 }
 
 /** 从 IR 里挑出事实表的落库形状（`kind: fact` 的那些） */
@@ -197,6 +200,7 @@ export function declaredFacts(ir: Ir): DeclaredFact[] {
       primaryKey: t.primaryKey,
       windowFrom: t.windowFrom ?? null,
       calibers: t.calibers ?? [],
+      queryDefaults: { ...t.queryDefaults },
     });
   }
   return facts;

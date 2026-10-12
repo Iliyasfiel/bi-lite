@@ -94,6 +94,7 @@ export interface MetricsResult {
   groups: Array<{ values: Array<string | null>; cells: Array<number | string | null> }>;
   meta: {
     audience: 'human' | 'agent';
+    appliedFilter?: Record<string, string | string[]>;
     redaction: 'none' | 'banded';
     rowCount: number;
     cellCount: number;
@@ -150,7 +151,7 @@ const AGGS = new Set(['sum', 'avg', 'max', 'min', 'count']);
 export function compileMetrics(
   mq: MetricsQuery,
   facts?: DeclaredFact[],
-): { sql: string; columns: MetricsResult['columns'] } {
+): { sql: string; columns: MetricsResult['columns']; appliedFilter: Record<string, string | string[]> } {
   if (!Array.isArray(mq.measures) || mq.measures.length === 0) {
     throw new QueryRefused('measures 不能为空', 'EMPTY_MEASURES');
   }
@@ -225,6 +226,26 @@ export function compileMetrics(
       `目标表 ${tableName} 没有「ccy」维度，不能按币种换算 —— 运营事实表没有币种体系。`,
       'CCY_NOT_ON_FACT',
     );
+  }
+
+  // 省略维度时按声明选择成员；换汇需要覆盖所有记账币种，不注入 ccy 默认过滤。
+  const filter = { ...mq.filter };
+  for (const dim of ['scenario', 'ccy']) {
+    if (!dimAvailableOn(dim as DimName, fact) || groupBy.includes(dim) || (dim === 'ccy' && ccySel)) continue;
+    if (filter[dim] === undefined && fact.queryDefaults?.[dim]) filter[dim] = fact.queryDefaults[dim];
+    const values = filter[dim] === undefined ? [] : Array.isArray(filter[dim]) ? filter[dim] : [filter[dim]];
+    if (values.length !== 1) {
+      throw new QueryRefused(`「${dim}」必须选择一个成员或作为分组维度，不能混加。`, 'DIM_MIXED_AGGREGATION');
+    }
+  }
+  const months = Array.isArray(filter.month) ? filter.month : filter.month === undefined ? [] : [filter.month];
+  const singleMonth = months.length === 1 && /^\d{4}-(0[1-9]|1[0-2])$/.test(months[0]);
+  const cumulative = mq.measures.some((m) => {
+    const c = m.periodType ? caliberOfName(m.periodType) : undefined;
+    return c && !c.calculator && (c.from === 'year_start' || c.from === 'since');
+  });
+  if (cumulative && !groupBy.includes('month') && !singleMonth) {
+    throw new QueryRefused('累计口径必须限定一个完整月份或按月份分组；不同期末快照不能相加。', 'CUMULATIVE_TIME_UNPINNED');
   }
 
   // 分组表达式：shift ≠ 0 时 month/year 的标签平移 -shift 年（落窗在去年，报的是今年）
@@ -305,7 +326,12 @@ export function compileMetrics(
     }
     const measureCol = fact?.measureColumn ?? 'amount';
     const valueExpr = ccySel ? `(f.${measureCol} * fx_s.rate / fx_u.rate)` : `f.${measureCol}`;
-    return `${agg}(CASE WHEN ${cond} THEN ${valueExpr} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}`;
+    const validFx = 'fx_s.rate_count = 1 AND fx_u.rate_count = 1 AND fx_s.rate > 0 AND fx_u.rate > 0 AND isfinite(fx_s.rate) AND isfinite(fx_u.rate)';
+    const value = ccySel ? `CASE WHEN ${validFx} THEN ${valueExpr} END` : valueExpr;
+    const missingFx = ccySel
+      ? `, sum(count(CASE WHEN (${cond}) AND NOT coalesce((${validFx}), false) THEN 1 END)) OVER () AS bad_fx${i}`
+      : '';
+    return `${agg}(CASE WHEN ${cond} THEN ${value} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}${missingFx}`;
   });
 
   // join（去重）
@@ -316,13 +342,15 @@ export function compileMetrics(
   }
   // 币种 selector 的取率 join（fx_rate 行唯一于 rate_month × ccy —— 模型声明里的承诺）
   if (ccySel) {
-    joins.add('JOIN dim_fx_rate fx_s ON fx_s.rate_month = f.fin_month AND fx_s.ccy = f.ccy');
-    joins.add(`JOIN dim_fx_rate fx_u ON fx_u.rate_month = f.fin_month AND fx_u.ccy = ${q(ccySel)}`);
+    // 先按业务键缩成一行，重复率键不能倍增事实行；计数在返回前拒绝。
+    const rates = '(SELECT rate_month, ccy, min(rate) AS rate, count(*) AS rate_count FROM dim_fx_rate GROUP BY rate_month, ccy)';
+    joins.add(`LEFT JOIN ${rates} fx_s ON fx_s.rate_month = f.fin_month AND fx_s.ccy = f.ccy`);
+    joins.add(`LEFT JOIN ${rates} fx_u ON fx_u.rate_month = f.fin_month AND fx_u.ccy = ${q(ccySel)}`);
   }
 
   // WHERE
   const where: string[] = [];
-  for (const [col, val] of Object.entries(mq.filter ?? {})) {
+  for (const [col, val] of Object.entries(filter)) {
     // 过滤的键是个「维度名.字段名」或裸字段名？统一按已注册维度处理：键必须是维度名
     if (!isRegisteredDim(col)) {
       throw new QueryRefused(`过滤字段未注册: ${col}（只允许 ${Object.keys(DIMENSIONS).join(' / ')}）`, 'UNKNOWN_FILTER');
@@ -373,7 +401,7 @@ export function compileMetrics(
     .filter(Boolean)
     .join('\n');
 
-  return { sql, columns };
+  return { sql, columns, appliedFilter: filter };
 }
 
 // ---------------- 脱敏（第④层） ----------------
@@ -408,9 +436,12 @@ export async function queryMetrics(
   facts?: DeclaredFact[],
 ): Promise<MetricsResult> {
   const limits = THRESHOLDS[mq.audience];
-  const { sql, columns } = compileMetrics(mq, facts);
+  const { sql, columns, appliedFilter } = compileMetrics(mq, facts);
 
   const raw = await run(sql);
+  if (raw.some((r) => columns.some((_, i) => Number(r[`bad_fx${i}`] ?? 0) > 0))) {
+    throw new QueryRefused('相关事实行缺少有效且唯一的源/目标币种汇率，拒绝返回部分换算结果。', 'FX_RATE_MISSING');
+  }
   const groupCount = (mq.groupBy ?? []).length;
 
   // 每个返回格的支撑事实行数（反推保护的真正依据，§6.2）
@@ -455,6 +486,7 @@ export async function queryMetrics(
     groups,
     meta: {
       audience: mq.audience,
+      appliedFilter,
       redaction: mq.audience === 'agent' ? 'banded' : 'none',
       rowCount: groups.length,
       cellCount,

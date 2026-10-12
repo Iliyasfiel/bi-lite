@@ -531,11 +531,27 @@ export function diagnoseModel(text: string, file: string): { table: IrTable | nu
     }
   }
 
+  let queryDefaults: Record<string, string> | undefined;
+  if (d.queryDefaults !== undefined) {
+    const qd = d.queryDefaults;
+    if (kind !== 'fact' || qd === null || typeof qd !== 'object' || Array.isArray(qd)) {
+      issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.queryDefaults`, 'queryDefaults 只允许事实表上的场景/币种成员映射'));
+    } else {
+      queryDefaults = {};
+      for (const [dim, member] of Object.entries(qd)) {
+        if (!['scenario', 'ccy'].includes(dim) || !columns.some((c) => c.name === dim && c.semantic === dim && ['pk', 'degenerate'].includes(c.role) && c.type === 'VARCHAR')
+            || typeof member !== 'string' || !member.trim()) {
+          issues.push(issue('error', 'MODEL_FIELD_BAD', `${file}.queryDefaults`, '默认值必须是该表场景/币种列的非空字符串成员'));
+        } else queryDefaults[dim] = member;
+      }
+    }
+  }
+
   if (issues.some((i) => i.level === 'error')) return { table: null, issues };
 
   const foreignKeys = columns.filter((c) => c.refs).map((c) => ({ column: c.name, refs: c.refs! }));
   return {
-    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys, rows, windowFrom, calibers },
+    table: { name, kind: kind as ModelKind, title, grain, columns, primaryKey, foreignKeys, rows, windowFrom, calibers, queryDefaults },
     issues,
   };
 }

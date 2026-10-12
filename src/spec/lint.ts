@@ -39,7 +39,7 @@ import { DIMENSIONS, DIM_NAMES, dimAvailableOn, isRegisteredDim, type DimName } 
 import { exprRefs, ExprError, parseExpr } from './expr.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { lintAnchorGeometry } from './geometry.ts';
-import type { DeclaredFact } from '../gen/ir.ts';
+import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
 
 export type LintLevel = 'error' | 'warn';
 
@@ -62,7 +62,9 @@ export interface LintIssue {
     | 'SHEET_NO_BLOCK'
     | 'NO_ID_OR_SHEET'
     | 'FACT_UNKNOWN'
-    | 'DIM_NOT_ON_FACT';
+    | 'DIM_NOT_ON_FACT'
+    | 'CUMULATIVE_TIME_UNPINNED'
+    | 'DIM_MIXED_AGGREGATION';
   /** 出问题的位置，人能直接对着 YAML 找（如 `sheets[0].blocks[1]`） */
   at: string;
   message: string;
@@ -279,6 +281,36 @@ function lintBlock(b: Block, at: string, out: LintIssue[], fact: DeclaredFact | 
     });
   }
 
+  // 累计快照不能跨终点聚合。静态参数占位符允许，编译期替换后再次走本判据。
+  const labels = b.cols?.dim === 'period_type' ? b.cols.order ?? [] : [];
+  const cumulative = labels.some((name) => {
+    const cal = fact?.calibers.find((c) => c.name === name);
+    return cal ? !cal.calculator && (cal.from === 'year_start' || cal.from === 'since')
+      : !fact && ['本年累计', '去年同期累计', '账面累计'].includes(name);
+  });
+  const symbolic = (v: unknown) => typeof v === 'string' && /^\{\{[a-zA-Z_][a-zA-Z0-9_]*\}\}$/.test(v);
+  const y = b.scope?.time?.year;
+  const m = b.scope?.time?.month;
+  const singlePeriod = (symbolic(y) || (y !== undefined && /^\d{4}$/.test(String(y))))
+    && (symbolic(m) || (m !== undefined && /^(0?[1-9]|1[0-2])$/.test(String(m))));
+  const monthAxis = b.rows?.dim === 'month' && !!b.rows.order?.length
+    && b.rows.order.every((x) => /^\d{4}-(0[1-9]|1[0-2])$/.test(x) || symbolic(x));
+  const shifted = labels.some((n) => (fact?.calibers.find((c) => c.name === n)?.shift ?? (n === '去年同期累计' ? -1 : 0)) !== 0);
+  if (cumulative && !singlePeriod && (!monthAxis || shifted)) {
+    out.push({ level: 'error', code: 'CUMULATIVE_TIME_UNPINNED', at,
+      message: '累计口径必须限定年/月或按完整月份分行，不同期末快照不能相加。',
+      hint: '在 scope.time 给出 year 和 month，或用 rows.dim: month 与 YYYY-MM 行标签。' });
+  }
+  for (const dim of ['scenario', 'ccy'] as const) {
+    if (!fact || !dimAvailableOn(dim, fact) || b.rows?.dim === dim || b.cols?.dim === dim) continue;
+    const selection = b.scope?.filter?.[dim]?.[dim];
+    const values = selection === undefined ? (fact.queryDefaults?.[dim] ? [fact.queryDefaults[dim]] : [])
+      : Array.isArray(selection) ? selection : [selection];
+    if (values.length !== 1) out.push({ level: 'error', code: 'DIM_MIXED_AGGREGATION', at,
+      message: `「${dim}」必须选择一个成员或作为轴，不同成员不能混加。`,
+      hint: `使用 scope.filter.${dim}.${dim} 指定一个成员，或把 ${dim} 做成行/列轴。` });
+  }
+
   // ---- value ----
   const v = b.value;
   if (!v || (!v.measure && !v.expr)) {
@@ -412,6 +444,7 @@ export function lintSpec(spec: Spec, opts: { facts?: DeclaredFact[] } = {}): Lin
       });
     }
   }
+  if (facts && !spec?.fact) fact = facts.find((f) => f.name === DEFAULT_TARGET) ?? null;
   const shapeKnown = !!facts && !factUnknown;
 
   if (!spec?.id) out.push({ level: 'error', code: 'NO_ID_OR_SHEET', at: 'id', message: '缺少 id。', hint: 'id 是保存时的文件名，也是报表的标识。' });
