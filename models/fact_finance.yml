@@ -9,6 +9,7 @@ grain: [fin_month, period_from, company_id, metric_id, scenario, ccy]
 # - 窗口平移（去年同期累计）：装载即落去年窗口（shift: -1），查询期标签 +1 年对齐 x 轴
 #   ——同一窗口不存两份（存两份必然在审计调整时漂移）；
 # - calculator（单月同比）：不落行，语义层算，缺去年行拒绝不静默。
+queryDefaults: { scenario: 实际, ccy: 人民币 }
 windowFrom: period_from
 calibers:
   - name: 单月

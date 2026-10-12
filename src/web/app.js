@@ -528,28 +528,32 @@ async function loadCatalog() {
   $('qPeriod').innerHTML = periods
     .map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
 
-  const years = [...new Set(CATALOG.periodTypes.length ? await fetchYears() : [])];
+  const months = CATALOG.periodTypes.length ? await fetchMonths() : [];
+  const years = [...new Set(months.map((m) => m.slice(0, 4)))].sort();
   $('qYear').innerHTML = `<option value="">全部</option>` +
     years.map((y) => `<option value="${y}">${y}</option>`).join('');
 
+  $('qMonth').innerHTML += Array.from({ length: 12 }, (_, i) => `<option value="${String(i + 1).padStart(2, '0')}">${i + 1} 月</option>`).join('');
+  const latest = [...months].sort().at(-1);
+  if (latest) { $('qYear').value = latest.slice(0, 4); $('qMonth').value = latest.slice(5); }
   // 默认选中常用项 —— 让用户一进来就能查到东西
   ['company'].forEach((v) => sel($('qGroup'), v));
   sel($('qMetric'), CATALOG.metrics[0]?.name);
   sel($('qPeriod'), periods[0]?.id);
 }
 
-async function fetchYears() {
+async function fetchMonths() {
   try {
     const r = await api('/api/query', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         measures: [{ metric: CATALOG.metrics[0]?.name ?? '', periodType: CATALOG.periodTypes[0]?.id ?? '' }],
-        groupBy: ['year'],
+        groupBy: ['month'],
       }),
     });
     return r.groups ? r.groups.map((g) => g.values[0]).filter(Boolean) : [];
-  } catch { return []; }
+  } catch (e) { console.error('查询月份目录失败', e); $('qYear').title = `月份目录未加载：${e.message}`; return []; }
 }
 
 const sel = (el, v) => { for (const o of el.options) if (o.value === v) o.selected = true; };
@@ -564,6 +568,8 @@ $('doQuery').addEventListener('click', async () => {
   const filter = {};
   if (vals($('qCompany')).length) filter.company = vals($('qCompany'));
   if ($('qYear').value) filter.year = $('qYear').value;
+  if ($('qMonth').value && $('qYear').value) filter.month = `${$('qYear').value}-${$('qMonth').value}`;
+  if ($('qMonth').value && !$('qYear').value) return alert('选择月份时请同时选择年份');
 
   const btn = $('doQuery');
   btn.disabled = true;
@@ -593,7 +599,8 @@ $('doQuery').addEventListener('click', async () => {
 function renderResult(res, groupBy) {
   $('resultCard').classList.remove('hidden');
   $('resultMeta').textContent =
-    `${res.meta.rowCount} 行 × ${res.columns.length} 列 · ${res.meta.rowCount * res.columns.length} 格`;
+    `${res.meta.rowCount} 行 × ${res.columns.length} 列 · ${res.meta.rowCount * res.columns.length} 格` +
+    Object.entries(res.meta.appliedFilter ?? {}).map(([dim, members]) => ` · ${dimLabel(dim)}：${Array.isArray(members) ? members.join('、') : members}`).join('');
 
   const head = [...groupBy.map((g) => dimLabel(g)), ...res.columns.map((c) => c.label)];
   const body = res.groups.map((g) => `<tr>
@@ -613,6 +620,8 @@ $('doChart').addEventListener('click', async () => {
   const filter = {};
   if (vals($('qCompany')).length) filter.company = vals($('qCompany'));
   if ($('qYear').value) filter.year = $('qYear').value;
+  if ($('qMonth').value && $('qYear').value) filter.month = `${$('qYear').value}-${$('qMonth').value}`;
+  if ($('qMonth').value && !$('qYear').value) return alert('选择月份时请同时选择年份');
 
   try {
     const res = await api('/api/chart', {

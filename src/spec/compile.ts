@@ -8,6 +8,7 @@ import type { Block, Spec, SheetSpec } from './types.ts';
 import { substitute } from './types.ts';
 import { DIMENSIONS, DIM_NAMES, dimAvailableOn, isRegisteredDim, type DimName } from './dims.ts';
 import { evalExpr, type ExprScope } from './expr.ts';
+import { lintSpec } from './lint.ts';
 import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
 
 // 白名单已抽到 ./dims.ts（lint.ts 与 grammar.ts 也要用，放在这里会成环）。
@@ -113,6 +114,10 @@ export function compileBlock(
       '口径轴只支持做列（cols.dim: period_type）—— 口径不落行，行轴没有可分组的行坐标（铁律 5）。',
     );
   }
+  const resolved = JSON.parse(JSON.stringify(block), (_, v) => typeof v === 'string' ? substitute(v, params) : v) as Block;
+  const issues = lintSpec({ id: 'compile', fact: fact?.name, sheets: [{ name: 'compile', blocks: [resolved] }] }, { facts: opts.facts })
+    .filter((i) => i.code === 'CUMULATIVE_TIME_UNPINNED' || i.code === 'DIM_MIXED_AGGREGATION');
+  if (issues.length) throw new Error(issues.map((i) => `${i.code}: ${i.message}`).join('；'));
   const agg = block.value.agg ?? 'sum';
   const measure = block.value.measure ?? fact?.measureColumn ?? 'amount';
 
@@ -205,6 +210,11 @@ export function compileBlock(
       }
     }
   };
+  for (const dim of ['scenario', 'ccy'] as const) {
+    if (rowsDim === dim || colsDim === dim || block.scope?.filter?.[dim] !== undefined) continue;
+    const member = fact?.queryDefaults?.[dim];
+    if (member !== undefined) addFilter(dim, { [dim]: member });
+  }
   addFilter(rowsDim, block.rows.filter);
   addFilter(colsDim, block.cols.filter);
   // 兼容文档 §5.2 的旧写法

@@ -55,6 +55,7 @@ export interface SemanticFact {
   windowFrom: string | null;
   /** 口径声明（铁律 5）。查询侧的口径白名单就是这份清单 */
   calibers: SemanticCaliber[];
+  queryDefaults: Record<string, string>;
   dimRefs: SemanticDimRef[];
   slicers: SemanticSlicer[];
   /** 派生谱系：聚合表的 source（声明的 fact）与 via（穿桥摊分）；事实表为 null */
@@ -78,6 +79,7 @@ function toSemanticFact(t: IrTable): SemanticFact {
     periodColumn: periodColumnOf(t.columns),
     windowFrom: t.windowFrom ?? null,
     calibers: (t.calibers ?? []).map((c) => ({ ...c })),
+    queryDefaults: { ...t.queryDefaults },
     dimRefs: t.columns
       .filter((c) => c.role === 'dim_fk' && c.refs)
       .map((c) => ({ column: c.name, refTable: c.refs!, semantic: c.semantic ?? null })),

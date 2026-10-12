@@ -424,6 +424,7 @@ sheets:
           agg: sum
           format: "#,##0"
         scope:
+          time: { year: 2026, month: 6 }
           filter: { metric: { name: 营业收入 } }
 `);
 const b2 = spec2.sheets[0].blocks[0];
@@ -444,13 +445,13 @@ const fp2 = await fingerprint(OUT2);
 check('第二张表同样零部件丢失', fp2.entries.length === fpBefore.entries.length);
 
 // ★ 真实断言（替代原来那句恒真的 check）：
-//   营业收入 × 集团公司 × 全年的「本年累计」之和，用独立 SQL 查出来比对，
+//   营业收入 × 集团公司 × 2026-06 的「本年累计」，用独立 SQL 查出来比对，
 //   而不是"跑出来多少就写多少"。
 const expectedMg = await db.query<{ v: string }>(`
   SELECT sum(f.amount) AS v FROM fact_finance f
   JOIN dim_company ON f.company_id = dim_company.id
   JOIN dim_metric ON f.metric_id = dim_metric.id
-  WHERE dim_company.name = '集团公司' AND dim_metric.name = '营业收入'
+  WHERE dim_company.name = '集团公司' AND dim_metric.name = '营业收入' AND f.fin_month = DATE '2026-06-01'
     AND f.period_from = date_trunc('year', f.fin_month)`);
 // 刀 23：本年累计 = 年首窗口（旧 period_type 列已退场）
 const mgRow = r2.matrix.find((m) => m.label === '集团公司');
@@ -518,10 +519,10 @@ check('human 不脱敏', qHuman.meta.redaction === 'none');
 check('按公司分组返回 4 组', qHuman.groups.length === 4, `${qHuman.groups.length}`);
 
 // agent 视角：同一查询 → 分档值 + 阈值
-// 注意：这里**不加 month 过滤** —— 一整年 12 个月的数据支撑每格，才过得了反推阈值。
+// 保留月份分组，按集团汇总四家公司支撑每格；累计快照不跨月相加。
 const qAgent = await queryMetrics({
   measures: [{ metric: '营业收入', periodType: '本年累计' }, { metric: '营业收入', periodType: '单月' }, { metric: '利润总额', periodType: '本年累计' }],
-  groupBy: ['company'],
+  groupBy: ['month'],
   audience: 'agent',
 }, undefined, declaredFactsOf());
 log(`  agent 视角: 脱敏=${qAgent.meta.redaction}，每格最少 ${qAgent.meta.minSupport} 行支撑，示例 [${qAgent.groups[0].cells.join(', ')}]`);
@@ -572,7 +573,7 @@ check('自由查询拒绝未注册口径', badPeriod);
 
 // SQL 注入：指标名里的单引号必须被双写转义
 const INJ = "营业收入'); DROP TABLE fact_finance;--";
-const inj = compileMetrics({ measures: [{ metric: INJ, periodType: '本年累计' }], audience: 'human' }, declaredFactsOf());
+const inj = compileMetrics({ measures: [{ metric: INJ, periodType: '本年累计' }], filter: { month: '2026-06' }, audience: 'human' }, declaredFactsOf());
 log('  注入输入的转义结果: ' + inj.sql.split('\n').find((l) => l.includes('营业收入'))?.trim().slice(0, 110));
 // 期望：每个单引号都被双写；不存在未转义的 `'); DROP`
 const unescaped = INJ.replace(/'/g, "''");
@@ -628,6 +629,7 @@ sheets:
         rows: { dim: metric, order: [营业收入] }
         cols: { dim: period_type, order: [本年累计] }
         value: { measure: amount, agg: sum }
+        scope: { time: { year: 2026, month: 6 } }
         chart: { type: bar, title: 测试 }
 `);
 check('spec 支持可选 chart 声明', specWithChart.sheets[0].blocks[0].chart?.type === 'bar');
@@ -667,7 +669,7 @@ check('目录不含任何金额字段', !/\d{4,}/.test(JSON.stringify(webCat.com
 const webQuery = await postJson('/api/query', {
   measures: [{ metric: '营业收入', periodType: '本年累计' }],
   groupBy: ['company'],
-  filter: { year: '2026' },
+  filter: { month: '2026-06' },
   audience: 'agent',                               // ← 故意写 agent，服务端应忽略
 });
 check('Web 查询固定 human 视角（请求里的 agent 被覆盖）',
@@ -692,7 +694,7 @@ check('HTTP 层拒绝未注册维度', webBadDim.refused === true && webBadDim.r
 
 // 图表：option 含数值、shape 不含
 const webChart = await postJson('/api/chart', {
-  query: { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'] },
+  query: { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], filter: { month: '2026-06' } },
   chart: { type: 'bar' },
 });
 check('图表 option 含数值且含 4 个类目', webChart.option.series[0].data.filter((v: any) => typeof v === 'number').length === 4);
@@ -1004,13 +1006,14 @@ sheets:
       - anchor: { name: DATA_START }
         rows: { dim: metric, order: [营业收入, 利润总额] }
         cols: { dim: period_type, order: [本年累计, 去年同期累计, 单月, 账面累计] }
-        value: { measure: amount, agg: sum }`;
+        value: { measure: amount, agg: sum }
+        scope: { time: { year: 2026, month: 6 } }`;
   const NEW = OLD.replace('dim: metric', 'dim: company')
     .replace('order: [营业收入, 利润总额]', 'order: [集团公司, 华东子公司]')
     .replace('order: [本年累计, 去年同期累计, 单月, 账面累计]', 'order: [本年累计, 单月]')
     .replace(
-      'value: { measure: amount, agg: sum }',
-      'value: { measure: amount, agg: sum }\n        scope: { filter: { metric: { name: 营业收入 } } }',
+      'scope: { time: { year: 2026, month: 6 } }',
+      'scope: { time: { year: 2026, month: 6 }, filter: { metric: { name: 营业收入 } } }',
     );
   const dr = await raw('diff_report', { before: OLD, after: NEW });
   check('diff_report 成功且识别出差异', !dr.isError && dr.json.changed === true, dr.text.slice(0, 200));
@@ -1368,8 +1371,9 @@ sheets:
   check('引用了 params 的 spec 正常通过', findUnusedParams(ok).length === 0);
 
   // 没有 params 的 spec 不该被这条规则波及
+  const { diagnoseSpec } = await import('../src/spec/types.ts');
   const NO_PARAMS = BUGGY.replace('params: { year: 2026, month: 6 }', '');
-  check('未声明 params 的 spec 不受影响', findUnusedParams(parseSpec(NO_PARAMS)).length === 0);
+  check('未声明 params 不会绕过累计期末约束', diagnoseSpec(NO_PARAMS).issues.some((i) => i.code === 'CUMULATIVE_TIME_UNPINNED'));
 
   // 发布出去的示例 spec 必须是好的
   const shipped = parseSpec(fs.readFileSync('specs/月度保送表.yaml', 'utf8'));
@@ -1377,7 +1381,6 @@ sheets:
 
   // ---------------- 15 阶段的前置：三个"静默算错"的回归防线 ----------------
   const { lintSpec, unpinnedMeaningDims } = await import('../src/spec/lint.ts');
-  const { diagnoseSpec } = await import('../src/spec/types.ts');
   const { compileBlock, runCompiled } = await import('../src/spec/compile.ts');
 
   // ★ bug A：block 没有任何指标约束 → 多个指标的金额被加成一格。
@@ -1437,13 +1440,14 @@ sheets:
   // 正例①：把指标做成轴 → 合法（集团合计的常用形状）
   const BY_METRIC = UNCONSTRAINED
     .replace('dim: company', 'dim: metric')
-    .replace('order: [华东子公司]', 'order: [营业收入, 利润总额]');
+    .replace('order: [华东子公司]', 'order: [营业收入, 利润总额]')
+    + '\n        scope: { time: { year: 2026, month: 6 } }';
   check('★ 指标做成轴 → 通过（不误伤合法形状）', !diagnoseSpec(BY_METRIC).willBeRejected);
 
   // 正例②：用 scope.filter 钉死单一指标 → 合法，且**数值必须真的只含那一个指标**
   const PINNED = UNCONSTRAINED.replace(
     'value: { measure: amount, agg: sum }',
-    'value: { measure: amount, agg: sum }\n        scope: { filter: { metric: { name: 利润总额 } } }',
+    'value: { measure: amount, agg: sum }\n        scope: { time: { year: 2026, month: 6 }, filter: { metric: { name: 利润总额 } } }',
   );
   check('★ 用 scope.filter 钉死指标 → 通过', !diagnoseSpec(PINNED).willBeRejected);
   {
@@ -1451,14 +1455,14 @@ sheets:
     const pres = await runCompiled(compileBlock(pb, {}, { facts: declaredFactsOf() }), (sql) => db.query(sql));
     const v = Number(pres.matrix[0].values[0]);
     // ★ 两个断言都来自独立事实，不写死"跑出来是多少"（那正是上一轮 bug 的教训）：
-    //   ① 真值 = 华东子公司 × 利润总额 × 本年累计 × 全部 12 个月
+    //   ① 真值 = 华东子公司 × 利润总额 × 本年累计 × 2026-06
     //   ② 反证 = 同公司同口径下**五个指标加总**，钉住后必须不等于它
     const q = async (extra: string) =>
       Number((await db.query<{ v: string }>(`
         SELECT sum(f.amount) AS v FROM fact_finance f
         JOIN dim_company ON f.company_id = dim_company.id
         JOIN dim_metric ON f.metric_id = dim_metric.id
-        WHERE dim_company.name = '华东子公司' AND f.period_from = date_trunc('year', f.fin_month)${extra}`))[0].v);
+        WHERE dim_company.name = '华东子公司' AND f.fin_month = DATE '2026-06-01' AND f.period_from = date_trunc('year', f.fin_month)${extra}`))[0].v);
     const want = await q(` AND dim_metric.name = '利润总额'`);
     const allMetrics = await q('');
     check(
@@ -2062,7 +2066,7 @@ log('\n════════ 21. CLI render / query（受众与物料隔离�
     `SELECT DISTINCT m.name FROM fact_finance f JOIN dim_metric m ON m.id = f.metric_id LIMIT 1`,
   ))[0]!.name;
   const cq = cap();
-  const code = await main(['query', '--measure', `${metricName}:本年累计`, '--by', 'company'], cq.io);
+  const code = await main(['query', '--measure', `${metricName}:本年累计`, '--by', 'company', '--filter', 'month=2026-06'], cq.io);
   const res = JSON.parse(cq.o.join('')) as { groups: Array<{ cells: Array<number | string | null> }>; meta: { audience: string; redaction: string } };
   const cells = res.groups.flatMap((g) => g.cells).filter((c) => c !== null);
   check('★ query 走 human 视角：精确值、不分档', res.meta.audience === 'human' && res.meta.redaction === 'none');
@@ -3430,7 +3434,7 @@ log('\n════════ 33. 维度版本行 SCD2（历史侧表 + 时点
     `${one.name}: valid_from=${String(firstVersion.valid_from)} ~ ${String(firstVersion.valid_to)}`);
 
   // —— ③ "零回归"的基线：改属性**之前**先把真实查询结果记下来 ——
-  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const } as never;
+  const probe = { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], filter: { month: '2026-06' }, audience: 'human' as const } as never;
   const probeFacts = declaredFactsOf();
   const runProbe = () => queryMetrics(probe, undefined, probeFacts);
   const before = JSON.stringify(await runProbe());
@@ -3647,7 +3651,7 @@ log('\n════════ 34. 聚合表 agg_*（kind: aggregate）══�
 
   // —— ⑨ 零回归 + 收尾 ——
   const probe = await queryMetrics(
-    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], filter: { month: '2026-06' }, audience: 'human' as const },
     undefined, declaredFactsOf());
   check('★ 零回归：聚合表在场，既有财务查询照常出数（聚合是新增的派生物，不是查询路径的一部分）',
     probe.groups.length > 0, `${probe.groups.length} 组`);
@@ -3866,7 +3870,7 @@ log('\n════════ 35. 桥接层 map_*（rows: 声明内嵌行 + vi
     deps35.map((d) => d.depends_on).join(',') === 'dim_business_line,dim_metric,fact_finance,map_org_bl',
     deps35.map((d) => d.depends_on).join(','));
   const probeQ = await queryMetrics(
-    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], filter: { month: '2026-06' }, audience: 'human' as const },
     undefined, declaredFactsOf());
   check('★ 零回归：桥接层在场，既有财务查询照常出数（map_* 是新增的派生物，不是查询路径的一部分）',
     probeQ.groups.length > 0, `${probeQ.groups.length} 组`);
@@ -3929,10 +3933,10 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
     mq36.measures.length === 1 && mq36.measures[0].metric === '营业收入' && mq36.measures[0].periodType === '单月'
       && mq36.groupBy.join(',') === 'company');
   const viaRewrite = await runSemanticQuery(
-    { metrics: ['营业收入'], caliber: '本年累计', by: ['company'], audience: 'human' as const }, run36, facts36);
+    { metrics: ['营业收入'], caliber: '本年累计', by: ['company'], filter: { month: '2026-06' }, audience: 'human' as const }, run36, facts36);
   const { queryMetrics } = await import('../src/semantic/query.ts');
   const byHand = await queryMetrics(
-    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], audience: 'human' as const },
+    { measures: [{ metric: '营业收入', periodType: '本年累计' }], groupBy: ['company'], filter: { month: '2026-06' }, audience: 'human' as const },
     run36, facts36);
   // 分组行序引擎从未承诺（GROUP BY ALL 无 ORDER BY，并行聚合顺序任意）——
   // 语义等价 = 同一组组、同一组值，比较前按组键排序，不把行序当语义。
@@ -3953,7 +3957,7 @@ log('\n════════ 36. 语义层自省 + 查询改写器 ═══�
 
   // —— ⑤ 受众分级穿透改写器 ——
   const agt36 = await runSemanticQuery(
-    { metrics: ['营业收入'], caliber: '本年累计', by: ['company'], audience: 'agent' as const }, run36, facts36);
+    { metrics: ['营业收入'], caliber: '本年累计', by: ['month'], audience: 'agent' as const }, run36, facts36);
   check('★ agent 受众穿透改写器仍分档（redaction=banded，分档值带亿/万/千）——铁律 10 不因新形状失效',
     agt36.meta.redaction === 'banded' && agt36.groups.some((g) => g.cells.some((c) => typeof c === 'string' && /[亿万千]/.test(c))));
 
@@ -4560,6 +4564,9 @@ sheets:
   check('② 探针列清掉后 plan 恢复干净（漂移门不留痕）',
     cleanAgain41.blocking.length === 0, `blocking=${cleanAgain41.blocking.length}`);
 }
+
+// ============ 42. 主链路报送正确性（独立合成内存库） ============
+await (await import('./report-correctness.ts')).reportCorrectnessChecks(check);
 
 // —— 文档里写的断言条数，必须与实际跑出来的一致 ——
 //   ★ 这一条把一条**人工纪律**变成断言："改了断言要同步条数"。
