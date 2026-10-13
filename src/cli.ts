@@ -97,11 +97,7 @@ function usage(message: string, hint: string | null = HINT): Invocation {
   return { kind: 'usage-error', message, hint };
 }
 
-/**
- * 把 argv 解析成一个 Invocation。**纯函数，没有任何副作用** ——
- * 不读文件、不碰库、不打印。于是 e2e 能在不启动任何东西的前提下覆盖整个命令面
- * （`--help` / 退出码 / 参数校验），见 `test/e2e.ts` 第 16 阶段。
- */
+/** 将 argv 解析为 Invocation，不读文件、不启动数据库。 */
 export function parseCliArgs(argv: readonly string[]): Invocation {
   const tokens = [...argv];
   const first = tokens[0];

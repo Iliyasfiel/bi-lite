@@ -1,6 +1,6 @@
 
 id: 月度经营接入
-source: data/月度经营接入源.xlsx
+source: test/fixtures/月度经营接入源.xlsx
 onConflict: reject
 unknownMaster: create
 onEmptyMeasure: skip
@@ -14,15 +14,14 @@ sheets:
           - col: C
             dim: metric
         values:
-          columns: [D, E, F]
+          columns: [D, E, F, G, H]
           skip:
             - columns: [F]
               why: 同比% 是派生列
-          periodTypes: [本年累计, 单月]
+          periodTypes: [本年累计, 单月, 去年同期累计, 账面累计]
         keys:
           - col: B
             as: period
-          # 正交维度（刀 22）：真实月报源没有场景/币种列 —— 整批常量绑定
           - as: scenario
             value: 实际
           - as: ccy
