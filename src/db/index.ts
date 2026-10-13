@@ -15,15 +15,7 @@ let writeConn: DuckDBConnection | null = null;
 let readConn: DuckDBConnection | null = null;
 let openedPath: string | null = null;
 
-/**
- * 打开（或创建）库文件。
- *
- * ★ 路径可被环境变量 `BILITE_DB` 覆盖。为什么需要它：DuckDB 是**单写者**模型
- *   （见 AGENTS.md §4 备忘 5），而 e2e 要一边握着主库、一边起一个**真实的 MCP 子进程**
- *   去跑工具 —— 一个进程一个库是这套设计的硬约束，所以子进程得跑在**库的副本**上
- *   （`test/e2e.ts` 第 13 阶段就是这么做的）。没有这个口子，测试只能违反单写者约束，
- *   而那会把归档写成空文件（§4 备忘 13 的判例）。
- */
+/** 打开或创建数据库；BILITE_DB 可覆盖路径，遵循 DuckDB 单写者约束。 */
 export async function open(
   dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb',
   opts: { models?: 'ensure' | 'skip' } = {},

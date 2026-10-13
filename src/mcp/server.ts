@@ -1,20 +1,8 @@
 /**
- * MCP stdio 服务端（docs/需求与架构.md §7）
- *
- * ★ 为什么手写而不用官方 SDK（实测决策，见 §3）：
- *   官方 `@modelcontextprotocol/server@2.1.0` 只拉 2 个包，但共 **16MB**（zod 占 8MB）。
- *   而本协议面极小 —— 实测握手序列只有四个方法：
- *     initialize → notifications/initialized → tools/list → tools/call
- *   本项目已有「手写零框架 HTTP 层」的先例（src/server.ts），零依赖是既定纪律。
- *   漂移风险用 e2e 实测对冲：e2e 第 13 阶段用 DSH 自带的真实 MCP 客户端连本服务。
- *
- * ★ 两个必须记住的协议细节（DSH 客户端用 versionNegotiation: {mode:'auto'}）：
- *   ① `server/discover` **必须回一个 JSON-RPC 错误**才能触发 legacy 回落 ——
- *      沉默不答会让探测窗口超时，而不是回落。这里回 -32601 Method not found。
- *   ② `initialize` 要回客户端请求的版本（若在已知列表内），否则回自己的最新版。
- *
- * ★ 分帧：换行分隔的 JSON-RPC 2.0（`JSON.stringify(msg) + "\n"`）。
- *   stdout 是协议通道 —— **任何 console.log 都会破坏协议**，日志一律走 stderr。
+ * MCP stdio 服务端（docs/需求与架构.md §7）。
+ * 换行分隔的 JSON-RPC 2.0，支持 initialize、tools/list、tools/call。
+ * server/discover 返回 Method not found；initialize 协商已支持版本。
+ * stdout 仅传协议，日志写 stderr。
  */
 import * as db from '../db/index.ts';
 import { TOOLS, toolListPayload, callTool } from './tools.ts';
