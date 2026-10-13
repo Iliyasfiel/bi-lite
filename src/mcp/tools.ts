@@ -118,7 +118,7 @@ function resolveAnchor(
 }
 
 /** 2. get_template_schema —— 模板结构：锚点、表头、行标签、合并区（只回文本） */
-async function getTemplateSchema(args: { template?: string }) {
+export async function getTemplateSchema(args: { template?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
   const schema = await readTemplateSchema(tpl);
@@ -203,7 +203,7 @@ async function lintSpecTool(args: { spec?: string; specFile?: string }) {
  * ★ 关键性质：**本函数不查数据库**。坐标完全由 spec + 模板锚点推出，
  *   所以"预览不含金额"不是靠过滤保证的，是结构上不可能。
  */
-async function previewSpec(args: { spec?: string; specFile?: string; params?: Record<string, string | number> }) {
+export async function previewSpec(args: { spec?: string; specFile?: string; params?: Record<string, string | number> }) {
   const { spec, from } = loadSpec(args);
   const p = { ...(spec.params ?? {}), ...(args.params ?? {}) };
 
@@ -371,7 +371,7 @@ function diffObjects(before: unknown, after: unknown, at = ''): Change[] {
   return out;
 }
 
-async function diffReport(args: { before?: string; after?: string; beforeFile?: string; afterFile?: string }) {
+export async function diffReport(args: { before?: string; after?: string; beforeFile?: string; afterFile?: string }) {
   const b = loadSpec({ spec: args.before, specFile: args.beforeFile });
   const a = loadSpec({ spec: args.after, specFile: args.afterFile });
   const changes = diffObjects(b.spec, a.spec);
@@ -407,7 +407,8 @@ async function diffReport(args: { before?: string; after?: string; beforeFile?: 
   };
 }
 
-/** 6. generate_spec —— 从模板推断 spec 草稿（§7.2 路径 1） */async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
+/** 6. generate_spec —— 从模板推断 spec 草稿（§7.2 路径 1） */
+export async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
 
@@ -496,11 +497,21 @@ function loadIngestSpecText(args: { spec?: string; specFile?: string }): { text:
  * 安全不变量（铁律 1）：数字格**只报"这里是个数"**，永不回传数值本身。
  *   所以这个工具既能看见形状，又结构上不可能把数带出去。
  */
-async function lookAtSource(args: { source?: string; sheet?: string; range?: string; maxRows?: number; maxCols?: number }) {
+export async function lookAtSource(args: { source?: string; sheet?: string; range?: string; maxRows?: number; maxCols?: number }) {
   if (!args.source) throw new Error('需要 source（源 Excel 路径，相对仓库根）');
   const resolved = resolveSource(args.source);
   if (!fs.existsSync(resolved)) throw new Error(`源文件不存在: ${args.source}`);
-  const wb = await XLSXPopulate.fromFileAsync(resolved);
+  let wb: Workbook;
+  try {
+    wb = await XLSXPopulate.fromFileAsync(resolved);
+  } catch (e: unknown) {
+    if ((e as Error).message?.includes('attributes')) {
+      throw new Error(
+        `无法读取源文件 ${args.source}：styles.xml 使用了 xlsx-populate 不支持的命名空间。请用 Excel 另存为标准 .xlsx 后重试。`,
+      );
+    }
+    throw e;
+  }
   const names = wb.sheets().map((sh) => sh.name());
   const sheetName = args.sheet ?? names[0];
   const sheet = wb.sheet(sheetName);

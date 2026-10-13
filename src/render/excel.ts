@@ -70,9 +70,10 @@ export function toRef(row: number, col: number): string {
 export function readNumberFormat(wb: Workbook, cell: Cell): string {
   const styleId = (cell as unknown as { _styleId?: number })._styleId;
   if (styleId === undefined || styleId === null) return 'General';
-  const ss = wb.styleSheet();
-  const node = (ss as unknown as { _cellXfsNode?: { children: Array<{ attributes: Record<string, string> }> } })
-    ._cellXfsNode?.children?.[styleId];
+  const ss = wb.styleSheet() as unknown as {
+    _cellXfsNode?: { children: Array<{ attributes?: Record<string, string> }> } | undefined;
+  };
+  const node = ss._cellXfsNode?.children?.[styleId];
   if (!node) return 'General';
   const numFmtId = Number(node.attributes?.numFmtId ?? 0);
   if (!numFmtId) return 'General';
