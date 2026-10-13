@@ -20,23 +20,6 @@ npm start --cache /tmp/bi-lite-npm-cache
 保存到 `ingest/` 只保存规格；点击执行导入或运行 CLI 接入命令才会进库。
 出表流程：选空白模板 → 编写或生成报表 YAML → 预览 → 导出。
 
-## 工作区结构
-
-| 目录 | 用途 |
-|---|---|
-| `src/ingest/`、`src/land/` | 源文件着陆、接入与重放 |
-| `src/spec/`、`src/semantic/` | 规格解析、查询编译与语义计算 |
-| `src/render/` | Excel 模板填充与图表渲染 |
-| `src/gen/`、`src/db/`、`src/meta/` | YAML 模型生成、数据库与元数据 |
-| `src/web/`、`src/server.ts` | 本地 Web 界面与 HTTP 入口 |
-| `src/cli.ts`、`src/mcp/` | CLI 与 agent 入口 |
-| `models/` | 表结构、维度、窗口口径、聚合与桥接声明 |
-| `ingest/`、`specs/`、`templates/` | 接入规格、报表规格、空白模板 |
-| `skills/bi-lite-ingest/` | agent 操作手册与 MCP 配置 |
-| `docs/` | 架构与功能状态 |
-| `test/` | 主链路验收、假数据生成器 |
-| `data/`、`output/` | 本地数据与输出，不进版本库 |
-
 ## 主要功能
 
 - 接入长表、宽表和网格 Excel，按规格映射主体、期数、指标与度量。
@@ -46,8 +29,37 @@ npm start --cache /tmp/bi-lite-npm-cache
 - 模板生成报表规格草稿、规格预览、Excel 导出，保留原模板格式与公式。
 - Web、CLI、MCP 共用引擎。agent 产出规格，工具只返回结构与执行结果描述。
 
-CLI 帮助：`node src/cli.ts --help`。
 Web、CLI、MCP 应轮流使用同一数据库；Web 默认只监听本机。
+
+## CLI 使用
+
+在仓库根目录运行 `node src/cli.ts <命令>`，用 `--help` 查看参数。
+CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 stdout，日志写到 stderr。
+
+| 命令 | 功能 |
+|---|---|
+| `ingest lint / dry-run / run` | 校验接入规格、试运行、执行导入 |
+| `validate` | 校验接入或报表 YAML |
+| `render` | 按报表规格填充模板，输出 Excel；只返回路径与状态 |
+| `query` | 按指标、口径与范围查询精确值，供人使用 |
+| `catalog dump / show` | 查看业务成员与模型结构 |
+| `agent look / template` | 查看源或模板结构，数字格只返回类型标记 |
+| `agent generate / preview / diff` | 推断报表草稿、预览坐标、比较规格差异 |
+| `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
+| `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
+
+导入并出表的示例：
+
+```bash
+node src/cli.ts ingest lint ingest/月度经营接入.yaml
+node src/cli.ts ingest dry-run ingest/月度经营接入.yaml
+node src/cli.ts ingest run ingest/月度经营接入.yaml
+node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
+```
+
+执行导入前确认试运行中的主数据待办；示例需先运行 `npm run fixtures`。
+报表写到 `output/`。agent 使用结构与状态命令，不使用返回精确金额的 `query`。
+当前 `agent preview` 支持坐标锚点；定义名称锚点可在 Web 或 MCP 中预览。
 
 ## Agent 接入配置
 
@@ -64,7 +76,8 @@ ln -s ../../skills/bi-lite-ingest .agents/skills/bi-lite-ingest
 在本项目中打开对话，输入 `$bi-lite-ingest`，或明确要求“使用 bi-lite-ingest 接入这个 Excel”。
 如果尚未显示，重新打开客户端。其他 agent 按其 skill 目录约定安装同一份手册。
 
-**当前 skill 使用 MCP 工具，需要同时完成下方 MCP 配置；单独安装 skill 不会提供执行能力。**
+现有 skill 手册按 MCP 工具流程编写，按该流程使用时需配置 MCP。
+本地 agent 也可调用上述 CLI 命令，无需启动 MCP 服务；skill 本身只提供操作说明。
 手册在 `skills/bi-lite-ingest/SKILL.md`，可粘贴提示在同目录的 `AGENT-PROMPT.md`。
 
 ### 配置 MCP（以 Codex 为例）
@@ -100,26 +113,14 @@ cwd = "/绝对路径/bi-lite"
 Codex 的 skill 发现与 MCP 配置格式分别参考官方 [Skills](https://developers.openai.com/codex/skills)
 和 [MCP](https://developers.openai.com/codex/mcp) 文档。
 
-### skill + CLI 与 MCP 的定位
+### 选择接入方式
 
-第二版建议以 **skill + agent 专用 CLI** 作为本地 agent 的主入口：
-skill 描述流程，短命 CLI 执行确定性操作；MCP 保留为工具客户端的可选适配层。
-两种入口共用引擎与操作实现，不发展两套业务功能。
+本地 agent 可用 skill 配合 CLI 完成结构查看、规格编写、导入与报表生成。
+MCP 用于客户端的工具调用接入，现有配置继续可用。
+两种入口共用引擎；数据访问权限由宿主控制。
 
-当前 CLI 面向人与脚本，`query` 返回精确值，不应直接提供给业务 agent。
-MCP 已有源结构读取、模板推断、坐标预览等操作，CLI 尚未完整对应这些能力。
-因此现阶段使用 **skill + MCP**；切换前应补齐 agent CLI，复用现有工具调用与无金额返回逻辑。
-skill 是操作说明，数据访问权限仍需由宿主限制；换成 MCP 也不会限制 agent 已拥有的 shell 或文件权限。
-
-## 开发与验收
-
-```bash
-npm run e2e --cache /tmp/bi-lite-npm-cache
-```
-
-少量验收覆盖模型启动、试运行、导入/重放、查询口径、模板导出与入口边界。
-测试在临时工作区生成假数据，结束后清理，不修改当前项目数据库。
-每次开发仅验证关键节点，具体约定见 [AGENTS.md](AGENTS.md)。
+## 项目状态
 
 第一版主链路已完成。第二版优先做 YAML 指标定义、接入单位/符号转换与模板复用。
 设计见 [需求与架构](docs/需求与架构.md)，状态见 [开发计划](docs/开发计划.md)。
+开发工作区与测试约定见 [AGENTS.md](AGENTS.md)。

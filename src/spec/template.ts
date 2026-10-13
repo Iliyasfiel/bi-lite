@@ -114,7 +114,18 @@ function parseRefersTo(refersTo: string): { sheet: string; row: number; col: num
 
 /** 模板全景：sheet / 合并区 / 定义名称锚点及其上方表头、左方行标签 */
 export async function readTemplateSchema(template: string): Promise<TemplateSchema> {
-  const wb = await XLSXPopulate.fromFileAsync(template);
+  let wb: Workbook;
+  try {
+    wb = await XLSXPopulate.fromFileAsync(template);
+  } catch (e: unknown) {
+    if ((e as Error).message?.includes('attributes')) {
+      throw new Error(
+        `无法读取模板 ${template}：styles.xml 使用了 xlsx-populate 不支持的命名空间。` +
+          `请用 Excel 打开并另存为标准 .xlsx 后重试。`,
+      );
+    }
+    throw e;
+  }
 
   const sheets = wb.sheets().map((s) => {
     const ur = s.usedRange();
@@ -431,7 +442,13 @@ export async function usesDate1904(absPath: string): Promise<boolean> {
 export async function openTemplate(template: string): Promise<Workbook> {
   try {
     return await XLSXPopulate.fromFileAsync(template);
-  } catch (e) {
+  } catch (e: unknown) {
+    if ((e as Error).message?.includes("attributes")) {
+      throw new Error(
+        `无法读取模板 ${template}：styles.xml 使用了 xlsx-populate 不支持的命名空间。` +
+          `请用 Excel 打开并另存为标准 .xlsx 后重试。`,
+      );
+    }
     // 底层是 jszip，非 .xlsx 时会抛出 "Can't find end of central directory" 这类
     // 对用户毫无意义的报错。这里翻译成能指导行动的说明。
     const raw = (e as Error).message;

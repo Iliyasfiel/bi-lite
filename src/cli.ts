@@ -30,6 +30,10 @@ import fs from 'node:fs';
 //    所以 "help / lint 不加载 xlsx-populate" 这条性质不受影响。
 import type { RenderBlock } from './render/excel.ts';
 import { looksLikeIngestDoc } from './spec/geometry.ts';
+import { compileBlock, planOf } from './spec/compile.ts';
+import { parseSpec, expandBlock, substitute } from './spec/types.ts';
+import { declaredFactsOf } from './gen/parse.ts';
+import type { Spec } from './spec/types.ts';
 
 // ---------------- IO（可注入，便于 e2e 在进程内跑而不杀测试进程） ----------------
 
@@ -85,6 +89,11 @@ export type Invocation =
   | { kind: 'rebuild'; modelsDir: string | null }
   | { kind: 'validate'; specFile: string }
   | { kind: 'replay'; specFile: string; source: string | null }
+  | { kind: 'source-look'; source: string; sheet: string | null; range: string | null; maxRows: number | null; maxCols: number | null }
+  | { kind: 'template-schema'; template: string | null }
+  | { kind: 'generate-spec'; template: string | null; sheets: string[]; id: string | null; title: string | null }
+  | { kind: 'preview-spec'; specFile: string; params: Record<string, string> }
+  | { kind: 'diff-spec'; beforeFile: string; afterFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
@@ -97,6 +106,66 @@ function usage(message: string, hint: string | null = HINT): Invocation {
   return { kind: 'usage-error', message, hint };
 }
 
+function parseAgentArgs(tokens: readonly string[]): Invocation {
+  const sub = tokens[0];
+  if (sub === undefined || HELP_FLAGS.has(sub)) return { kind: 'help', command: 'agent' };
+  if (!['look', 'template', 'generate', 'preview', 'diff'].includes(sub)) {
+    return usage(`agent 没有子命令「${sub}」`, 'bilite agent --help');
+  }
+
+  const hint = `bilite agent ${sub} --help`;
+  const rest = tokens.slice(1);
+  if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: `agent ${sub}` };
+
+  if (sub === 'look') {
+    const args = scanArgs(rest, ['--sheet', '--range', '--max-rows', '--max-cols'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const source = onePositional(args, '源 Excel 路径', hint);
+    if (typeof source !== 'string') return source;
+    const int = (flag: string): number | null | Invocation => {
+      const raw = args.values[flag]?.[0];
+      if (raw === undefined) return null;
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) return usage(`${flag} 要写成 ≥ 1 的整数（收到 ${raw}）`, hint);
+      return n;
+    };
+    const maxRows = int('--max-rows');
+    if (maxRows !== null && typeof maxRows === 'object') return maxRows;
+    const maxCols = int('--max-cols');
+    if (maxCols !== null && typeof maxCols === 'object') return maxCols;
+    return { kind: 'source-look', source, sheet: args.values['--sheet']?.[0] ?? null, range: args.values['--range']?.[0] ?? null, maxRows, maxCols };
+  }
+
+  if (sub === 'template') {
+    const args = scanArgs(rest, ['--template'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    if (args.positionals.length > 0) return usage(`template 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+    return { kind: 'template-schema', template: args.values['--template']?.[0] ?? null };
+  }
+
+  if (sub === 'generate') {
+    const args = scanArgs(rest, ['--template', '--id', '--title', '--sheet'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    if (args.positionals.length > 0) return usage(`generate 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+    return { kind: 'generate-spec', template: args.values['--template']?.[0] ?? null, sheets: args.values['--sheet'] ?? [], id: args.values['--id']?.[0] ?? null, title: args.values['--title']?.[0] ?? null };
+  }
+
+  if (sub === 'preview') {
+    const args = scanArgs(rest, ['--param'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const specFile = onePositional(args, '报表规格文件', hint);
+    if (typeof specFile !== 'string') return specFile;
+    const params = keyValues(args.values['--param'] ?? [], '--param', hint);
+    if ('kind' in params) return params;
+    return { kind: 'preview-spec', specFile, params };
+  }
+
+  const args = scanArgs(rest, [], [], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length !== 2) return usage('diff 需要两个报表规格文件', hint);
+  return { kind: 'diff-spec', beforeFile: args.positionals[0]!, afterFile: args.positionals[1]! };
+}
+
 /** 将 argv 解析为 Invocation，不读文件、不启动数据库。 */
 export function parseCliArgs(argv: readonly string[]): Invocation {
   const tokens = [...argv];
@@ -105,6 +174,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (VERSION_FLAGS.has(first) || first === 'version') return { kind: 'version' };
   if (HELP_FLAGS.has(first)) return { kind: 'help', command: null };
   if (first === 'help') return { kind: 'help', command: tokens[1] ?? null };
+  if (first === 'agent') return parseAgentArgs(tokens.slice(1));
   if (first === 'ingest') return parseIngestArgs(tokens.slice(1));
   if (first === 'render') return parseRenderArgs(tokens.slice(1));
   if (first === 'query') return parseQueryArgs(tokens.slice(1));
@@ -477,6 +547,11 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'rebuild',
   'replay',
   'validate',
+  'source-look',
+  'template-schema',
+  'generate-spec',
+  'preview-spec',
+  'diff-spec',
   'skill-export',
 ];
 
@@ -501,6 +576,40 @@ function readSpecFile(specFile: string): string {
 
 function jsonTo(io: CliIO, value: unknown): void {
   io.out(JSON.stringify(value, null, 2) + '\n');
+}
+
+function previewPlan(spec: Spec, params: Record<string, string | number>) {
+  const facts = declaredFactsOf();
+  const factName = spec.fact?.trim() ? spec.fact : undefined;
+  const fact = facts.find((f) => f.name === (factName ?? 'fact_finance'));
+  if (factName && !fact) throw new Error(`目标表未声明: ${factName}`);
+  const results = spec.sheets.map((sheet) => {
+    const blocks = sheet.blocks.map((raw) => {
+      const block = JSON.parse(JSON.stringify(raw), (_, value) => typeof value === 'string' ? substitute(value, params) : value) as Block;
+      if (typeof block.anchor === 'object' && 'name' in block.anchor) {
+        throw new Error(`预览需要 --anchor-row/--anchor-col 或坐标锚点：定义名称 ${block.anchor.name} 无法在 CLI 中解析`);
+      }
+      const { row, col } = (() => { const m = /^([A-Z]+)([1-9][0-9]*)$/i.exec(block.anchor); if (!m) throw new Error(`非法锚点: ${block.anchor}`); let c = 0; for (const ch of m[1]!.toUpperCase()) c = c * 26 + (ch.charCodeAt(0) - 64); return { row: Number(m[2]), col: c }; })();
+      void row;
+      void col;
+      const expanded = expandBlock(block, params);
+      return { sheet: sheet.name, anchor: block.anchor, rowLabels: expanded.rowLabels, colLabels: expanded.colLabels };
+    })
+    return blocks;
+  }).flat();
+  const plan = planOf(spec, results);
+  return { spec: { id: spec.id, title: spec.title ?? null, template: spec.template ?? null }, params, plan, note: '预览只含坐标与形状，不含任何金额（本命令不查数据库）' };
+}
+
+async function agentOutput(io: CliIO, value: unknown): Promise<number> {
+  const { findAmountLike } = await import('./mcp/tools.ts');
+  const hits = findAmountLike(value);
+  if (hits.length) {
+    io.err(`bilite agent: 返回值包含疑似金额，已拦截（${hits.length} 处）\n`);
+    return EXIT.FAILED;
+  }
+  jsonTo(io, value);
+  return EXIT.OK;
 }
 
 export const COMMANDS: CliCommand[] = [
@@ -1027,6 +1136,62 @@ export const COMMANDS: CliCommand[] = [
     },
   },
   {
+    invocation: 'source-look',
+    name: 'agent look',
+    summary: '查看源 Excel 文本结构；数字格只标记，不返回值',
+    usage: 'bilite agent look <源.xlsx> [--sheet 名称] [--range A1:L40] [--max-rows 60] [--max-cols 30]',
+    async run(inv, io) {
+      if (inv.kind !== 'source-look') throw new Error('命令表与 Invocation 不匹配');
+      const { lookAtSource } = await import('./mcp/tools.ts');
+      return agentOutput(io, await lookAtSource({ source: inv.source, sheet: inv.sheet ?? undefined, range: inv.range ?? undefined, maxRows: inv.maxRows ?? undefined, maxCols: inv.maxCols ?? undefined }));
+    },
+  },
+  {
+    invocation: 'template-schema',
+    name: 'agent template',
+    summary: '读取模板结构：锚点、表头与行标签；不返回数字',
+    usage: 'bilite agent template [--template 模板.xlsx]',
+    async run(inv, io) {
+      if (inv.kind !== 'template-schema') throw new Error('命令表与 Invocation 不匹配');
+      const { getTemplateSchema } = await import('./mcp/tools.ts');
+      return agentOutput(io, await getTemplateSchema({ template: inv.template ?? undefined }));
+    },
+  },
+  {
+    invocation: 'generate-spec',
+    name: 'agent generate',
+    summary: '从模板推断报表规格草稿；推断结果需要人工确认',
+    usage: 'bilite agent generate [--template 模板.xlsx] [--sheet 名称]... [--id ID] [--title 标题]',
+    async run(inv, io) {
+      if (inv.kind !== 'generate-spec') throw new Error('命令表与 Invocation 不匹配');
+      const { generateSpec, guessedAxes } = await import('./mcp/tools.ts');
+      const result = await generateSpec({ template: inv.template ?? undefined, sheets: inv.sheets.length ? inv.sheets : undefined, id: inv.id ?? undefined, title: inv.title ?? undefined });
+      const output = { ...result, guessedAxes: guessedAxes(result), note: '草稿是提案；guessedAxes 与 unmatched 需人工确认后再渲染' };
+      return agentOutput(io, output);
+    },
+  },
+  {
+    invocation: 'preview-spec',
+    name: 'agent preview',
+    summary: '预览报表规格填充坐标；不查库、不返回金额',
+    usage: 'bilite agent preview <规格.yaml> [--param k=v]...',
+    async run(inv, io) {
+      if (inv.kind !== 'preview-spec') throw new Error('命令表与 Invocation 不匹配');
+      return agentOutput(io, previewPlan(parseSpec(fs.readFileSync(inv.specFile, 'utf8'), { facts: declaredFactsOf() }), inv.params));
+    },
+  },
+  {
+    invocation: 'diff-spec',
+    name: 'agent diff',
+    summary: '比较两版报表规格；只比较文本结构',
+    usage: 'bilite agent diff <旧规格.yaml> <新规格.yaml>',
+    async run(inv, io) {
+      if (inv.kind !== 'diff-spec') throw new Error('命令表与 Invocation 不匹配');
+      const { diffReport } = await import('./mcp/tools.ts');
+      return agentOutput(io, await diffReport({ beforeFile: inv.beforeFile, afterFile: inv.afterFile }));
+    },
+  },
+  {
     invocation: 'skill-export',
     name: 'skill export',
     summary: '把手册里**可对拍**的事实从实现投影出来（工具面 + 注册表；缺口写在导出物里）',
@@ -1101,7 +1266,7 @@ function readVersion(io: CliIO): string {
 
 /** 有专门帮助页的主题：总览(null)、每个命令名、以及 "ingest" 这个分组 */
 function isKnownHelpTopic(command: string): boolean {
-  return command === 'ingest' || COMMANDS.some((c) => c.name === command);
+  return command === 'ingest' || command === 'agent' || COMMANDS.some((c) => c.name === command);
 }
 
 function helpText(io: CliIO, command: string | null): string {
@@ -1141,6 +1306,19 @@ function helpText(io: CliIO, command: string | null): string {
         '  导出物里会显式列出这个缺口 —— 别把这份导出当成完整手册。',
       ].join('\n') + '\n'
     );
+  }
+  if (command === 'agent') {
+    return [
+      '用法： bilite agent <子命令>',
+      '',
+      '子命令：',
+      ...COMMANDS.filter((c) => c.name.startsWith('agent ')).map(
+        (c) => `  ${c.name.slice('agent '.length).padEnd(10)} ${c.summary}`,
+      ),
+      '',
+      '这些命令是 agent 专用入口：只返回结构、坐标与状态，不返回金额。',
+      '接入执行仍用 ingest；渲染仍用 render。',
+    ].join('\n') + '\n';
   }
   if (command === 'catalog') {
     return (

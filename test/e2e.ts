@@ -153,6 +153,12 @@ async function verify() {
     const toolRender = await callTool('render_report', { specFile, output: 'output/mcp.xlsx' });
     assert.equal(toolRender.ok, true);
     assert.deepEqual(findAmountLike(JSON.parse(toolRender.text)), []);
+    const { main } = await import('../src/cli.ts');
+    const cliIO = { out: () => {}, err: (message: string) => { if (message.includes('failed')) throw new Error(message); } };
+    assert.equal(await main(['agent', 'look', ingest.source], cliIO), 0);
+    assert.equal(await main(['agent', 'template', '--template', 'test/fixtures/月度保送表.xlsx'], cliIO), 0);
+    assert.equal(await main(['agent', 'preview', specFile], cliIO), 0);
+    assert.equal(await main(['agent', 'diff', specFile, specFile], cliIO), 0);
     for (const file of ['SKILL.md', 'AGENT-PROMPT.md']) {
       assert.deepEqual(skillProblems(fs.readFileSync(`skills/bi-lite-ingest/${file}`, 'utf8'), TOOLS.map((tool) => tool.name)), []);
     }
