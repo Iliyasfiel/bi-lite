@@ -30,10 +30,9 @@ import fs from 'node:fs';
 //    所以 "help / lint 不加载 xlsx-populate" 这条性质不受影响。
 import type { RenderBlock } from './render/excel.ts';
 import { looksLikeIngestDoc } from './spec/geometry.ts';
-import { compileBlock, planOf } from './spec/compile.ts';
-import { parseSpec, expandBlock, substitute } from './spec/types.ts';
+import { compileBlock } from './spec/compile.ts';
+import { parseSpec } from './spec/types.ts';
 import { declaredFactsOf } from './gen/parse.ts';
-import type { Spec } from './spec/types.ts';
 
 // ---------------- IO（可注入，便于 e2e 在进程内跑而不杀测试进程） ----------------
 
@@ -402,7 +401,7 @@ function parseGenArgs(cmd: 'plan' | 'apply' | 'rebuild', tokens: readonly string
 /**
  * `validate <yaml>` —— §8.2 的第 ④ 条接口：**可执行、带修复建议**的校验。
  *
- * ★ 它**不写新判据**。判据仍是那两份（接入规格 `diagnoseIngest` / 报表规格 `diagnoseSpec`），
+ * 判据复用指标定义加载器、接入规格 `diagnoseIngest` 与报表规格 `diagnoseSpec`，
  *   这里只做一件它们没做的事：**判别该用哪一份** —— 按**模板几何**判
  *   （`looksLikeIngestDoc`：接入块的 rows 是「列 → 维」数组，报表块是带 dim 的轴对象）。
  *   不再按"有没有 source"判 —— source 已经是执行参数，没有 source 的接入规格是合法的。
@@ -412,10 +411,10 @@ function parseValidateArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite validate --help';
   if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'validate' };
   // 裸跑 `validate` 退 0 会让"脚本里变量为空"看起来像通过 —— 只有这一个形式能跑，所以缺文件就是用法错误
-  if (tokens.length === 0) return usage('缺规格文件（接入规格或报表规格）', hint);
+  if (tokens.length === 0) return usage('缺 YAML 文件（指标定义、接入规格或报表规格）', hint);
   const args = scanArgs(tokens, [], [], hint);
   if (args.problem) return usage(args.problem.message, args.problem.hint);
-  const specFile = onePositional(args, '规格文件（接入规格或报表规格）', hint);
+  const specFile = onePositional(args, 'YAML 文件（指标定义、接入规格或报表规格）', hint);
   if (typeof specFile !== 'string') return specFile;
   return { kind: 'validate', specFile };
 }
@@ -576,29 +575,6 @@ function readSpecFile(specFile: string): string {
 
 function jsonTo(io: CliIO, value: unknown): void {
   io.out(JSON.stringify(value, null, 2) + '\n');
-}
-
-function previewPlan(spec: Spec, params: Record<string, string | number>) {
-  const facts = declaredFactsOf();
-  const factName = spec.fact?.trim() ? spec.fact : undefined;
-  const fact = facts.find((f) => f.name === (factName ?? 'fact_finance'));
-  if (factName && !fact) throw new Error(`目标表未声明: ${factName}`);
-  const results = spec.sheets.map((sheet) => {
-    const blocks = sheet.blocks.map((raw) => {
-      const block = JSON.parse(JSON.stringify(raw), (_, value) => typeof value === 'string' ? substitute(value, params) : value) as Block;
-      if (typeof block.anchor === 'object' && 'name' in block.anchor) {
-        throw new Error(`预览需要 --anchor-row/--anchor-col 或坐标锚点：定义名称 ${block.anchor.name} 无法在 CLI 中解析`);
-      }
-      const { row, col } = (() => { const m = /^([A-Z]+)([1-9][0-9]*)$/i.exec(block.anchor); if (!m) throw new Error(`非法锚点: ${block.anchor}`); let c = 0; for (const ch of m[1]!.toUpperCase()) c = c * 26 + (ch.charCodeAt(0) - 64); return { row: Number(m[2]), col: c }; })();
-      void row;
-      void col;
-      const expanded = expandBlock(block, params);
-      return { sheet: sheet.name, anchor: block.anchor, rowLabels: expanded.rowLabels, colLabels: expanded.colLabels };
-    })
-    return blocks;
-  }).flat();
-  const plan = planOf(spec, results);
-  return { spec: { id: spec.id, title: spec.title ?? null, template: spec.template ?? null }, params, plan, note: '预览只含坐标与形状，不含任何金额（本命令不查数据库）' };
 }
 
 async function agentOutput(io: CliIO, value: unknown): Promise<number> {
@@ -1036,34 +1012,20 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite replay <规格.yaml> [--source 源.xlsx]',
     async run(inv, io) {
       if (inv.kind !== 'replay') throw new Error('命令表与 Invocation 不匹配');
-      const { diagnoseIngest, parseIngestSpec } = await import('./ingest/types.ts');
-      const { masterCatalog } = await import('./ingest/master.ts');
+      const { parseIngestSpecLenient } = await import('./ingest/types.ts');
       const { replaySpec } = await import('./ingest/replay.ts');
 
       const text = readSpecFile(inv.specFile);
-      await openDb();
-      const cat = await masterCatalog();
-      // ★ 同一份 ctx 给诊断与解析（与 ingest run 相同的理由：判据不许有两份）
-      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
-      const d = diagnoseIngest(text, lintCtx);
-      if (d.willBeRejected) {
-        jsonTo(io, {
-          from: inv.specFile,
-          ok: false,
-          refused: true,
-          errors: d.issues.filter((i) => i.level === 'error'),
-          note: '规格没通过静态诊断，没有可对拍的对象。',
-        });
-        io.err('bilite replay: 静态诊断没通过，没有对拍\n');
-        return EXIT.FAILED;
-      }
-      const spec = parseIngestSpec(text, lintCtx);
+      const { spec, parseError } = parseIngestSpecLenient(text);
+      if (parseError || !spec || typeof spec.id !== 'string' || !spec.id.trim()) throw new Error(parseError ?? '重放需要有效的规格 id');
+      // 快照重放无需同步当前指标/模型；实际采用的规格仍由展开器统一校验。
+      await openDb({ models: 'skip' });
       const diff = await replaySpec(spec, { source: inv.source ?? undefined });
       jsonTo(io, { from: inv.specFile, ...diff });
       io.err(
         diff.ok
           ? `bilite replay: 对拍一致 —— ${diff.replayedRows} 行逐格相等（批次 ${diff.batchId}，` +
-            `${diff.mode === 'raw' ? '从库内 raw 重展' : '从源文件重展'}）\n`
+            `${diff.specSource === 'batch-snapshot' ? '批次快照' : '传入规格'}，${diff.mode === 'raw' ? '从库内 raw 重展' : '从源文件重展'}）\n`
           : `bilite replay: 对拍不一致 —— 库内 ${diff.stgRows} 行 / 重展 ${diff.replayedRows} 行 / ` +
             `重展缺 ${diff.missingInStg} 行、库内多 ${diff.extraInStg} 行、字段不一致 ${diff.mismatchTotal} 处` +
             `（坐标见 stdout；按纪律不含值）\n`,
@@ -1074,7 +1036,7 @@ export const COMMANDS: CliCommand[] = [
   {
     invocation: 'validate',
     name: 'validate',
-    summary: '校验一份 YAML（接入规格或报表规格），自动判别该用哪份判据；一次给全问题',
+    summary: '校验指标定义、接入规格或报表规格 YAML',
     usage: 'bilite validate <规格.yaml>',
     async run(inv, io) {
       if (inv.kind !== 'validate') throw new Error('命令表与 Invocation 不匹配');
@@ -1086,6 +1048,15 @@ export const COMMANDS: CliCommand[] = [
         doc = parseYaml(text);
       } catch {
         doc = null; // 语法错交给下面的 diagnose 去报（它们对"解析失败"有专门的措辞）
+      }
+      if (doc && typeof doc === 'object' && 'metrics' in doc) {
+        const { dirname } = await import('node:path');
+        const { loadMetrics, validateMetricFacts } = await import('./metrics/definitions.ts');
+        const definitions = loadMetrics(dirname(inv.specFile));
+        validateMetricFacts(definitions, declaredFactsOf());
+        jsonTo(io, { kind: 'metrics', from: inv.specFile, ok: true, metrics: definitions,
+          note: '共同校验同目录下的指标文件与跨文件引用；不打开数据库。' });
+        return EXIT.OK;
       }
       // ★ 判别按模板几何（geometry.ts 的唯一实现），不按"有没有 source"——
       //   source 是执行参数，没有它的一份接入规格也是接入规格
@@ -1117,7 +1088,6 @@ export const COMMANDS: CliCommand[] = [
       }
 
       const { diagnoseSpec } = await import('./spec/types.ts');
-      const { declaredFactsOf } = await import('./gen/parse.ts');
       const d = diagnoseSpec(text, { facts: declaredFactsOf() });
       const c = count(d.issues);
       jsonTo(io, {
@@ -1177,7 +1147,8 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite agent preview <规格.yaml> [--param k=v]...',
     async run(inv, io) {
       if (inv.kind !== 'preview-spec') throw new Error('命令表与 Invocation 不匹配');
-      return agentOutput(io, previewPlan(parseSpec(fs.readFileSync(inv.specFile, 'utf8'), { facts: declaredFactsOf() }), inv.params));
+      const { previewSpec } = await import('./mcp/tools.ts');
+      return agentOutput(io, await previewSpec({ specFile: inv.specFile, params: inv.params }));
     },
   },
   {

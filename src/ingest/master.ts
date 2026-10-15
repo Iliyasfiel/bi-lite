@@ -8,6 +8,7 @@
 import { catalog } from '../semantic/query.ts';
 import { declaredFactsOf } from '../gen/parse.ts';
 import type { MasterCatalog } from './dryrun.ts';
+import { loadAliases, loadEntities, normalizeName } from './resolve.ts';
 
 /**
  * 声明里的事实表（**不碰库**：models/*.yml → IR → 投影）。
@@ -19,7 +20,15 @@ export const staticFacts = () => declaredFactsOf();
 
 export async function masterCatalog(): Promise<MasterCatalog> {
   const c = await catalog();
+  const [entities, aliases] = await Promise.all([loadEntities('metric'), loadAliases('metric')]);
+  const metricNames: Record<string, string> = Object.create(null);
+  for (const e of entities) for (const name of [e.name, ...e.aliases]) metricNames[normalizeName(name)] = e.name;
+  for (const [key, id] of aliases) {
+    const entity = entities.find((e) => e.id === id);
+    if (entity) metricNames[key] = entity.name;
+  }
   return {
+    metricNames,
     companies: c.companies.map((x) => x.name),
     metrics: c.metrics.map((x) => x.name),
     // ★ period_type 的实际取值就是 PERIOD_TYPES 的 id（catalog 已把它当数据下发）

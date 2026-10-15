@@ -1,0 +1,23 @@
+id: 集团盈利指标表
+title: 集团盈利分析
+template: test/fixtures/盈利指标表.xlsx
+params:
+  year: 2026
+  month: 6
+sheets:
+  - name: 盈利指标
+    blocks:
+      - anchor: { name: PROFIT_START }
+        rows:
+          dim: metric
+          order: [gross_profit, gross_margin]
+        cols:
+          dim: period_type
+          order: [本年累计, 去年同期累计, 单月, 账面累计]
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          time:
+            year: "{{year}}"
+            month: "{{month}}"

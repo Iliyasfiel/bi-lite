@@ -10,6 +10,8 @@ import { masterCatalog } from './master.ts';
 import { rawWorkbook } from '../land/read.ts';
 import { lit } from '../land/raw.ts';
 import { query } from '../db/index.ts';
+import type { MasterCatalog } from './dryrun.ts';
+import type { MetricDefinition } from '../metrics/definitions.ts';
 
 export interface ReplayMismatch {
   sheet: string;
@@ -21,6 +23,7 @@ export interface ReplayMismatch {
 }
 
 export interface ReplayDiff {
+  specSource: 'batch-snapshot' | 'provided';
   specId: string;
   batchId: string;
   /** raw = 从库内 raw 重放（默认）；source-file = 显式 --source 开当前文件重展 */
@@ -60,6 +63,12 @@ export async function replaySpec(spec: IngestSpec, opts: { source?: string } = {
     );
   }
   const fileHash = b[0]!.file_hash;
+  const snapshots = await query<{ spec_json: string; catalog_json: string; metrics_json: string }>(
+    `SELECT spec_json, catalog_json, metrics_json FROM ingest_snapshot WHERE batch_id = ${lit(batchId)}`,
+  );
+  const snapshot = snapshots[0];
+  const replaySpec: IngestSpec = snapshot ? JSON.parse(snapshot.spec_json) : spec;
+  const definitions: MetricDefinition[] | undefined = snapshot ? JSON.parse(snapshot.metrics_json) : undefined;
   const stgCount = await query<{ n: number }>(
     `SELECT count(*) AS n FROM stg_fact_rows WHERE batch_id = ${lit(batchId)}`,
   );
@@ -68,15 +77,17 @@ export async function replaySpec(spec: IngestSpec, opts: { source?: string } = {
   // ② 重展。默认从库内 raw 重放（openBook 口子 —— 与 run.ts 落库用的是**同一个**重放依据，
   //    这样"源文件还在不在"根本不影响对拍）；显式 --source 时开当前文件，对拍"源改了没"。
   const rows: IngestFactRow[] = [];
-  const cat = await masterCatalog();
-  await dryRunIngest(spec, {
+  const cat: MasterCatalog = snapshot ? JSON.parse(snapshot.catalog_json) : await masterCatalog();
+  const shape = await dryRunIngest(replaySpec, {
+    metricDefinitions: definitions,
     catalog: cat,
     ...(opts.source ? { source: opts.source } : { openBook: () => rawWorkbook(fileHash) }),
     // ★ 与 run.ts 落库同一份解法（onEmptyMeasure → writeEmptyMeasures），
     //   否则"落库写了 NULL 行、重展不回调"会成批假红。
-    writeEmptyMeasures: (spec.onEmptyMeasure ?? 'skip') === 'null',
+    writeEmptyMeasures: (replaySpec.onEmptyMeasure ?? 'skip') === 'null',
     onRow: (r) => rows.push(r),
   });
+  if (!shape.ok) throw new Error('重放校验失败：' + shape.issues.filter((i) => i.level === 'error').map((i) => `${i.code}: ${i.message}`).join('；'));
 
   // ③ 逐格对拍。
   const keyOf = (sheet: string, block: number, row: number, col: string): string =>
@@ -130,6 +141,7 @@ export async function replaySpec(spec: IngestSpec, opts: { source?: string } = {
   for (const k of replayed.keys()) if (!stgKeys.has(k)) missingInStg++;
 
   return {
+    specSource: snapshot ? 'batch-snapshot' : 'provided',
     specId: spec.id,
     batchId,
     mode: opts.source ? 'source-file' : 'raw',

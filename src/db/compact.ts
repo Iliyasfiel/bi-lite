@@ -10,8 +10,7 @@
  *   归档目录**不是库**。合并只碰 `data/parquet/<表>/<目录>/part.parquet`，用一个
  *   **内存实例**（`:memory:` + `enable_external_access: true`）去读它们 —— 它既不打开
  *   `.duckdb` 文件、也不碰库锁，所以**服务端正在跑的时候也能合并**。
- *   （`exportParquet()` 必须碰主库，所以它才要那套「新建只读实例 → 写完读回来数一遍 → reattach」
- *   的锁舞蹈；这里根本不需要 —— 这两种操作的性质不同，别把那条推理抄过来。）
+ *   批次归档也用独立内存实例写文件，主库结果通过原生数据块传入，不重复打开库文件。
  *
  * ★ 三条纪律（都是本仓库踩过的坑换来的）：
  *   ① **先验证、再删**：合并出来的行数必须与各源文件**逐 batch_id** 对上，否则抛错、
@@ -167,10 +166,7 @@ function q(s: string): string {
 /**
  * 打开一个**内存**实例：只读归档文件、写合并产物。
  *
- * ★ 为什么是 `:memory:` 而不是像 `exportParquet()` 那样开库文件的只读实例：
- *   这里一个字节都不需要从库里读。开内存实例的收益是**不碰库锁**
- *   （见 AGENTS.md §4 备忘 13：关掉开在库文件上的实例会把主实例的锁一起丢掉）——
- *   所以服务端正在跑时也能合并归档。
+ * 不打开库文件、不碰主库锁，所以服务端正在跑时也能合并归档。
  */
 async function withMemoryInstance<T>(fn: (run: (sql: string) => Promise<Record<string, unknown>[]>) => Promise<T>): Promise<T> {
   const inst = await DuckDBInstance.create(':memory:', { enable_external_access: 'true' });

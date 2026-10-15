@@ -13,7 +13,6 @@ import path from 'node:path';
 let instance: DuckDBInstance | null = null;
 let writeConn: DuckDBConnection | null = null;
 let readConn: DuckDBConnection | null = null;
-let openedPath: string | null = null;
 
 /** 打开或创建数据库；BILITE_DB 可覆盖路径，遵循 DuckDB 单写者约束。 */
 export async function open(
@@ -21,7 +20,6 @@ export async function open(
   opts: { models?: 'ensure' | 'skip' } = {},
 ) {
   if (instance) return;
-  openedPath = dbPath;
 
   // 确保归档目录存在（路径常量只有一份，见 db/compact.ts）
   fs.mkdirSync(path.join(PARQUET_ROOT), { recursive: true });
@@ -47,7 +45,16 @@ export async function open(
   //     ② 接入层落库时（runIngest 的事务里）：数据与元数据同一时刻落库。
   //   `{ models: 'skip' }` 给生成器自己的两条命令用（`plan` 要看到一个**没被动过**的库；
   //   `apply` 要自己报告它落了什么，而不是被 open() 抢先做掉）。
-  if (opts.models !== 'skip') await ensureModels();
+  if (opts.models !== 'skip') {
+    try {
+      await ensureModels();
+      const { syncMetrics } = await import('../metrics/sync.ts');
+      await syncMetrics();
+    } catch (e) {
+      close();
+      throw e;
+    }
+  }
 }
 
 /**
@@ -139,88 +146,40 @@ export function close() {
   writeConn?.closeSync();
   instance?.closeSync();
   readConn = writeConn = instance = null;
-  openedPath = null;
 }
 
 /**
- * 导出一段查询结果到 Parquet，**不放松主实例的 `enable_external_access=false` 硬化**。
- *
- * 背景（本机实测，见 docs/需求与架构.md §4.4）：`COPY ... TO` 属于外部文件操作，
- * 被 `enable_external_access=false` 直接拒绝 —— 也就是说主实例永远写不出 Parquet。
- * 而 `allowed_directories` 与 `enable_external_access=false` 互斥
- * （`Cannot change allowed_directories when enable_external_access is disabled`），
- * 且它并不拦截 `read_text` / `read_csv`，所以不能拿它来"既允许归档又保持硬化"。
- *
- * 解法：归档时另开一个**短命只读实例**（`access_mode: READ_ONLY`）来跑 COPY。
- * 它的可写性由 DuckDB 结构性禁止（实测 `Cannot execute statement of type "INSERT"`）。
- *
- * ★★ 两个**实测**出来的坑（都是这一版才补上的，见 §4 备忘 13）：
- *   ① **关掉那个只读实例会把主实例的库锁一起丢掉**。实测：归档之前，第二个进程
- *      `db.open()` 报 `Could not set lock`；**归档一次之后，它就能开进来了**
- *      —— 于是两个写者同时操作一个库，之后所有归档都读到**过期视图**、
- *      写出**只有表头没有行的空 Parquet**，而 `archived` 还报 `true`。
- *      `CHECKPOINT` / 空查询都拿不回来，**只有"把主实例关掉重开"能拿回来**（实测），
- *      所以下面 `finally` 里 `reattach()`。
- *   ② **同一实例读的是创建那一刻的快照**：把只读实例留着不关能保住锁，但它再也看不见
- *      后来的提交（实测：连续三次归档都读回 0 行）。所以只读实例必须**每次新建**。
- *   合起来的结论：**每次新建只读实例 + 用完立刻重开主实例**。
- *
- * @param verify 可选的行数校验（写完之后在**同一个只读实例**上读回来数一遍）。
- *   为什么值得做：归档曾经"静默写出空文件"而没人发现（R13 的同款失败）。
- *   校验把"安静的错"变成**响亮的抛错**，调用方据此把 `archived` 置 false。
+ * 由主库连接读取已提交结果，按原生数据块复制到独立内存实例后写出归档。
+ * 不把金额转换为 JS number，不重复打开库文件，也不关闭主实例或释放库锁。
+ * 主库始终禁用外部访问；只有临时内存实例可以读写 Parquet。
  */
-export async function exportParquet(sql: string, verify?: { path: string; rows: number }): Promise<number> {
-  if (!openedPath) throw new Error('先调用 open()');
-  const inst = await DuckDBInstance.create(openedPath, {
-    enable_external_access: 'true',
-    access_mode: 'READ_ONLY',
-  });
-  let written = -1;
+export async function exportParquet(selectSql: string, output: { path: string; rows: number }): Promise<number> {
+  const result = await reader().run(selectSql);
+  const inst = await DuckDBInstance.create(':memory:', { enable_external_access: 'true' });
+  const identifier = (s: string) => '"' + s.replaceAll('"', '""') + '"';
+  const literal = (s: string) => "'" + s.replaceAll("'", "''") + "'";
   try {
     const conn = await inst.connect();
     try {
-      await conn.run(sql);
-      if (verify) {
-        const r = await conn.runAndReadAll(`SELECT count(*) AS n FROM read_parquet('${verify.path}')`);
-        written = Number((r.getRowObjectsJson() as Record<string, unknown>[])[0]!.n);
-        if (written !== verify.rows) {
-          throw new Error(
-            `Parquet 归档写出的行数不对：本批 ${verify.rows} 行，归档文件里只有 ${written} 行。` +
-              ` 归档不可信，已判为失败（这比留一个安静的空归档安全）。`,
-          );
-        }
+      const columns = result.columnNames().map((name, i) => identifier(name) + ' ' + result.columnType(i).toString());
+      await conn.run('CREATE TABLE archive_rows (' + columns.join(', ') + ')');
+      const appender = await conn.createAppender('archive_rows');
+      try {
+        for await (const chunk of result) appender.appendDataChunk(chunk);
+      } finally {
+        appender.closeSync();
       }
+      await conn.run('COPY archive_rows TO ' + literal(output.path) + ' (FORMAT parquet)');
+      const back = await conn.runAndReadAll('SELECT count(*) AS n FROM read_parquet(' + literal(output.path) + ')');
+      const written = Number(back.getRowObjectsJson()[0]!.n);
+      if (written !== output.rows) {
+        throw new Error('Parquet 归档写出的行数不对：本批 ' + output.rows + ' 行，归档文件里只有 ' + written + ' 行。归档不可信，已判为失败。');
+      }
+      return written;
     } finally {
       conn.closeSync();
     }
   } finally {
     inst.closeSync();
-    // ★ 关掉只读实例会把主实例的锁丢掉（见上面 ①）—— 立刻重开把它拿回来。
-    await reattach();
   }
-  return written;
-}
-
-/**
- * 把主实例**关掉重开**，只为了把库锁拿回来（只读实例一关，锁就没了，实测）。
- *
- * ★ 为什么不走 `close()` + `open()`：`open()` 会重跑一遍 DDL 与列契约登记，
- *   而这里结构没变、什么都没变 —— 只是要那把锁。所以只重建实例与两条连接。
- * ★ 代价（要认）：重开的那一瞬间旧连接失效，若此刻别处正在读，那一次读会失败。
- *   换来的是**库锁始终在主实例手上**（否则第二个进程能进来，那是真的会坏数据）。
- *   落库与归档本来就是串行的（`runIngest` 内部排队），窗口是微秒级。
- */
-async function reattach(): Promise<void> {
-  if (!openedPath) return;
-  const p = openedPath;
-  try { readConn?.closeSync(); } catch { /* 已经在关了 */ }
-  try { writeConn?.closeSync(); } catch { /* 同上 */ }
-  try { instance?.closeSync(); } catch { /* 同上 */ }
-  instance = await DuckDBInstance.create(p, {
-    enable_external_access: 'false',
-    memory_limit: '2GB',
-  });
-  writeConn = await instance.connect();
-  readConn = await instance.connect();
-  console.error(`[db] 归档后已重开主实例，库锁回到本进程（${p}）`);
 }

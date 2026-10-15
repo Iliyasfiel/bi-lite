@@ -22,6 +22,8 @@ import {
 } from '../spec/template.ts';
 import { parseRef } from '../render/excel.ts';
 import { normalizeName } from './normalize.ts';
+import { loadMetrics, metricOf, type MetricDefinition } from '../metrics/definitions.ts';
+import { transformFor, transformValue, type ValueTransform } from './transform.ts';
 import {
   COORD_CN,
   DEFAULT_TARGET,
@@ -48,6 +50,7 @@ export { resolveSource, SOURCE_ROOTS };
 
 /** 主数据快照 —— 由调用方注入（来自 catalog()），使本模块可脱库测试 */
 export interface MasterCatalog {
+  metricNames?: Record<string, string>;
   companies: string[];
   metrics: string[];
   periodTypes: string[];
@@ -91,6 +94,8 @@ export interface IngestFactRow {
 }
 
 export interface IngestDryRunOptions {
+  /** 重放时传入批次保存的定义，避免后续主数据变更影响历史转换。 */
+  metricDefinitions?: MetricDefinition[];
   catalog: MasterCatalog;
   /**
    * **源文件（执行参数）**—— 覆盖规格里的 `source:`；规格没写 source 时它就是唯一的来源。
@@ -129,6 +134,7 @@ export interface CellStats {
 }
 
 export interface IngestBlockShape {
+  transforms: Array<ValueTransform & { cells: number }>;
   sheet: string;
   anchor: string;
   headerRow: number;
@@ -163,7 +169,7 @@ export interface IngestBlockShape {
 }
 
 export interface IngestShape {
-  spec: { id: string; source: string; onConflict: 'reject' | 'replace'; unknownMaster: 'confirm' | 'create' };
+  spec: { id: string; source: string; onConflict: 'reject' | 'replace'; unknownMaster: 'confirm' | 'create'; onEmptyMeasure: 'skip' | 'null'; target: string };
   sheets: number;
   blocks: IngestBlockShape[];
   issues: IngestIssue[];
@@ -260,6 +266,8 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
       source: effSource,
       onConflict: spec?.onConflict ?? 'reject',
       unknownMaster: spec?.unknownMaster ?? 'confirm',
+      onEmptyMeasure: spec?.onEmptyMeasure ?? 'skip',
+      target: spec?.target ?? DEFAULT_TARGET,
     },
     sheets: Array.isArray(spec?.sheets) ? spec.sheets.length : 0,
     blocks,
@@ -308,6 +316,8 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
   }
   const companyIndex = new Map(opts.catalog.companies.map((n) => [normalizeName(n), n]));
   const metricIndex = new Map(opts.catalog.metrics.map((n) => [normalizeName(n), n]));
+  for (const [key, name] of Object.entries(opts.catalog.metricNames ?? {})) metricIndex.set(key, name);
+  const definitions = opts.metricDefinitions ?? loadMetrics();
 
   spec.sheets.forEach((sheetSpec, si) => {
     const sheet = wb.sheet(sheetSpec.name);
@@ -330,6 +340,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
           onRow: opts.onRow,
           writeEmptyMeasures: opts.writeEmptyMeasures === true,
           fact,
+          definitions,
         }),
       ),
     );
@@ -348,6 +359,7 @@ export async function dryRunIngest(spec: IngestSpec, opts: IngestDryRunOptions):
  *   同类参数扎堆时必须靠名字而不是靠顺序。
  */
 interface BlockReadContext {
+  definitions: MetricDefinition[];
   /** 源文件（相对路径）—— 落库时 batch 要记它 */
   source: string;
   si: number;
@@ -383,6 +395,14 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
     for (const c of expandColumns(s.columns)) skipCols.push({ col: c, why: s.why });
   }
   const measure = block.values.measure ?? fact?.measureColumn ?? 'amount';
+  const rules = block.values.transforms ?? [];
+  const transforms = rules.map((rule) => ({ ...rule, cells: 0 }));
+  for (const rule of rules) for (const id of rule.metrics ?? []) {
+    if (!ctx.definitions.some((m) => m.id === id && m.fact === fact?.name)) {
+      err('TRANSFORM_METRIC_UNKNOWN', `${where}.values.transforms`, `转换规则引用了未知或不属于目标表的指标编号：${id}`);
+    }
+  }
+  const measureDeclaration = fact?.columns.find((c) => c.name === measure);
 
   // ---- 值列的口径：位置优先，其次表头映射 ----
   const valueColumns = valueCols.map((col, i) => {
@@ -572,6 +592,19 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
         // ★ 只有执行器（run.ts）会走到这里。金额在这一行里读完就交出去，不落到 shape / issues / 日志里。
         //   空值格默认不回调（空不是 0，也不是一条事实）—— 规格写 onEmptyMeasure: null 才落 NULL。
         const raw = sheet.cell(r, colIndex(vc.col)).value();
+        let amount: number | null = typeof raw === 'number' ? raw : null;
+        const metricName = metricIndex.get(normalizeName(metric)) ?? metric;
+        const rule = transformFor(rules, metricName, ctx.definitions);
+        if (rule && typeof raw === 'number') {
+          const definition = metricOf(metricName, ctx.definitions);
+          try {
+            amount = transformValue(raw, rule, definition?.unit ?? measureDeclaration?.unit, measureDeclaration?.type ?? '');
+            transforms[rules.indexOf(rule)].cells++;
+          } catch (e) {
+            err('TRANSFORM_VALUE_INVALID', `${where}.${vc.col}${r}`, (e as Error).message);
+            continue;
+          }
+        }
         if (onRow && (writeEmptyMeasures || typeof raw === 'number')) {
           const p = parsePeriodText(periodText);
           onRow({
@@ -585,7 +618,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
             period: p ? `${p.year}-${String(p.month).padStart(2, '0')}` : periodText,
             periodType,
             deg,
-            amount: typeof raw === 'number' ? raw : null,
+            amount,
           });
         }
       }
@@ -717,6 +750,7 @@ function readBlockShape(sheet: Sheet, block: IngestBlock, ctx: BlockReadContext)
   }
 
   return {
+    transforms,
     sheet: sheet.name(),
     anchor: block.anchor,
     headerRow,

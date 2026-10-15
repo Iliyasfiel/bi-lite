@@ -79,6 +79,10 @@ export interface AxisSpec extends ReportAxisGeometry {
 }
 
 export interface ValueSpec {
+  /** 公司行 × 口径列：固定指标编号或名称，公式来自 metrics/。 */
+  metric?: string;
+  /** 公司行 × 指标列：固定口径，窗口规则来自事实表声明。 */
+  periodType?: string;
   measure?: string;           // 事实表字段，通常是 amount
   agg?: 'sum' | 'avg' | 'max' | 'min' | 'count';
   /** 派生表达式，引用同区其他口径列，如 "(本年累计 - 去年同期累计) / 去年同期累计" */
@@ -189,6 +193,8 @@ function substitutableStrings(s: Spec): string[] {
         }
       }
       if (b.scope?.time?.year !== undefined) out.push(String(b.scope.time.year));
+      if (b.value?.metric !== undefined) out.push(String(b.value.metric));
+      if (b.value?.periodType !== undefined) out.push(String(b.value.periodType));
       if (b.scope?.time?.month !== undefined) out.push(String(b.scope.time.month));
     }
   }

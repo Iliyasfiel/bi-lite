@@ -57,6 +57,7 @@ export interface LintIssue {
     | 'ORDER_DUPLICATE'
     | 'PERIODTYPE_UNKNOWN'
     | 'VALUE_MISSING'
+    | 'VALUE_BINDING_BAD'
     | 'ANCHOR_MISSING'
     | 'ANCHOR_BAD'
     | 'SHEET_NO_BLOCK'
@@ -88,6 +89,8 @@ export const MEANING_DIMS: DimName[] = ['metric', 'period_type'];
 
 /** 一个 block 里某个维度是否被"钉住"了（作为轴，或被 filter 显式限定） */
 function isPinned(b: Block, dim: DimName): boolean {
+  if (dim === 'metric' && typeof b.value?.metric === 'string' && b.value.metric.trim()) return true;
+  if (dim === 'period_type' && typeof b.value?.periodType === 'string' && b.value.periodType.trim()) return true;
   if (b.rows?.dim === dim || b.cols?.dim === dim) return true;
   // 自己的轴 filter（rows.filter 作用在 rows.dim 上，cols.filter 同理）
   if (b.rows?.dim === dim && Object.keys(b.rows?.filter ?? {}).length) return true;
@@ -156,6 +159,25 @@ function checkFilter(
  */
 function lintBlock(b: Block, at: string, out: LintIssue[], fact: DeclaredFact | null, shapeKnown: boolean) {
   const factLabel = fact?.name ?? 'fact_finance（缺省）';
+  const bindingError = (message: string) => out.push({ level: 'error', code: 'VALUE_BINDING_BAD', at: `${at}.value`, message });
+  if (b.value?.metric !== undefined) {
+    if (typeof b.value.metric !== 'string' || !b.value.metric.trim()) bindingError('value.metric 必须是非空指标编号或名称');
+    if (b.rows?.dim !== 'company' || b.cols?.dim !== 'period_type' || b.scope?.filter?.metric) {
+      bindingError('value.metric 用于公司行 × 口径列，不能同时使用指标轴或指标过滤');
+    }
+  }
+  if (b.value?.periodType !== undefined) {
+    if (typeof b.value.periodType !== 'string' || !b.value.periodType.trim()) bindingError('value.periodType 必须是非空口径');
+    if (b.rows?.dim !== 'company' || b.cols?.dim !== 'metric' || b.scope?.filter?.period_type) {
+      bindingError('value.periodType 用于公司行 × 指标列，不能同时使用口径轴或口径过滤');
+    }
+    const name = b.value.periodType;
+    const symbolic = typeof name === 'string' && /^\{\{\w+\}\}$/.test(name);
+    const cal = fact?.calibers.find((c) => c.name === name);
+    if (!symbolic && (shapeKnown ? !cal || cal.calculator : !PERIOD_TYPES.some((p) => p.id === name && !p.derivable))) {
+      out.push({ level: 'error', code: 'PERIODTYPE_UNKNOWN', at: `${at}.value.periodType`, message: 'value.periodType 必须选择目标表已声明的实存口径' });
+    }
+  }
   /** 维度在目标表上不可用的统一文案（轴与 scope.filter 共用） */
   const notOnFact = (dim: DimName, issueAt: string) =>
     out.push({
@@ -282,7 +304,7 @@ function lintBlock(b: Block, at: string, out: LintIssue[], fact: DeclaredFact | 
   }
 
   // 累计快照不能跨终点聚合。静态参数占位符允许，编译期替换后再次走本判据。
-  const labels = b.cols?.dim === 'period_type' ? b.cols.order ?? [] : [];
+  const labels = b.cols?.dim === 'period_type' ? b.cols.order ?? [] : b.value?.periodType ? [b.value.periodType] : [];
   const cumulative = labels.some((name) => {
     const cal = fact?.calibers.find((c) => c.name === name);
     return cal ? !cal.calculator && (cal.from === 'year_start' || cal.from === 'since')

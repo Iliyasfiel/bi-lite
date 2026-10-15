@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS stg_fact_rows (
 );
 
 -- ---------- 控制面元数据：物理层向语义层 / Agent 自省自己的契约（架构 §7.2）----------
+CREATE TABLE IF NOT EXISTS ingest_snapshot (
+  batch_id VARCHAR PRIMARY KEY,
+  spec_json VARCHAR NOT NULL,
+  catalog_json VARCHAR NOT NULL,
+  metrics_json VARCHAR NOT NULL
+);
+
 -- ⚠️ 这段注释里**不能出现反引号** —— 整个 DDL 是一个模板字符串，
 --    写一个反引号进去就会把它提前闭合，报错却是"Expected a semicolon"，指在毫不相干的下一行（踩过一次）。
 -- ★ 内容由 src/meta/columns.ts 的 registerMeta() 写入，而它的**唯一来源**是 models/*.yml

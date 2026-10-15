@@ -84,7 +84,7 @@ function listSpecs() {
       const full = path.join('specs', f);
       try {
         const spec = parseSpec(fs.readFileSync(full, 'utf8'), { facts });
-        return { file: full, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length };
+        return { file: full, id: spec.id, title: spec.title ?? spec.id, sheets: spec.sheets.length, params: spec.params ?? {} };
       } catch (e) {
         return { file: full, id: f, title: f, sheets: 0, error: (e as Error).message };
       }

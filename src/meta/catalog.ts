@@ -15,6 +15,7 @@ import { query } from '../db/index.ts';
 import { staticCatalog } from '../semantic/query.ts';
 import { semanticFacts, type SemanticFact } from '../semantic/introspect.ts';
 import { API_VERSION, metaProblems, schemaFingerprint } from './columns.ts';
+import { loadMetrics, type MetricDefinition } from '../metrics/definitions.ts';
 
 export interface CatalogColumn {
   column: string;
@@ -33,6 +34,7 @@ export interface CatalogObject {
 }
 
 export interface Catalog {
+  metricDefinitions: MetricDefinition[];
   apiVersion: string;
   /** 导出时刻。catalog 是快照，**一定会过期** —— 过期必须响亮（架构 §8.5.4） */
   asOf: string;
@@ -85,6 +87,7 @@ async function objects(): Promise<CatalogObject[]> {
 export async function catalogDump(): Promise<Catalog> {
   const static_ = staticCatalog();
   return {
+    metricDefinitions: loadMetrics(),
     apiVersion: API_VERSION,
     asOf: new Date().toISOString(),
     ddlHash: await schemaFingerprint(),
@@ -131,6 +134,7 @@ export function catalogPrompt(c: Catalog): string {
     `bi-lite catalog · apiVersion ${c.apiVersion} · ddlHash ${c.ddlHash} · asOf ${c.asOf}`,
     'L1 业务成员',
     line('metrics', c.members.metrics.map((m) => `${m.name}${m.unit ? `(${m.unit})` : ''}`)),
+    ...c.metricDefinitions.map((m) => `  ${m.id} → ${m.name} (${m.unit}, ${m.category})${m.calculation ? ` = ${m.calculation}` : ''}`),
     line('companies', c.members.companies.map((x) => x.name)),
     line('periodTypes', c.members.periodTypes),
     line('dimensions', c.members.dimensions),

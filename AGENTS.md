@@ -20,6 +20,7 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 | `src/web/`、`src/server.ts` | 本地 Web 界面与 HTTP 入口 |
 | `src/cli.ts`、`src/mcp/` | CLI 与 agent 入口 |
 | `models/` | 表结构、维度、窗口口径、聚合与桥接声明 |
+| `metrics/`、`src/metrics/` | 指标身份、单位/分类、公式声明与主数据同步 |
 | `ingest/`、`specs/`、`templates/` | 接入规格、报表规格、空白模板 |
 | `skills/bi-lite-ingest/` | agent 操作手册与 MCP 配置 |
 | `docs/` | 架构与功能状态 |
