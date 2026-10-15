@@ -55,12 +55,8 @@ let igLintCodes = new Set();  // lint 阶段已知的 issue code（用来挑出"
 const igYaml = () => $('igYaml').value;
 const igDkey = (kind, raw) => `${kind}|${raw}`;
 
-/** 按当前规格与快照，这次会落多少行事实。
- *  干跑不写库，所以只能从形状里推：坐标总数 − 凑不齐坐标的。 */
-const igWillWrite = (res) =>
-  ((res && res.shape && res.shape.blocks) || []).reduce(
-    (n, b) => n + (b.coordinates.total - b.coordinates.incomplete), 0,
-  );
+/** 引擎按空值规则展开的候选值格数，事实去重前计数。 */
+const igWillWrite = (res) => res?.candidateRows ?? 0;
 
 function igStatus(text, cls) {
   const el = $('igStatus');
@@ -78,7 +74,7 @@ function igSyncRun() {
   const n = igPending();
   const btn = $('igRun');
   btn.disabled = n > 0;
-  btn.textContent = n > 0 ? `还有 ${n} 个名称待确认` : `确认无误，落库（${igWillWrite(igPlan).toLocaleString()} 行）`;
+  btn.textContent = n > 0 ? `还有 ${n} 个名称待确认` : `确认导入（${igWillWrite(igPlan).toLocaleString()} 个值格）`;
 }
 
 // —— 源文件：先落到白名单目录；选中的文件是**执行参数**，不改规格的 YAML 文本 ——
@@ -268,6 +264,9 @@ function igBlockHtml(b) {
     <table class="mini" style="margin-top:8px">
       <tr><th>行键</th><td>${b.rows.map((r) => `${r.col} → ${esc(r.dim)}`).join('、')}</td></tr>
       <tr><th>值列</th><td>${vals.map((v) => esc(v)).join('、') || '—'}</td></tr>
+      ${(b.transforms || []).length ? `<tr><th>单位与符号</th><td>${b.transforms.map((t) =>
+        `${esc(t.metrics ? t.metrics.join('、') : '默认规则')}：${esc(t.fromUnit)} → ${esc(t.toUnit)}，${t.sign === 'negate' ? '反号' : '保留符号'}，${t.rounding === 'half-up' ? '四舍五入' : '不允许舍入'}（${t.cells} 个单元格）`
+      ).join('<br>')}</td></tr>` : ''}
       ${ptCols.length ? `<tr><th>口径</th><td>由行键给（${ptCols.join('/')} 列）</td></tr>` : ''}
       ${b.skipped.length ? `<tr><th>跳过</th><td>${skips.map((s) => esc(s)).join('、')}</td></tr>` : ''}
       <tr><th>期数</th><td>${esc(period)}</td></tr>
@@ -332,12 +331,13 @@ function renderIgPlan(res) {
 
   $('igPlan').innerHTML = `
     <div class="kv">
-      <div><div class="k">会写入的事实行</div><div class="v">${igWillWrite(res).toLocaleString()}</div></div>
+      <div><div class="k">待接入的值格</div><div class="v">${igWillWrite(res).toLocaleString()}</div></div>
       <div><div class="k">数据区</div><div class="v">${blocks.length}</div></div>
-      <div><div class="k">空值格（不落库）</div><div class="v">${(res.emptyMeasureCells || 0).toLocaleString()}</div></div>
+      <div><div class="k">空值格（${res.shape?.spec?.onEmptyMeasure === 'null' ? '写入 NULL' : '跳过'}）</div><div class="v">${(res.emptyMeasureCells || 0).toLocaleString()}</div></div>
       <div><div class="k">会新建主数据</div><div class="v">${(res.willCreate || []).length}</div></div>
       <div><div class="k">自动归并写法</div><div class="v">${(res.merged || []).length}</div></div>
     </div>
+    <p class="hint">源文件：${esc(res.shape?.spec?.source)} · ${res.shape?.spec?.onConflict === 'replace' ? '覆盖已有坐标' : '已有坐标重复时拒绝导入'}。值格数量为事实去重前计数。</p>
     ${res.note ? `<p class="hint">${esc(res.note)}</p>` : ''}
     ${blocks.map(igBlockHtml).join('')}
     ${igPlanLists(res)}
@@ -847,79 +847,140 @@ async function loadSpecs() {
       : '<p class="empty">specs/ 目录下还没有 .yaml 报表定义。</p>';
 
     $('specs').querySelectorAll('button[data-spec]').forEach((b) => {
-      b.addEventListener('click', () => openSpec(b.dataset.spec, b.dataset.title));
+      b.addEventListener('click', () => openSpec(specs.find((s) => s.file === b.dataset.spec)));
     });
   } catch (e) {
     $('specs').innerHTML = `<p class="empty">加载失败：${e.message}</p>`;
   }
 }
 
-async function openSpec(file, title) {
-  currentSpec = file;
-  $('reportCard').classList.remove('hidden');
-  $('reportTitle').textContent = title;
-  $('rYear').value = new Date().getFullYear();
-  $('rMonth').value = 6;
+let reportVersion = 0;
+let previewRequest = 0;
+let reportReady = null;
+const reportParamLabels = { year: '年份', month: '月份', periodType: '口径' };
+
+function clearReportView() {
   $('reportPreview').innerHTML = '';
+  reportCharts.forEach((c) => c.dispose());
+  reportCharts.length = 0;
   $('reportCharts').innerHTML = '';
-  $('renderMsg').textContent = '';
+}
+
+function invalidateReport() {
+  reportVersion++;
+  reportReady = null;
+  $('doRender').disabled = true;
+  clearReportView();
+  $('renderMsg').textContent = '请预览当前参数后导出。';
+}
+
+async function openSpec(spec) {
+  if (!spec) return;
+  currentSpec = spec.file;
+  $('reportCard').classList.remove('hidden');
+  $('reportTitle').textContent = spec.title;
+  $('reportParams').innerHTML = Object.entries(spec.params || {}).map(([name, value], i) => {
+    const numeric = typeof value === 'number' || name === 'year' || name === 'month';
+    const attrs = 'id="report-param-' + i + '" data-name="' + esc(name) + '" data-kind="' + (numeric ? 'number' : 'text') + '"';
+    const periods = [...new Set([String(value), ...(CATALOG?.periodTypes || []).filter((p) => !p.derivable).map((p) => p.id)])];
+    const input = name === 'periodType'
+      ? '<select ' + attrs + '>' + periods.map((p) => '<option' + (p === String(value) ? ' selected' : '') + '>' + esc(p) + '</option>').join('') + '</select>'
+      : '<input ' + attrs + ' type="' + (numeric ? 'number' : 'text') + '" value="' + esc(value) + '" required ' + (name === 'month' ? 'min="1" max="12"' : '') + ' style="width:10em">';
+    return '<label for="report-param-' + i + '">' + esc(reportParamLabels[name] || name) + ' ' + input + '</label>';
+  }).join('') || '<span class="hint">此报表没有可调整的参数。</span>';
+  invalidateReport();
   await previewReport();
 }
 
+function reportParams() {
+  const params = Object.create(null);
+  $('reportParams').querySelectorAll('[data-name]').forEach((input) => {
+    if (!input.value.trim() || !input.checkValidity()) throw new Error('请填写有效的报表参数：' + (reportParamLabels[input.dataset.name] || input.dataset.name));
+    const value = input.dataset.kind === 'number' ? Number(input.value) : input.value;
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('报表参数必须是有效数字');
+    params[input.dataset.name] = value;
+  });
+  return params;
+}
+
+$('reportParams').addEventListener('input', invalidateReport);
+$('reportParams').addEventListener('change', invalidateReport);
 $('doPreview').addEventListener('click', previewReport);
+
+function reportScopeText(b) {
+  const scope = b.scope || {};
+  const parts = [];
+  if (scope.time?.year !== undefined) parts.push('报告期：' + scope.time.year + (scope.time.month !== undefined ? '-' + String(scope.time.month).padStart(2, '0') : ''));
+  if (scope.periods?.length) parts.push('口径：' + scope.periods.join('、'));
+  if (scope.metrics?.length) parts.push('指标：' + scope.metrics.map((m) => m.name + (m.unit ? '（' + m.unit + '）' : '')).join('、'));
+  if (scope.rows === 'company') parts.push('公司：' + b.rowLabels.join('、'));
+  (scope.filters || []).forEach((f) => parts.push(dimLabel(f.dimension) + (f.field === 'name' || f.field === f.dimension ? '' : '（' + f.field + '）') + '：' + f.members.join('、')));
+  return parts.join(' · ');
+}
+
+function reportValue(value, block, rowIndex, colIndex) {
+  if (value === null) return '—';
+  const scope = block.scope || {};
+  const metric = scope.metrics?.[scope.rows === 'metric' ? rowIndex : scope.cols === 'metric' ? colIndex : 0];
+  if (block.format?.includes('%') || (!block.format && metric?.unit === '比率')) return fmt(value * 100) + '%';
+  if (!block.format && metric?.unit === '%') return fmt(value) + '%';
+  return fmt(value);
+}
 
 async function previewReport() {
   if (!currentSpec) return;
+  const version = reportVersion, request = ++previewRequest;
+  reportReady = null;
+  $('doRender').disabled = true;
+  clearReportView();
+  $('renderMsg').textContent = '预览中…';
   try {
+    const payload = { specFile: currentSpec, params: reportParams() };
     const res = await api('/api/report/preview', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ specFile: currentSpec, params: { year: +$('rYear').value, month: +$('rMonth').value } }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
     });
-
-    $('reportPreview').innerHTML = res.sheets.map((s) => s.blocks.map((b) => `
-      <div style="margin-top:14px">
-        <p class="hint">sheet「${esc(s.name)}」· 锚点 ${esc(String(typeof b.anchor === 'object' ? b.anchor.name : b.anchor))}</p>
-        <div class="table-wrap"><table>
-          <thead><tr><th></th>${b.colLabels.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
-          <tbody>${b.matrix.map((r) => `<tr><td>${esc(r.label)}</td>
-            ${r.values.map((v) => `<td class="num">${v === null ? '—' : fmt(v)}</td>`).join('')}</tr>`).join('')}
-          </tbody></table></div>
-      </div>`).join('')).join('');
-
-    // 图表渲染器：与 Excel 同源，同一份 spec
-    reportCharts.forEach((c) => c.dispose());
-    reportCharts.length = 0;
-    $('reportCharts').innerHTML = res.charts.map((_, i) => `<div id="rc${i}" class="chart"></div>`).join('');
+    if (version !== reportVersion || request !== previewRequest) return;
+    $('reportPreview').innerHTML = res.sheets.map((s) => s.blocks.map((b) =>
+      '<div style="margin-top:14px"><h3>' + esc(s.name) + '</h3><p class="hint">' + esc(reportScopeText(b)) + '</p>' +
+      '<div class="table-wrap"><table><thead><tr><th></th>' + b.colLabels.map((c) => '<th>' + esc(c) + '</th>').join('') + '</tr></thead>' +
+      '<tbody>' + b.matrix.map((r, ri) => '<tr><td>' + esc(r.label) + '</td>' + r.values.map((v, ci) => '<td class="num">' + esc(reportValue(v, b, ri, ci)) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div></div>'
+    ).join('')).join('');
+    $('reportCharts').innerHTML = res.charts.map((_, i) => '<div id="rc' + i + '" class="chart"></div>').join('');
     res.charts.forEach((c, i) => {
-      const inst = echarts.init($(`rc${i}`));
+      const inst = echarts.init($('rc' + i));
       inst.setOption(c.option);
       reportCharts.push(inst);
     });
-
-    $('renderMsg').textContent = `计划：${res.plan.totalCells} 个数据格（预览只含坐标与形状）`;
+    reportReady = { ...payload, version };
+    $('doRender').disabled = false;
+    $('renderMsg').textContent = '已预览 ' + res.plan.totalCells + ' 个数据格；导出将使用以上参数。';
   } catch (e) {
-    $('reportPreview').innerHTML = `<p class="empty">预览失败：${esc(e.message)}</p>`;
+    if (version !== reportVersion || request !== previewRequest) return;
+    clearReportView();
+    $('reportPreview').innerHTML = '<p class="empty">预览失败：' + esc(e.message) + '</p>';
+    $('renderMsg').textContent = '请修正参数后重新预览。';
   }
 }
 
 $('doRender').addEventListener('click', async () => {
-  if (!currentSpec) return;
+  const request = reportReady;
+  if (!request || request.version !== reportVersion) return;
   const btn = $('doRender');
   btn.disabled = true;
   btn.textContent = '导出中…';
   try {
     const res = await api('/api/report/render', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ specFile: currentSpec, params: { year: +$('rYear').value, month: +$('rMonth').value } }),
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ specFile: request.specFile, params: request.params }),
     });
-    $('renderMsg').innerHTML = `已写入 ${res.cellsWritten} 格，保留模板原格式 ${res.formatKept} 格。
-      <a href="${res.download}">下载 ${res.outputPath.split('/').pop()}</a>${res.warnings.length ? ` · ${res.warnings.join('；')}` : ''}`;
+    if (request.version !== reportVersion) return;
+    $('renderMsg').innerHTML = '已写入 ' + res.cellsWritten + ' 格，保留模板原格式 ' + res.formatKept + ' 格。 ' +
+      '<a href="' + esc(res.download) + '">下载 ' + esc(res.outputPath.split(/[\\/]/).pop()) + '</a>' +
+      (res.warnings.length ? ' · ' + esc(res.warnings.join('；')) : '');
   } catch (e) {
-    $('renderMsg').textContent = `导出失败：${e.message}`;
+    if (request.version === reportVersion) $('renderMsg').textContent = '导出失败：' + e.message;
   } finally {
-    btn.disabled = false;
+    btn.disabled = !reportReady || reportReady.version !== reportVersion;
     btn.textContent = '导出 Excel';
   }
 });

@@ -16,13 +16,14 @@ import { DIMENSIONS, dimAvailableOn, isRegisteredDim, type DimName } from '../sp
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { query } from '../db/index.ts';
 import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
+import { loadMetrics, metricOf, metricAggregate, type MetricDefinition } from '../metrics/definitions.ts';
 
 // ---------------- 元数据（无金额，可安全给 agent 与前端） ----------------
 
 export interface Catalog {
   dimensions: Array<{ name: string; label: string; kind: 'dimension' }>;
   periodTypes: Array<{ id: string; label: string; derivable: boolean }>;
-  metrics: Array<{ id: string; name: string; category: string | null; unit: string | null }>;
+  metrics: Array<{ id: string; name: string; category: string | null; unit: string | null; definition?: MetricDefinition }>;
   companies: Array<{ id: string; name: string; group_name: string | null; level: number | null }>;
 }
 
@@ -57,7 +58,8 @@ export async function catalog(): Promise<Catalog> {
   const companies = await query<{ id: string; name: string; group_name: string | null; level: number | null }>(
     'SELECT id, name, group_name, level FROM dim_company ORDER BY level NULLS LAST, name',
   );
-  return { ...staticCatalog(), metrics, companies };
+  const definitions = loadMetrics();
+  return { ...staticCatalog(), metrics: metrics.map((m) => ({ ...m, definition: metricOf(m.name, definitions) })), companies };
 }
 
 // ---------------- 查询定义 ----------------
@@ -180,6 +182,11 @@ export function compileMetrics(
     );
   }
   const calibers = fact.calibers;
+  const definitions = loadMetrics();
+  const hasDerived = mq.measures.some((m) => metricOf(m.metric, definitions)?.calculation);
+  if (hasDerived && ((mq.groupBy ?? []).includes('metric') || mq.filter?.metric !== undefined)) {
+    throw new QueryRefused('派生指标不能按指标分组或额外过滤指标（会截断公式操作数）', 'DERIVED_METRIC_FILTER');
+  }
 
   const groupBy = mq.groupBy ?? [];
   for (const d of groupBy) {
@@ -230,6 +237,10 @@ export function compileMetrics(
 
   // 省略维度时按声明选择成员；换汇需要覆盖所有记账币种，不注入 ccy 默认过滤。
   const filter = { ...mq.filter };
+  if (filter.metric !== undefined) {
+    const canonical = (s: string) => metricOf(s, definitions)?.name ?? s;
+    filter.metric = Array.isArray(filter.metric) ? filter.metric.map(canonical) : canonical(filter.metric);
+  }
   for (const dim of ['scenario', 'ccy']) {
     if (!dimAvailableOn(dim as DimName, fact) || groupBy.includes(dim) || (dim === 'ccy' && ccySel)) continue;
     if (filter[dim] === undefined && fact.queryDefaults?.[dim]) filter[dim] = fact.queryDefaults[dim];
@@ -313,7 +324,7 @@ export function compileMetrics(
           : cal.from === 'year_start'
             ? `f.${w} = date_trunc('year', f.${p})`
             : `f.${w} = DATE '${cal.since}-01'`;
-      cond = `dim_metric.name = ${q(m.metric)} AND ${rule}`;
+      cond = rule;
     } else if (m.periodType) {
       // 口径有声明、表却没有窗口列 = 声明与窗口列不自洽（声明了 calibers 就必须有 windowFrom）
       throw new QueryRefused(
@@ -322,16 +333,18 @@ export function compileMetrics(
       );
     } else {
       // 没有口径体系的表（运营事实）：只按指标取数
-      cond = `dim_metric.name = ${q(m.metric)}`;
+      cond = 'TRUE';
     }
     const measureCol = fact?.measureColumn ?? 'amount';
     const valueExpr = ccySel ? `(f.${measureCol} * fx_s.rate / fx_u.rate)` : `f.${measureCol}`;
     const validFx = 'fx_s.rate_count = 1 AND fx_u.rate_count = 1 AND fx_s.rate > 0 AND fx_u.rate > 0 AND isfinite(fx_s.rate) AND isfinite(fx_u.rate)';
     const value = ccySel ? `CASE WHEN ${validFx} THEN ${valueExpr} END` : valueExpr;
+    const compiled = metricAggregate(m.metric, definitions, { fact: tableName, agg, condition: cond, value,
+      invalidFx: ccySel ? `NOT coalesce((${validFx}), false)` : undefined });
     const missingFx = ccySel
-      ? `, sum(count(CASE WHEN (${cond}) AND NOT coalesce((${validFx}), false) THEN 1 END)) OVER () AS bad_fx${i}`
+      ? `, sum(${compiled.badFx}) OVER () AS bad_fx${i}`
       : '';
-    return `${agg}(CASE WHEN ${cond} THEN ${value} END) AS m${i},\n  count(CASE WHEN ${cond} THEN 1 END) AS n${i}${missingFx}`;
+    return `${compiled.value} AS m${i},\n  ${compiled.support} AS n${i}${missingFx}`;
   });
 
   // join（去重）

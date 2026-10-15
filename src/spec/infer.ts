@@ -426,7 +426,9 @@ function inferSheet(
       message:
         `这张表里找不到${names.join(' 和 ')}的信息：表头只有 ${region.colLabels.join(' / ')}（列）` +
         `与角格「${cornerCell ?? '(空)'}」（行），推不出这一格该填哪个指标。` +
-        `草稿因此**无法保存**，请先补上指标约束。`,
+        `草稿因此**无法保存**，请先补上相应约束。` +
+        (rowsDim === 'company' && colsDim === 'metric' ? ' 公司行 × 指标列可用 value.periodType 固定口径。' : '') +
+        (rowsDim === 'company' && colsDim === 'period_type' ? ' 公司行 × 口径列可用 value.metric 固定指标。' : ''),
     });
   }
 

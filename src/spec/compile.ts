@@ -10,6 +10,7 @@ import { DIMENSIONS, DIM_NAMES, dimAvailableOn, isRegisteredDim, type DimName } 
 import { evalExpr, type ExprScope } from './expr.ts';
 import { lintSpec } from './lint.ts';
 import { DEFAULT_TARGET, type DeclaredFact } from '../gen/ir.ts';
+import { loadMetrics, metricOf, metricAggregate } from '../metrics/definitions.ts';
 
 // 白名单已抽到 ./dims.ts（lint.ts 与 grammar.ts 也要用，放在这里会成环）。
 // 下面转出去，保持 `from './compile.ts'` 的既有调用点不用改。
@@ -29,6 +30,14 @@ function ident(d: string): string {
 }
 
 export interface CompiledQuery {
+  scope: {
+    fact: string;
+    time: { year?: string | number; month?: string | number };
+    rows: string; cols: string;
+    metrics: Array<{ name: string; unit: string | null }>;
+    periods: string[];
+    filters: Array<{ dimension: string; field: string; members: string[] }>;
+  };
   sql: string;
   rowLabels: string[];
   colLabels: string[];
@@ -116,13 +125,32 @@ export function compileBlock(
   }
   const resolved = JSON.parse(JSON.stringify(block), (_, v) => typeof v === 'string' ? substitute(v, params) : v) as Block;
   const issues = lintSpec({ id: 'compile', fact: fact?.name, sheets: [{ name: 'compile', blocks: [resolved] }] }, { facts: opts.facts })
-    .filter((i) => i.code === 'CUMULATIVE_TIME_UNPINNED' || i.code === 'DIM_MIXED_AGGREGATION');
+    .filter((i) => i.code === 'CUMULATIVE_TIME_UNPINNED' || i.code === 'DIM_MIXED_AGGREGATION'
+      || i.code === 'VALUE_BINDING_BAD' || i.code === 'PERIODTYPE_UNKNOWN');
   if (issues.length) throw new Error(issues.map((i) => `${i.code}: ${i.message}`).join('；'));
   const agg = block.value.agg ?? 'sum';
   const measure = block.value.measure ?? fact?.measureColumn ?? 'amount';
 
-  const rowLabels = (block.rows.order ?? []).map((r) => substitute(String(r), params));
-  const colLabels = (block.cols.order ?? []).map((c) => substitute(String(c), params));
+  const definitions = loadMetrics();
+  const fixedMetric = resolved.value.metric;
+  const fixedPeriod = resolved.value.periodType;
+  const label = (s: string, dim: string) => dim === 'metric' ? metricOf(s, definitions)?.name ?? s : s;
+  const rowLabels = (block.rows.order ?? []).map((r) => label(substitute(String(r), params), rowsDim));
+  const colLabels = (block.cols.order ?? []).map((c) => label(substitute(String(c), params), colsDim));
+  const metricLabels = [...(rowsDim === 'metric' ? rowLabels : []), ...(colsDim === 'metric' ? colLabels : []), ...(fixedMetric ? [fixedMetric] : [])];
+  const metricFilters = [rowsDim === 'metric' ? block.rows.filter : undefined, colsDim === 'metric' ? block.cols.filter : undefined, block.scope?.filter?.metric];
+  const filteredMetrics = metricFilters.flatMap((f) => Object.values(f ?? {}).flat()).map(String);
+  const usesDerived = [...metricLabels, ...filteredMetrics].some((m) => metricOf(m, definitions)?.calculation);
+  const derivedRows = usesDerived && rowsDim === 'metric' && colsDim === 'period_type';
+  const metricColumns = rowsDim === 'company' && colsDim === 'metric' && !!fixedPeriod;
+  const fixedMetricGrid = rowsDim === 'company' && colsDim === 'period_type' && !!fixedMetric;
+  if (usesDerived && (!(derivedRows || metricColumns || fixedMetricGrid) || metricFilters.some((f) => f && Object.keys(f).length))) {
+    throw new Error('派生指标需使用指标行 × 口径列，或公司行配 value.metric / value.periodType；不能额外过滤指标（会截断公式操作数）');
+  }
+  for (const m of metricLabels) {
+    const def = metricOf(m, definitions);
+    if (def && def.fact !== tableName) throw new Error(`指标 ${def.id} 属于 ${def.fact}，不能在 ${tableName} 取数`);
+  }
 
   if (colLabels.length === 0) throw new Error('cols.order 不能为空（列口径必须显式声明）');
 
@@ -134,6 +162,7 @@ export function compileBlock(
   };
   needJoin(rowsDim);
   needJoin(colsDim);
+  if (fixedMetric) needJoin('metric');
 
   const rowExpr = labelRef(rowsDim);
 
@@ -186,6 +215,11 @@ export function compileBlock(
 
   // 列：条件聚合。口径轴 → 窗口谓词；其余轴 → 维表/列标签等值（原行为）
   const colExprs = colLabels.map((c, i) => {
+    if (metricColumns || fixedMetricGrid) {
+      return `${metricAggregate(metricColumns ? c : fixedMetric!, definitions, {
+        fact: tableName, agg, condition: caliberCond(metricColumns ? fixedPeriod! : c), value: `f.${measure}`,
+      }).value} AS c${i}`;
+    }
     const cond = colsDim === 'period_type' ? caliberCond(c) : `${labelRef(colsDim)} = ${q(c)}`;
     // 别名用序号，避免中文别名在不同驱动下的引用问题
     return `${agg}(CASE WHEN ${cond} THEN f.${measure} END) AS c${i}`;
@@ -193,20 +227,23 @@ export function compileBlock(
 
   // WHERE
   const where: string[] = [];
+  const appliedFilters: CompiledQuery['scope']['filters'] = [];
   const addFilter = (dim: DimName, filter?: Record<string, string | string[]>) => {
     if (!filter) return;
     needDim(dim, '过滤');
     for (const [col, val] of Object.entries(filter)) {
       if (!/^[a-z_][a-z0-9_]*$/i.test(col)) throw new Error(`非法过滤字段: ${col}`);
       const ref = filterRef(dim, col);
+      const member = (v: string) => label(substitute(String(v), params), dim === 'metric' && col === 'name' ? 'metric' : '');
+      appliedFilters.push({ dimension: dim, field: col, members: (Array.isArray(val) ? val : [val]).map(member) });
       // ★ 修复：引用了某个维度的列，就必须带上它的 JOIN。
       //   首版只对 rows/cols 建 join，于是 scope.company.filter 生成
       //   「WHERE dim_company.name = ... 但没有 JOIN dim_company」→ 查库直接报错。
       needJoin(dim);
       if (Array.isArray(val)) {
-        where.push(`${ref} IN (${val.map((v) => q(substitute(String(v), params))).join(', ')})`);
+        where.push(`${ref} IN (${val.map((v) => q(member(v))).join(', ')})`);
       } else {
-        where.push(`${ref} = ${q(substitute(String(val), params))}`);
+        where.push(`${ref} = ${q(member(val))}`);
       }
     }
   };
@@ -230,7 +267,7 @@ export function compileBlock(
   //   落窗月（fin_month = as-of − 1 年）钉掉。dim_period join 也随之不需要（asOfPin 直接用
   //   f.fin_month，年份/月份不需要 dim_period 的映射）。
   //   非口径轴的 block（运营事实表报表）：时间钉保持全局 WHERE（dim_period join）。
-  if (colsDim !== 'period_type') {
+  if (colsDim !== 'period_type' && !fixedPeriod) {
     const timePin: string[] = [];
     if (block.scope?.time?.year !== undefined) {
       timePin.push(`dim_period.year = ${q(substitute(String(block.scope.time.year), params))}`);
@@ -244,12 +281,12 @@ export function compileBlock(
   }
 
   // 行标签必须限定在 order 里，避免返回多余行
-  if (rowLabels.length > 0) {
+  if (rowLabels.length > 0 && !derivedRows) {
     where.push(`${rowExpr} IN (${rowLabels.map((r) => q(r)).join(', ')})`);
   }
 
   const maxRows = opts.maxRows ?? 1000;
-  const sql = [
+  let sql = [
     `SELECT ${rowExpr} AS row_label,`,
     '  ' + colExprs.join(',\n  '),
     `FROM ${tableName} f`,
@@ -261,6 +298,24 @@ export function compileBlock(
     .filter(Boolean)
     .join('\n');
 
+  if (derivedRows) {
+    // 每个输出指标各自聚合其依赖，保留相同范围；比率由聚合后的金额计算。
+    sql = rowLabels.map((metric) => [
+      `SELECT ${q(metric)} AS row_label,`,
+      colLabels.map((caliber, i) => `${metricAggregate(metric, definitions, {
+        fact: tableName, agg, condition: caliberCond(caliber), value: `f.${measure}`,
+      }).value} AS c${i}`).join(', '),
+      `FROM ${tableName} f`, ...joins,
+      where.length ? 'WHERE ' + where.join(' AND ') : '',
+    ].filter(Boolean).join('\n')).join('\nUNION ALL\n') + `\nLIMIT ${maxRows}`;
+  }
+
+  const scope: CompiledQuery['scope'] = {
+    fact: tableName, time: resolved.scope?.time ?? {}, rows: rowsDim, cols: colsDim,
+    metrics: metricLabels.map((m) => ({ name: label(m, 'metric'), unit: metricOf(m, definitions)?.unit ?? null })),
+    periods: colsDim === 'period_type' ? colLabels : fixedPeriod ? [fixedPeriod] : [],
+    filters: appliedFilters,
+  };
   // ★ 派生表达式（§5.2.1）。
   //   首版 compile.ts 认得 value.expr 这个字段但从不使用它 —— 于是写了同比表达式
   //   的 spec 会**静默**返回两个累计额本身（实测 [65198, 60870]，而期望 0.0711）。
@@ -268,6 +323,7 @@ export function compileBlock(
   if (block.value.expr) {
     return {
       sql,
+      scope,
       rowLabels,
       colLabels: [exprLabel(block.value.expr)],
       block,
@@ -275,7 +331,7 @@ export function compileBlock(
     };
   }
 
-  return { sql, rowLabels, colLabels, block };
+  return { sql, scope, rowLabels, colLabels, block };
 }
 
 /** 派生列的显示名：优先用 spec 里的 format 提示，否则用表达式原文 */
@@ -310,7 +366,7 @@ export async function runCompiled(c: CompiledQuery, query: (sql: string) => Prom
     return { label, values: inputs };
   });
 
-  return { rowLabels: c.rowLabels, colLabels: c.colLabels, matrix };
+  return { rowLabels: c.rowLabels, colLabels: c.colLabels, matrix, scope: c.scope, format: c.block.value.format ?? null };
 }
 
 /**

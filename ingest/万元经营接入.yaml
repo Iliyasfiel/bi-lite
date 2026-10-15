@@ -1,0 +1,31 @@
+id: 万元经营接入
+source: test/fixtures/万元经营接入源.xlsx
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 月报
+    blocks:
+      - anchor: D2
+        rows:
+          - { col: A, dim: company }
+          - { col: C, dim: metric }
+        values:
+          columns: [D, E, F, G, H]
+          skip:
+            - columns: [F]
+              why: 同比% 是派生列
+          periodTypes: [本年累计, 单月, 去年同期累计, 账面累计]
+          transforms:
+            - fromUnit: 万元
+              toUnit: 元
+            - metrics: [operating_cost]
+              fromUnit: 万元
+              toUnit: 元
+              sign: negate
+        keys:
+          - { col: B, as: period }
+          - { as: scenario, value: 实际 }
+          - { as: ccy, value: 人民币 }
+        drop:
+          labels: [合计]

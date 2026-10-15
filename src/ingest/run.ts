@@ -18,6 +18,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { PARQUET_ROOT, PART_FILE } from '../db/compact.ts';
 import { execute, exportParquet, query, queryWriter } from '../db/index.ts';
+import { loadMetrics, metricOf } from '../metrics/definitions.ts';
 import { findRawFile, landRawFile } from '../land/raw.ts';
 import { rawWorkbook } from '../land/read.ts';
 import { registerMeta } from '../meta/columns.ts';
@@ -55,6 +56,8 @@ export interface IngestRunOptions {
 }
 
 export interface IngestRunResult {
+  /** 通过读取与空值处理后待接入的值格；事实去重前的数量。 */
+  candidateRows: number;
   ok: boolean;
   batchId: string | null;
   /** 真正写进 fact_finance 的行数 */
@@ -139,6 +142,19 @@ export function runIngest(spec: IngestSpec, opts: IngestRunOptions): Promise<Ing
 }
 
 async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise<IngestRunResult> {
+  const definitions = loadMetrics();
+  const resolvers = {
+    company: await buildResolver('company'),
+    metric: await buildResolver('metric'),
+  };
+  // 人工确认的指标归并也参与转换选择；快照保留这次使用的名称映射。
+  const conversionCatalog = structuredClone(opts.catalog);
+  conversionCatalog.metricNames ??= Object.create(null);
+  for (const decision of opts.decisions ?? []) {
+    if (decision.kind !== 'metric' || decision.action !== 'merge') continue;
+    const target = resolvers.metric.ents.find((e) => e.id === decision.targetId);
+    if (target) conversionCatalog.metricNames[normalizeName(decision.raw)] = target.name;
+  }
   const rows: IngestFactRow[] = [];
   const onEmptyMeasure = spec.onEmptyMeasure ?? 'skip';
 
@@ -164,7 +180,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   }
 
   const shape = await dryRunIngest(spec, {
-    catalog: opts.catalog,
+    metricDefinitions: definitions,
+    catalog: conversionCatalog,
     source: opts.source,
     maxRows: opts.maxRows,
     openBook,
@@ -176,6 +193,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   const emptyMeasureCells = shape.blocks.reduce((n, b) => n + b.measureCells.empty, 0);
   const errors = shape.issues.filter((i) => i.level === 'error');
   const base: IngestRunResult = {
+    candidateRows: rows.length,
     ok: false,
     batchId: null,
     inserted: 0,
@@ -237,10 +255,6 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   const unknownMaster = spec.unknownMaster ?? 'confirm';
   const autoCreateDims = opts.autoCreateDims !== undefined ? opts.autoCreateDims : unknownMaster === 'create';
   const strict = opts.strict === true;
-  const resolvers = {
-    company: await buildResolver('company'),
-    metric: await buildResolver('metric'),
-  };
 
   // 人的决定优先于一切自动判定 —— 人拍过板的事不该被算法再推翻
   const decided = new Map<string, DimDecision>();
@@ -322,6 +336,19 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     plan('company', r.company);
     plan('metric', r.metric);
   }
+
+  const invalidMetrics = new Set<string>();
+  for (const r of rows) {
+    const targetId = assigned.get(`metric|${r.metric}`);
+    const declaredSource = metricOf(r.metric, definitions);
+    const definition = (targetId && definitions.find((d) => resolvers.metric.resolve(d.name) === targetId)) || declaredSource;
+    const identityConflict = declaredSource && targetId !== resolvers.metric.resolve(declaredSource.name);
+    if (definition && (identityConflict || definition.calculation || definition.fact !== (spec.target ?? DEFAULT_TARGET))) {
+      invalidMetrics.add(definition.id);
+    }
+  }
+  if (invalidMetrics.size) return { ...base, errors: [{ level: 'error', code: 'METRIC_INPUT_INVALID', at: 'source',
+    message: `这些指标为派生指标、属于其他事实表或与声明身份冲突，不能接入源金额：${[...invalidMetrics].join('、')}` }] };
 
   // ---- 干跑（planOnly）：判定做完就停，一次库都不写 ----
   // ★ 必须排在下面 needsDecision 的早退之前：干跑的用处正是"先看清楚哪些名字要人拍板"，
@@ -544,8 +571,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
   //   在此之前，「写维度 → 写事实 → 改批次状态」是几条独立的 execute：关卡把它们拦在写之前，
   //   但一旦开始写，中途失败就会留下**半个批次**（批次行停在 pending、维度建了、事实没写）。
   //   半个批次比整批拒绝难查得多 —— 它看起来像"导过了"。
-  //   ⚠️ Parquet 归档必须留在 COMMIT **之后**：`exportParquet()` 另开短命只读实例，
-  //      事务未提交时它拿不到锁（DuckDB 单写者锁，见 AGENTS.md §4 备忘 5）。
+  //   Parquet 归档留在 COMMIT 之后：读连接只能看到已提交数据，归档失败不回滚导入。
   // ⚠️ 这几个必须在**事务外**声明：事务里赋值，事务结束后（return 时）还要用。
   //    放进 try 里会变成块级作用域 —— 编译器不报，运行时才炸（踩过一次）。
   const createdCompanies: string[] = [];
@@ -566,6 +592,8 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
       `INSERT INTO import_batch (batch_id, source_file, row_count, imported_at, status, note)
        VALUES (${lit(batchId)}, ${lit(effSource ?? '')}, ${rows.length}, now(), 'pending', ${lit(`接入规格 ${spec.id}${replaceNote}`)})`,
     );
+    await execute(`INSERT INTO ingest_snapshot (batch_id, spec_json, catalog_json, metrics_json)
+      VALUES (${lit(batchId)}, ${lit(JSON.stringify({ ...spec, source: effSource }))}, ${lit(JSON.stringify(conversionCatalog))}, ${lit(JSON.stringify(definitions))})`);
 
     // ★ 版本行的生效日 = **本批最早的期数**（不是 now()）：重放要确定性 ——
     //   同一份 raw 今天跑与下个月跑，"这一版从哪天生效"必须一样（db/scd2.ts 文件头纪律 ①）。
@@ -768,16 +796,14 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
     throw e;
   }
 
-  // Parquet 归档：留着溯源（铁律 11 —— 主实例 enable_external_access=false，只能走 exportParquet 的短命只读实例）
-  // ★ 放在 COMMIT **之后**：归档要另开实例拿库的锁，事务未提交时拿不到。
+  // COMMIT 后从主库读取批次，交给独立内存实例写归档；主库始终禁用外部访问。
   try {
     const dir = `${PARQUET_ROOT}/${target}/batch=${batchId}`;
     mkdirSync(dir, { recursive: true });
     await exportParquet(
-      `COPY (SELECT * FROM ${target} WHERE ${fact.provenanceColumn ?? fact.periodColumn} = ${
+      `SELECT * FROM ${target} WHERE ${fact.provenanceColumn ?? fact.periodColumn} = ${
         fact.provenanceColumn ? lit(batchId) : lit(day(rows[0]!.period))
-      }) TO '${dir}/${PART_FILE}' (FORMAT parquet)`,
-      // ★ 写完读回来数一遍：归档曾经"静默写出空文件"而 archived 还报 true（§4 备忘 13）。
+      }`,
       { path: `${dir}/${PART_FILE}`, rows: inserted },
     );
   } catch (e) {
@@ -789,6 +815,7 @@ async function runIngestInner(spec: IngestSpec, opts: IngestRunOptions): Promise
 
   return {
     ok: true,
+    candidateRows: rows.length,
     batchId,
     inserted,
     createdCompanies,

@@ -84,7 +84,10 @@ function tokenize(src: string): Token[] {
 //   unary  := ('-' | '+')? primary
 //   primary:= number | ident | '(' expr ')'
 
-interface Node { eval(scope: ExprScope): number | null }
+interface Node {
+  eval(scope: ExprScope): number | null;
+  sql(ref: (name: string) => string): string;
+}
 
 // ⚠️ Node 原生 TS 是 strip-only 模式，不支持构造函数参数属性
 //    （`constructor(private v: number)`）—— 必须显式声明字段。
@@ -92,11 +95,13 @@ class Num implements Node {
   v: number;
   constructor(v: number) { this.v = v; }
   eval() { return this.v; }
+  sql() { return String(this.v); }
 }
 
 class Ref implements Node {
   name: string;
   constructor(name: string) { this.name = name; }
+  sql(ref: (name: string) => string) { return '(' + ref(this.name) + ')'; }
   eval(scope: ExprScope) {
     if (!(this.name in scope)) {
       throw new ExprError(
@@ -114,6 +119,10 @@ class Bin implements Node {
   l: Node;
   r: Node;
   constructor(op: string, l: Node, r: Node) { this.op = op; this.l = l; this.r = r; }
+  sql(ref: (name: string) => string) {
+    const a = this.l.sql(ref), b = this.r.sql(ref);
+    return `(${a} ${this.op} ${this.op === '/' || this.op === '%' ? `NULLIF(${b}, 0)` : b})`;
+  }
   eval(scope: ExprScope): number | null {
     const a = this.l.eval(scope);
     const b = this.r.eval(scope);
@@ -134,6 +143,7 @@ class Bin implements Node {
 
 class Neg implements Node {
   x: Node;
+  sql(ref: (name: string) => string) { return '(-' + this.x.sql(ref) + ')'; }
   constructor(x: Node) { this.x = x; }
   eval(scope: ExprScope) {
     const v = this.x.eval(scope);
@@ -201,6 +211,11 @@ export function parseExpr(src: string): Node {
  */
 export function evalExpr(src: string, scope: ExprScope): number | null {
   return parseExpr(src).eval(scope);
+}
+
+/** 只将解析树中的白名单运算符与调用方提供的引用编译为 SQL。 */
+export function compileExpr(src: string, ref: (name: string) => string): string {
+  return parseExpr(src).sql(ref);
 }
 
 /** 抽取表达式引用的口径名（供 lint 校验「引用的口径是否真的在 cols.order 里」） */

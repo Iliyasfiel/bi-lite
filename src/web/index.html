@@ -150,8 +150,7 @@
     <div class="card">
       <h2>已注册报表</h2>
       <p class="hint">
-        每张报送表是一个声明式 spec（<code>specs/*.yaml</code>）。换口径只改 spec 里的
-        <code>cols.order</code> 一行，数据与版式都不用手工重抄。
+        选择已保存的报表，核对参数和取数范围后导出。同一份数据可用于不同报表。
       </p>
       <div id="specs"><p class="hint">加载中…</p></div>
     </div>
@@ -159,10 +158,9 @@
     <div class="card hidden" id="reportCard">
       <h2 id="reportTitle"></h2>
       <div class="actions">
-        <label>年份 <input type="number" id="rYear" style="width:6em"></label>
-        <label>月份 <input type="number" id="rMonth" min="1" max="12" style="width:5em"></label>
+        <div class="actions" id="reportParams"></div>
         <button class="primary" id="doPreview">预览</button>
-        <button id="doRender">导出 Excel</button>
+        <button id="doRender" disabled>导出 Excel</button>
         <span class="hint" id="renderMsg"></span>
       </div>
       <div id="reportPreview"></div>

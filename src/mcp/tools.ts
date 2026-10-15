@@ -20,7 +20,7 @@ import XLSXPopulate from 'xlsx-populate';
 import type { Workbook } from 'xlsx-populate';
 import * as db from '../db/index.ts';
 import { catalog } from '../semantic/query.ts';
-import { parseSpec, expandBlock, diagnoseSpec, type Spec } from '../spec/types.ts';
+import { parseSpec, substitute, diagnoseSpec, type Spec } from '../spec/types.ts';
 import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
 import { declaredFactsOf } from '../gen/parse.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
@@ -215,7 +215,7 @@ export async function previewSpec(args: { spec?: string; specFile?: string; para
   for (const sheet of spec.sheets) {
     for (const b of sheet.blocks) {
       const anchor = resolveAnchor(wb, sheet.name, b.anchor);
-      const { rowLabels, colLabels } = expandBlock(b, p);
+      const { rowLabels, colLabels } = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
       const endRef = toRef(anchor.row + Math.max(rowLabels.length, 1) - 1, anchor.col + Math.max(colLabels.length, 1) - 1);
 
       const chart = b.chart
@@ -240,6 +240,10 @@ export async function previewSpec(args: { spec?: string; specFile?: string; para
         rows: { dim: b.rows.dim, count: rowLabels.length, labels: rowLabels },
         cols: { dim: b.cols.dim, count: colLabels.length, labels: colLabels },
         cells: rowLabels.length * colLabels.length,
+        selection: {
+          metric: b.value.metric ? substitute(b.value.metric, p) : null,
+          periodType: b.value.periodType ? substitute(b.value.periodType, p) : null,
+        },
         templateHeaderAbove: headerAbove,
         chart,
         ...(anchor.warning ? { warning: anchor.warning } : {}),

@@ -22,6 +22,7 @@ import { lintAnchorGeometry } from '../spec/geometry.ts';
 import type { DeclaredFact } from '../gen/ir.ts';
 import { DEFAULT_TARGET } from '../gen/ir.ts';
 import type { DimKind } from './resolve.ts';
+import { lintTransforms, type ValueTransform } from './transform.ts';
 
 // ---------------- 列号工具（Excel 列字母 ↔ 序号） ----------------
 
@@ -109,6 +110,8 @@ export interface SkipColumnsSpec {
 }
 
 export interface ValueColumnsSpec {
+  /** 显式单位/符号转换；指标规则覆盖默认规则，未匹配值保持原样。 */
+  transforms?: ValueTransform[];
   /** 值列，必须**显式列出**，不自动推断（自动推断列族出过一次静默错位） */
   columns: string[];
   /**
@@ -603,6 +606,7 @@ export function lintIngest(spec: IngestSpec, ctx: IngestLintContext = {}): Inges
       // 有效清单 = columns 展开后**减去** skip（跳过优先）。判据只有一份：
       // 这里和 dry-run 都用 effectiveValueColumns()，不在两处各写一遍（铁律 17）。
       const v = (block?.values ?? {}) as ValueColumnsSpec;
+      for (const problem of lintTransforms(v.transforms)) err('TRANSFORM_BAD', `${at}.values.transforms`, problem);
       const {
         cols, overlap, badFromColumns, badFromSkip, duplicateSkips,
       } = effectiveValueColumns(v);

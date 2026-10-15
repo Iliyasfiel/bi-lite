@@ -1,0 +1,42 @@
+id: 公司盈利对比表
+title: 公司盈利对比与口径分析
+template: test/fixtures/公司盈利对比表.xlsx
+params:
+  year: 2026
+  month: 6
+  periodType: 本年累计
+sheets:
+  - name: 公司盈利对比
+    blocks:
+      - anchor: { name: COMPANY_PROFIT_START }
+        rows:
+          dim: company
+          order: [集团公司, 华东子公司, 华南子公司, 华北子公司]
+        cols:
+          dim: metric
+          order: [revenue, operating_cost, gross_profit, gross_margin]
+        value:
+          measure: amount
+          agg: sum
+          periodType: "{{periodType}}"
+        scope:
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+  - name: 公司毛利率
+    blocks:
+      - anchor: B4
+        rows:
+          dim: company
+          order: [集团公司, 华东子公司, 华南子公司, 华北子公司]
+        cols:
+          dim: period_type
+          order: [本年累计, 去年同期累计, 单月]
+        value:
+          measure: amount
+          agg: sum
+          metric: gross_margin
+        scope:
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
