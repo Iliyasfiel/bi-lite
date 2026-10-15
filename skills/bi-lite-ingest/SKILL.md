@@ -18,7 +18,24 @@ agent 只编写规格；金额读取、计算、落库、填表由本地引擎�
 | 报表 | `generate_spec`、`lint_spec`、`preview_spec`、`render_report`、`diff_report` |
 | 接入 | `lint_ingest`、`dry_run_ingest`、`run_ingest` |
 
-先读取目录，名称、目标事实表与口径以目录为准，不使用 SQL 或 shell 取数。
+先读取目录，名称、目标事实表与口径以目录为准。只通过以下引擎入口操作，不用 SQL、自编脚本或 `query` 命令读取金额。
+
+## 本地 CLI（未配置 MCP 时使用）
+
+在项目根目录运行；Web、CLI、MCP 轮流使用同一数据库。未配置 MCP 时可以使用以下 CLI。
+
+| MCP 操作 | 对应 CLI |
+|---|---|
+| 目录 | `node src/cli.ts catalog dump --format prompt` |
+| 源结构 | `node src/cli.ts agent look <源.xlsx>` |
+| 模板结构 | `node src/cli.ts agent template --template <模板.xlsx>` |
+| 生成草稿 | `node src/cli.ts agent generate --template <模板.xlsx>` |
+| 校验/预览 | `node src/cli.ts validate <规格.yaml>`、`node src/cli.ts agent preview <规格.yaml>` |
+| 接入 | `node src/cli.ts ingest lint <规格.yaml>`、`node src/cli.ts ingest dry-run <规格.yaml>`、`node src/cli.ts ingest run <规格.yaml>` |
+| 填表 | `node src/cli.ts render <规格.yaml> --out <文件.xlsx>` |
+
+CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态。全局安装方案见 `docs/CLI升级计划.md`，当前不依赖尚未完成的全局分发功能。
+项目 skill 可通过 `.agents/skills/bi-lite-ingest` 链接到本目录。
 
 ## 接入流程与字段
 
@@ -52,6 +69,7 @@ sheets:
 
 值列显式列出，可用 `skip` 排除派生列；口径可由表头映射或按列顺序给定。
 固定主体/指标/期数可用 `facts` 的 `literal` 或 `cell` 指定。
+`values.transforms` 按指标定义将源单位转换为标准单位。百分数和比率不同：单位 `%` 的 57.77 表示 57.77%，不能再次乘以 100。
 期数字符串支持年月与完整日期；Excel 日期格须声明 `type: date`，只支持 1900 日期系统。
 正式源路径放 `data/`，测试示例放 `test/fixtures/`。名称、空值、冲突问题按诊断处理。
 
@@ -65,3 +83,10 @@ sheets:
 指标与口径必须确定，累计需指定期末，参数要实际被引用。
 示例见 `specs/月度保送表.yaml`；窗口、场景和币种定义见 `models/fact_finance.yml`。
 模板格式与公式由引擎保留，精细排版在人使用的 Excel 中完成。
+
+## 本项目的18期测试包
+
+使用 `ingest/18期经营测试.yaml` 和 `specs/18期经营报送.yaml`，数据解释见 `docs/18期经营测试.md`。
+源表的同比/环比列不落金额事实；去年同期由2025年窗口取数。报送模板保留增长率公式，并使用“上月取数”辅助表。
+改报告期时同时调整 `previousYear`、`previousMonth`，一月的上月为上一年十二月。导出后在 Excel 打开以重算模板公式。
+集团合并主体与本部/子公司是两种观察范围，做集团汇总时只选择合并主体，不将五个主体一起加总。
