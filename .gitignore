@@ -15,6 +15,7 @@ probe-*.ts
 
 # 依赖与编辑器
 node_modules/
+.agents/skills/
 npm-debug.log*
 .DS_Store
 .idea/
