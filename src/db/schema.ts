@@ -164,6 +164,7 @@ export const PERIOD_TYPES = [
   { id: '本年累计', label: '本年累计', derivable: false, note: '含审计调整，必须实存' },
   { id: '去年同期累计', label: '去年同期累计', derivable: false, note: '来自去年账，无法从本月派生' },
   { id: '单月', label: '单月', derivable: false, note: '最基础的事实值，实际值' },
+  { id: '本月累计', label: '本月累计', derivable: false, note: '本月发生额，与单月使用相同窗口' },
   { id: '单月同比', label: '单月同比', derivable: true, note: '可由 (本月 - 去年同月)/去年同月 派生' },
   { id: '账面累计', label: '账面累计', derivable: false, note: '含审计调整，与单月累加不等' },
 ] as const;

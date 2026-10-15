@@ -14,6 +14,8 @@ windowFrom: period_from
 calibers:
   - name: 单月
     from: same
+  - name: 本月累计
+    from: same
   - name: 本年累计
     from: year_start
   - name: 去年同期累计

@@ -1,0 +1,33 @@
+metrics:
+  - id: revenue
+    name: 营业收入
+    unit: 元
+    category: 主要指标
+  - id: total_profit
+    name: 利润总额
+    unit: 元
+    category: 盈利指标
+  - id: operating_cost
+    name: 营业成本
+    unit: 元
+    category: 主要指标
+    direction: negative
+  - id: net_profit
+    name: 净利润
+    unit: 元
+    category: 盈利指标
+  - id: period_expense
+    name: 期间费用
+    unit: 元
+    category: 主要指标
+    direction: negative
+  - id: gross_profit
+    name: 毛利润
+    unit: 元
+    category: 盈利指标
+    calculation: revenue - operating_cost
+  - id: gross_margin
+    name: 毛利率
+    unit: 比率
+    category: 盈利指标
+    calculation: gross_profit / revenue

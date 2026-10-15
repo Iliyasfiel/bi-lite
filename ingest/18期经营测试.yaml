@@ -1,0 +1,30 @@
+id: 18期经营测试
+source: data/testing/经营测试数据_202501-202606.xlsx
+target: fact_finance
+onConflict: reject
+unknownMaster: create
+onEmptyMeasure: skip
+sheets:
+  - name: 经营数据
+    blocks:
+      - anchor: E2
+        rows:
+          - { col: A, dim: company }
+          - { col: C, dim: metric }
+        values:
+          columns: [E, F, G, H, I]
+          skip:
+            - columns: [F]
+              why: 去年同期累计由已导入的2025年累计窗口取数，不重复申报
+            - columns: [G, I]
+              why: 同比增长率和环比增长率为派生结果，在报送模板计算，不作为金额事实落库
+          periodTypes: [本年累计, 本月累计]
+          transforms:
+            - { fromUnit: 万元, toUnit: 元 }
+            - metrics: [debt_to_asset_ratio, return_on_equity]
+              fromUnit: "%"
+              toUnit: "%"
+        keys:
+          - { col: B, as: period }
+          - { as: scenario, value: 实际 }
+          - { as: ccy, value: 人民币 }

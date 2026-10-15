@@ -1,0 +1,379 @@
+id: 18期经营报送
+title: 五主体六指标经营报送
+template: templates/18期经营报送模板.xlsx
+params:
+  year: 2026
+  month: 6
+  previousYear: 2026
+  previousMonth: 5
+sheets:
+  - name: 报送表
+    blocks:
+      - anchor: D5
+        rows:
+          dim: metric
+          order: &a1
+            - total_revenue
+            - total_profit
+            - operating_cash_flow
+            - debt_to_asset_ratio
+            - return_on_equity
+            - new_contract_amount
+        cols:
+          dim: period_type
+          order:
+            - 本年累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（合并）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: D11
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本年累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（本部）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: D17
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本年累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司A
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: D23
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本年累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司B
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: D29
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本年累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司C
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: E5
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 去年同期累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（合并）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: E11
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 去年同期累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（本部）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: E17
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 去年同期累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司A
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: E23
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 去年同期累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司B
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: E29
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 去年同期累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司C
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: G5
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（合并）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: G11
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（本部）
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: G17
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司A
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: G23
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司B
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+      - anchor: G29
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司C
+          time:
+            year: "{{year}}"
+            month: "{{month}}"
+  - name: 上月取数
+    blocks:
+      - anchor: D5
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（合并）
+          time:
+            year: "{{previousYear}}"
+            month: "{{previousMonth}}"
+      - anchor: D11
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 集团公司（本部）
+          time:
+            year: "{{previousYear}}"
+            month: "{{previousMonth}}"
+      - anchor: D17
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司A
+          time:
+            year: "{{previousYear}}"
+            month: "{{previousMonth}}"
+      - anchor: D23
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司B
+          time:
+            year: "{{previousYear}}"
+            month: "{{previousMonth}}"
+      - anchor: D29
+        rows:
+          dim: metric
+          order: *a1
+        cols:
+          dim: period_type
+          order:
+            - 本月累计
+        value:
+          measure: amount
+          agg: sum
+        scope:
+          company:
+            filter:
+              name: 子公司C
+          time:
+            year: "{{previousYear}}"
+            month: "{{previousMonth}}"
