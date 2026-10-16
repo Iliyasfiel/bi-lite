@@ -3,22 +3,23 @@
 轻量的本地 BI 引擎：把不同形态的 Excel 按 YAML 规格导入 DuckDB，再按指定模板生成报送 Excel。
 主要目标是模板填表报送；查询与图表是辅助能力。数据与计算留在本机。
 
-当前工作区已准备5主体、6指标、18期的经营测试包，先按 [18期经营测试](docs/18期经营测试.md) 试跑。
-该配置与下方原有小型示例不同；项目自动验收使用独立指标配置，不会修改测试包或本地业务库。
+仓库提供5主体、6指标、18期的可重建经营测试包，按 [18期经营测试](docs/18期经营测试.md) 恢复后试用。
+下方的小型示例使用另一组指标；自动验收使用独立临时副本，不修改本地测试源或业务库。
 
 ## 开始使用
 
-开发需要 Node ≥22.6，直接运行 TypeScript；仅打包时转译 JavaScript，安装时无需编译器，无外部数据库服务。
-实际安装包当前在 Windows / Node 24.18.0 验收；最低 Node 和其他平台分发支持待确认。
+开发环境基线、安装和排障见 [CONTRIBUTING.md](CONTRIBUTING.md)；必读约定见 [AGENTS.md](AGENTS.md)。
+开发直接运行 TypeScript，仅打包时转译 JavaScript，无外部数据库服务；最低 Node 和其他平台分发支持待确认。
 
 ```bash
-npm install --cache /tmp/bi-lite-npm-cache
-npm run fixtures --cache /tmp/bi-lite-npm-cache
-npm start --cache /tmp/bi-lite-npm-cache
+npm ci
+npm run doctor
+npm run fixtures:business
+npm start
 ```
 
-打开 http://127.0.0.1:4319 。示例源与空白模板由 `fixtures` 生成在 `test/fixtures/`。
-`ingest/月度经营接入.yaml` 与 `specs/月度保送表.yaml` 是配套示例。
+打开 http://127.0.0.1:4319 。上述命令恢复18期测试包，不自动执行导入。
+原有小型示例由 `fixtures` 生成在 `test/fixtures/`，配套 `ingest/月度经营接入.yaml` 与 `specs/月度保送表.yaml`；使用方式与隔离说明见贡献指南。
 
 导入流程：选源文件 → 编写或加载接入 YAML → 校验、试运行 → 确认主数据 → 执行导入。
 保存到 `ingest/` 只保存规格；点击执行导入或运行 CLI 接入命令才会进库。
@@ -38,7 +39,7 @@ npm start --cache /tmp/bi-lite-npm-cache
 - 模板生成报表规格草稿、规格预览、Excel 导出，保留原模板格式与公式。
 - Web、CLI、MCP 共用引擎。agent 产出规格，工具只返回结构与执行结果描述。
 
-Web、CLI、MCP 应轮流使用同一数据库；Web 默认只监听本机。
+Web 运行时 CLI 转交同一持库服务；MCP 目前须单独占库。Web 默认只监听本机。
 
 ## YAML 指标定义
 
@@ -77,7 +78,7 @@ node src/cli.ts render specs/盈利指标表.yaml --out 盈利指标.xlsx
 ```
 
 校验会检查同目录下全部指标文件及跨文件引用，不写数据库。
-正常启动入口时事务同步主数据；修改定义后重启正在运行的 Web/MCP。
+启动时事务同步主数据，Web 在串行操作开始时重读声明；MCP 修改定义后需重启。
 存量名称/别名对应多个指标时会拒绝同步，需要先人工归并。
 属性变更保留历史；可用 `effectiveFrom: "2026-10-15"` 指定生效日，省略为当天，
 变更日期必须晚于当前版本起点。删除声明不删除历史主数据和旧别名。
@@ -149,11 +150,11 @@ transforms:
 
 ```bash
 # 在任意目录，操作已有的 bi-lite 工作区
-bilite --workspace "D:/Documents/Codes/bi-lite" agent preview specs/18期经营报送.yaml
+bilite --workspace ./my-bi agent preview specs/月报.yaml
 
 # 或建立独立工作区，之后使用该目录自己的模型、指标和数据库
-bilite init "D:/Documents/My BI"
-bilite --workspace "D:/Documents/My BI" catalog dump --format prompt
+bilite init ./my-bi
+bilite --workspace ./my-bi catalog dump --format prompt
 ```
 
 `--workspace`（简写 `-C`）放在命令前；也可用 `BILITE_WORKSPACE` 环境变量指定工作区，未指定时从当前目录向上识别工作区标识。
@@ -182,7 +183,7 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
 | `skill install` | 可选安装项目/用户级手册副本；`--force` 显式更新 |
 
-开发验收：`npm run e2e` 复用隔离主链路，`npm run package:check` 生成并安装真实包，在临时目录验证 CLI、网页和 skill。后者需要依赖缓存或可用的 npm 网络连接。
+开发验收入口与范围见贡献指南；`npm run e2e` 验证主链路，`npm run package:check` 验证真实安装包。
 
 导入并出表的示例：
 
@@ -201,19 +202,15 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 
 ### 安装 skill（以 Codex 为例）
 
-在仓库根目录执行，将现有手册注册为项目 skill：
+在业务工作区中显式安装手册副本：
 
 ```bash
-mkdir -p .agents/skills
-ln -s ../../skills/bi-lite-ingest .agents/skills/bi-lite-ingest
+bilite skill install
 ```
 
-链接已存在时无需重建。Codex 从 `.agents/skills/` 发现 skill，支持目录符号链接。
-在本项目中打开对话，输入 `$bi-lite-ingest`，或明确要求“使用 bi-lite-ingest 接入这个 Excel”。
-如果尚未显示，重新打开客户端。其他 agent 按其 skill 目录约定安装同一份手册。
-
-现有 skill 手册按 MCP 工具流程编写，按该流程使用时需配置 MCP。
-本地 agent 也可调用上述 CLI 命令，无需启动 MCP 服务；skill 本身只提供操作说明。
+源码开发可用 `node bin/bilite.mjs skill install`，不要求全局命令。
+已有开发链接或副本时先保留，按需由用户决定是否替换；安装不会静默覆盖。
+手册可配合 CLI 使用，无需 MCP；宿主按自己的发现机制载入项目 `.agents/skills/bi-lite-ingest`。
 手册在 `skills/bi-lite-ingest/SKILL.md`，可粘贴提示在同目录的 `AGENT-PROMPT.md`。
 
 ### 配置 MCP（以 Codex 为例）
@@ -230,7 +227,7 @@ cwd = "/绝对路径/bi-lite"
 如果客户端启动环境找不到 Node，将 `command` 换成 Node 可执行文件的绝对路径。
 配置后运行 `codex mcp list` 检查是否注册，再在对话中调用 `get_catalog` 验证连接。
 服务端由客户端启动，采用 stdio，不需要额外启动 HTTP 服务。
-**使用同一数据库前先停止 Web 或其他 MCP 进程。** `cwd` 必须是仓库根目录，规格与模型使用相对路径。
+**使用同一数据库前先停止 Web 或其他 MCP 进程。** `cwd` 指向目标业务工作区；源码脚本路径指向引擎 checkout，规格与模型相对工作区解析。
 
 使用 `mcpServers` 配置格式且支持 `cwd` 的其他客户端，可使用：
 

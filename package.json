@@ -17,6 +17,7 @@
     "bilite": "bin/bilite.mjs"
   },
   "scripts": {
+    "doctor": "node scripts/doctor.mjs",
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",
     "start": "node src/server.ts",
