@@ -21,11 +21,7 @@
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",
     "start": "node src/server.ts",
-    "fixtures:business": "node test/prepare-business-fixtures.ts",
-    "build": "tsc --project tsconfig.json && npm run sync-assets",
-    "sync-assets": "node scripts/sync-package-assets.mjs",
-    "prepack": "npm run build",
-    "package:check": "npm run build && node test/package.ts"
+    "fixtures:business": "node test/prepare-business-fixtures.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.5",
