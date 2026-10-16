@@ -11,7 +11,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 if (process.argv[2] !== '--isolated') {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-lite-e2e-'));
   try {
-    for (const dir of ['src', 'models', 'ingest', 'specs', 'skills']) {
+    for (const dir of ['assets/presets/finance', 'bin', 'src', 'models', 'ingest', 'specs', 'skills']) {
       fs.cpSync(path.join(root, dir), path.join(tmp, dir), { recursive: true });
     }
     fs.cpSync(path.join(root, 'test/config/metrics'), path.join(tmp, 'metrics'), { recursive: true });
