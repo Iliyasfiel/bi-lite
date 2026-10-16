@@ -1,0 +1,24 @@
+# 业务线维度（声明内嵌行：这张表的行就写在声明里，写路径唯一 = `bilite rebuild` 全量对齐）——
+# id 是名字的纯函数（`bl_` + nameHash，src/gen/ir.ts），声明里只写名字，**id 不手写**。
+#
+# ★ 为什么行在声明里：业务线就这两行，它们是"声明的另一面"而不是数据 ——
+#   改一行 = 改这份 YAML = 一次可 review 的 git 提交，库里的行随时可以删了重建。
+#
+# ★ 带声明行的维表不许被事实表引用（parse 的单一写路径守卫 MODEL_ROWS_OWNER_BAD）：
+#   接入归并（人拍板）与 rebuild 对齐（声明投影）是两条写路径，会互相覆盖。
+#   所以 fact_business_line 保留行内退化列 business_line，不加指向这里的外键。
+kind: dimension
+title: 业务线维度（工业 / 消费）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    comment: bl_<nameHash>，名字的纯函数，由 sync 派生
+  - name: name
+    type: varchar
+    notNull: true
+    semantic: business_line
+rows:
+  - name: 工业
+  - name: 消费

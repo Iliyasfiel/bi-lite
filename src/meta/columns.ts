@@ -33,7 +33,9 @@ import { loadModels, MODEL_API_VERSION } from '../gen/parse.ts';
 export type { MetaRole, MetaColumn, MetaObject } from '../gen/ir.ts';
 
 /** **唯一一份**列契约：模型声明的投影（见上） */
-export const META: readonly MetaObject[] = metaOf(loadModels());
+export function currentMeta(): readonly MetaObject[] {
+  return metaOf(loadModels());
+}
 
 /** SQL 字符串字面量转义。⚠️ 本仓库另有几份同功能实现，待收拢 */
 function lit(v: string): string {
@@ -61,7 +63,7 @@ const NON_SEMANTIC = new Set([
  * ★ 由 `runIngest` 在**阶段 2 的事务里**调用：数据与元数据同一时刻落库。
  *   这样"元数据漂移"只可能来自**声明写错**，而那种漂移会被 `metaProblems()` 当场抓住。
  */
-export async function registerMeta(meta: readonly MetaObject[] = META): Promise<void> {
+export async function registerMeta(meta: readonly MetaObject[] = currentMeta()): Promise<void> {
   for (const obj of meta) {
     await execute(
       `INSERT INTO _meta_objects (object_name, kind, grain, api_version) VALUES ` +
@@ -107,7 +109,7 @@ export const API_VERSION = MODEL_API_VERSION;
  *             证明这个守卫真的会抓（否则"守卫存在"跟"守卫有用"是两回事）。
  * @returns 问题清单（空数组 = 声明与真实结构一致）
  */
-export async function metaProblems(meta: readonly MetaObject[] = META): Promise<string[]> {
+export async function metaProblems(meta: readonly MetaObject[] = currentMeta()): Promise<string[]> {
   const actual = await query<{ table_name: string; column_name: string }>(
     `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'`,
   );
@@ -146,7 +148,7 @@ export async function schemaFingerprint(): Promise<string> {
   const actual = await query<{ table_name: string; column_name: string }>(
     `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main' ORDER BY table_name, column_name`,
   );
-  const declared = META.map((o) => `${o.name}(${o.columns.map((c) => `${c.column}:${c.role}`).join(',')})`).join(';');
+  const declared = currentMeta().map((o) => `${o.name}(${o.columns.map((c) => `${c.column}:${c.role}`).join(',')})`).join(';');
   const live = actual.map((r) => `${r.table_name}.${r.column_name}`).join(',');
   return createHash('sha256').update(`${API_VERSION}|${declared}|${live}`).digest('hex').slice(0, 12);
 }

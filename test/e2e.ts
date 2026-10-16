@@ -1,16 +1,17 @@
 /** 六个主链路节点。在临时副本中运行；不读取或改写项目 data/。 */
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFile } from 'node:child_process';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 if (process.argv[2] !== '--isolated') {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-lite-e2e-'));
   try {
-    for (const dir of ['src', 'models', 'ingest', 'specs', 'skills']) {
+    for (const dir of ['assets/presets/finance', 'bin', 'src', 'models', 'ingest', 'specs', 'skills']) {
       fs.cpSync(path.join(root, dir), path.join(tmp, dir), { recursive: true });
     }
     fs.cpSync(path.join(root, 'test/config/metrics'), path.join(tmp, 'metrics'), { recursive: true });
@@ -262,8 +263,9 @@ async function verify() {
     assert.equal(toolRender.ok, true);
     assert.deepEqual(findAmountLike(JSON.parse(toolRender.text)), []);
     const { main } = await import('../src/cli.ts');
+    const showCliError = (message: string) => console.error(message);
     let cliOutput = '';
-    const cliIO = { out: (message: string) => { cliOutput = message; }, err: (message: string) => { if (message.includes('failed')) throw new Error(message); } };
+    const cliIO = { out: (message: string) => { cliOutput = message; }, err: showCliError };
     assert.equal(await main(['validate', 'metrics/finance.yml'], cliIO), 0);
     assert.equal(JSON.parse(cliOutput).kind, 'metrics');
     assert.equal(await main(['agent', 'look', ingest.source], cliIO), 0);
@@ -285,8 +287,32 @@ async function verify() {
       assert.deepEqual(skillProblems(fs.readFileSync(`skills/bi-lite-ingest/${file}`, 'utf8'), TOOLS.map((tool) => tool.name)), []);
     }
     const server = await import('../src/server.ts');
-    stop = server.stop;
+    stop = () => server.stop();
     const port = await server.start(0);
+    // Child CLI processes must use the live owner's queue, preserving output and locks.
+    const sharedCli = (args: string[]) => new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      execFile(process.execPath, [path.join(root, 'bin/bilite.mjs'), ...args], { encoding: 'utf8', timeout: 15000 },
+        (error, stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve({ stdout, stderr }));
+    });
+    fs.writeFileSync('test/fixtures/共享接入.yaml', JSON.stringify({ ...ingest, onConflict: 'replace' }));
+    const importedViaService = JSON.parse((await sharedCli(['ingest', 'run', 'test/fixtures/共享接入.yaml'])).stdout);
+    assert.equal(importedViaService.inserted, 80);
+    assert.equal(importedViaService.archived, true);
+    assert.deepEqual(findAmountLike(importedViaService), []);
+    const [sharedRender] = await Promise.all([
+      sharedCli(['render', specFile, '--out', 'shared.xlsx']), sharedCli(['catalog', 'dump']),
+    ]);
+    assert.equal(JSON.parse(sharedRender.stdout).cellsWritten, 20);
+    assert.deepEqual((await XLSX.fromFileAsync('output/shared.xlsx')).sheet('主要指标').range('B4:E8').value(), expected);
+    assert.equal(JSON.parse(fs.readFileSync('.bilite/db.lock', 'utf8')).pid, process.pid);
+    const runtimeState = JSON.parse(fs.readFileSync('.bilite/service.json', 'utf8'));
+    const operationId = crypto.randomUUID();
+    const request = { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + runtimeState.token },
+      body: JSON.stringify({ operationId, workspace: runtimeState.workspace, instanceId: runtimeState.instanceId, argv: ['catalog', 'dump'] }) };
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/operations`, { ...request, headers: { 'content-type': 'application/json' } })).status, 401);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/operations`, request)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/operations`, request)).status, 409);
+    assert.equal(JSON.parse((await sharedCli(['operation', 'status', operationId])).stdout).status, 'completed');
     const response = await fetch(`http://127.0.0.1:${port}/api/query`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ measures: [{ metric: '营业收入', periodType: '单月' }], filter: { month: '2026-06' }, audience: 'agent' }),
@@ -313,22 +339,47 @@ async function verify() {
     const webWorkbook = await XLSX.fromFileAsync(webExport.outputPath);
     assert.equal(webWorkbook.sheet('公司盈利对比').cell('B4').value(), webBlock.matrix[0].values[0]);
     await stop(); stop = undefined;
+    assert.equal(fs.existsSync('.bilite/service.json'), false);
+    assert.equal(fs.existsSync('.bilite/db.lock'), false);
     await db.close();
-    const cli = spawnSync(process.execPath, ['src/cli.ts', 'render', specFile, '--out', 'output/cli.xlsx'], { encoding: 'utf8' });
+    const cli = spawnSync(process.execPath, [root + '/bin/bilite.mjs', 'render', specFile, '--out', 'output/cli.xlsx'], { encoding: 'utf8' });
     assert.equal(cli.status, 0, cli.stderr);
     assert.equal(fs.existsSync('output/cli.xlsx'), true);
-    const derivedCli = spawnSync(process.execPath, ['src/cli.ts', 'render', 'specs/盈利指标表.yaml', '--out', 'output/盈利分析.xlsx'], { encoding: 'utf8' });
+    const derivedCli = spawnSync(process.execPath, [root + '/bin/bilite.mjs', 'render', 'specs/盈利指标表.yaml', '--out', 'output/盈利分析.xlsx'], { encoding: 'utf8' });
     assert.equal(derivedCli.status, 0, derivedCli.stderr);
-    const comparisonCli = spawnSync(process.execPath, ['src/cli.ts', 'render', 'specs/公司盈利对比表.yaml', '--out', 'output/公司对比.xlsx'], { encoding: 'utf8' });
+    const comparisonCli = spawnSync(process.execPath, [root + '/bin/bilite.mjs', 'render', 'specs/公司盈利对比表.yaml', '--out', 'output/公司对比.xlsx'], { encoding: 'utf8' });
     assert.equal(comparisonCli.status, 0, comparisonCli.stderr);
     const comparisonWorkbook = await XLSX.fromFileAsync('output/公司对比.xlsx');
     assert.deepEqual(comparisonWorkbook.sheet('公司盈利对比').range('B4:E7').value(), companyValues);
     assert.equal(comparisonWorkbook.sheet('公司毛利率').cell('B4').value(), companyValues[0][3]);
     assert.equal(readNumberFormat(comparisonWorkbook, comparisonWorkbook.sheet('公司盈利对比').cell('E4')), '0.00%');
     fs.writeFileSync('test/fixtures/重放标识.yaml', `id: ${ingest.id}\n`);
-    const replayCli = spawnSync(process.execPath, ['src/cli.ts', 'replay', 'test/fixtures/重放标识.yaml'], { encoding: 'utf8' });
+    const replayCli = spawnSync(process.execPath, [root + '/bin/bilite.mjs', 'replay', 'test/fixtures/重放标识.yaml'], { encoding: 'utf8' });
     assert.equal(replayCli.status, 0, replayCli.stderr);
     assert.equal(JSON.parse(replayCli.stdout).specSource, 'batch-snapshot');
+    // 安装入口从其他目录启动，必须先选择工作区，且初始化不能覆盖既有模型。
+    const caller = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-lite-cli-'));
+    try {
+      const entry = path.join(root, 'bin/bilite.mjs');
+      const newWorkspace = path.join(caller, '独立工作区');
+      const init = spawnSync(process.execPath, [entry, 'init', newWorkspace, '--preset', 'finance'], { cwd: caller, encoding: 'utf8' });
+      assert.equal(init.status, 0, init.stderr);
+      assert.equal(fs.existsSync(path.join(newWorkspace, 'models/fact_finance.yml')), true);
+      assert.deepEqual(fs.readdirSync(path.join(newWorkspace, 'metrics')), []);
+      assert.equal(fs.existsSync(path.join(newWorkspace, 'data/bi.duckdb')), false);
+      assert.equal(spawnSync(process.execPath, [entry, 'init', newWorkspace], { cwd: caller }).status, 2);
+      const fromElsewhere = spawnSync(process.execPath, [entry, '--workspace', root, 'agent', 'preview', specFile], { cwd: caller, encoding: 'utf8' });
+      assert.equal(fromElsewhere.status, 0, fromElsewhere.stderr);
+      assert.equal(JSON.parse(fromElsewhere.stdout).blocks[0].dataRange, 'B4:E8');
+      assert.equal(spawnSync(process.execPath, [entry, '--version'], { cwd: caller }).status, 0);
+      const emptyWorkspace = path.join(caller, '空工作区');
+      assert.equal(spawnSync(process.execPath, [entry, 'init', emptyWorkspace], { cwd: caller }).status, 0);
+      assert.deepEqual(fs.readdirSync(path.join(emptyWorkspace, 'models')), []);
+      const emptyPlan = spawnSync(process.execPath, [entry, '--workspace', emptyWorkspace, 'plan', '--check'], {
+        cwd: caller, encoding: 'utf8', env: { ...process.env, BILITE_DB: path.join(emptyWorkspace, 'data/bi.duckdb') },
+      });
+      assert.equal(emptyPlan.status, 0, emptyPlan.stderr);
+    } finally { fs.rmSync(caller, { recursive: true, force: true }); }
     passed('MCP / Web / CLI → 共用引擎与受众边界');
     console.log('6 个核心节点通过；临时数据将清理。');
   } finally {

@@ -1,0 +1,48 @@
+# 公司维度的**历史版本行**（SCD2 之二：类型 2 的版本行）。
+#
+# ★ 为什么历史挂在**侧表**、而不是让 `dim_company` 自己变成多版本：
+#   `dim_company` 是**当前态**的唯一真相 —— 全仓库的查询、spec 编译、看板、agent 目录都直接 join 它。
+#   若把版本行塞进它（PK 变成 `(id, valid_from)`），那么**每一处 join 都必须补 `is_current`**，
+#   少写一处就是"同一家公司在结果里出现两次"（数字翻倍，而报表看起来完全正常）。
+#   侧表把这份成本关在一个地方：**当前态查询一个字都不用改**（这是"零回归"的结构性保证），
+#   历史查询则必须显式说"我要 as-of"（`dimAsOf`）—— 两件事不再混在一起。
+#
+# ★ 已知边界（写在声明里，别让下一个人以为是漏做）：
+#   事实行仍然只记**业务键**（`company_id`），不记版本键 —— 所以"按事实期自动取当时那一版"
+#   需要一次**显式**的 as-of join（`dimAsOf`）。要把这件事变成默认行为，就是类型 2 的
+#   "版本键进事实表"（surrogate key），那是一次跨全链路的切换，不在本轮。
+kind: dimension
+title: 公司维度历史（SCD2 版本行）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    refs: dim_company
+    semantic: org
+    comment: 业务键（与 dim_company.id 同值；历史按它串起来）
+  - name: valid_from
+    type: date
+    key: true
+    notNull: true
+    semantic: valid
+    comment: 这一版从哪天起生效（用期的首日，**不用 now()** —— 重放要确定性）
+  - name: valid_to
+    type: date
+    semantic: valid
+    comment: 到哪天为止（NULL = 生效中）
+  - name: is_current
+    type: boolean
+    default: 'TRUE'
+    comment: 与 valid_to IS NULL 冗余，但人读 SQL 时更直白；两者不一致会被 scdProblems() 抓住
+  - name: name
+    type: varchar
+    semantic: org
+  - name: parent_id
+    type: varchar
+    semantic: org
+  - name: level
+    type: integer
+  - name: group_name
+    type: varchar
+    comment: 所属板块 —— "维度属性会变"最典型的例子

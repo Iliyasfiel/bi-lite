@@ -14,19 +14,25 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import * as db from './db/index.ts';
 import type { DimDecision } from './ingest/types.ts';
 import { normalizeName, type DimKind } from './ingest/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
-import { declaredFactsOf } from './gen/parse.ts';
-import { renderTemplate, type RenderBlock } from './render/excel.ts';
+import { declaredFactsOf, loadModels } from './gen/parse.ts';
+import { renderReport } from './operations/report.ts';
+import { prepareIngest } from './operations/ingest.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
 import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
 import { diagnoseIngest, parseIngestSpec, type IngestSpec } from './ingest/types.ts';
 import { runIngest } from './ingest/run.ts';
 import { masterCatalog } from './ingest/master.ts';
+import { SERVICE_PROTOCOL, clearServiceState, writeServiceState } from './runtime/workspace.ts';
+import { acquireWorkspaceLock, servicePeer, workspacePath, databasePath } from './runtime/service.ts';
+import { runInvocation } from './runtime/invocation.ts';
+import { randomUUID } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 const PORT = Number(process.env.PORT ?? 4319);
@@ -106,19 +112,26 @@ function loadIngestText(body: { yaml?: string; specFile?: string }): { text: str
 }
 
 /** 接入规格的静态诊断（与 MCP 侧 lint_ingest 同一套判据：diagnoseIngest） */
-async function diagIngest(text: string) {
-  const cat = await masterCatalog();
-  const d = diagnoseIngest(text, { periodTypes: cat.periodTypes, facts: cat.facts });
-  return {
-    cat,
-    d,
-    errors: d.issues.filter((i) => i.level === 'error'),
-    warnings: d.issues.filter((i) => i.level === 'warn'),
-  };
-}
+const diagIngest = prepareIngest;
 
 /** HTTP 路由表，与本地 Web 共用。 */
 export const routes: Record<string, Handler> = {
+  'GET /api/workspace': async (_req, res) => {
+    const ir = loadModels();
+    json(res, 200, { workspace: WORKSPACE, modelCount: ir.tables.length, empty: ir.tables.length === 0 });
+  },
+
+  'POST /api/workspace/preset': async (req, res) => {
+    const body = await readJson<Record<string, unknown>>(req);
+    if (!body || Object.keys(body).length) return json(res, 400, { error: '此入口只添加财务基础模型，不接受其他配置' });
+    try {
+      const { initializeWorkspace } = await import('../bin/workspace.mjs');
+      const result = initializeWorkspace(['--preset', 'finance'], WORKSPACE, fileURLToPath(new URL('../', import.meta.url)));
+      await db.refresh();
+      json(res, 200, result);
+    } catch (error) { json(res, 400, { error: (error as Error).message }); }
+  },
+
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
   'GET /api/catalog': async (_req, res) => {
     json(res, 200, await catalog());
@@ -442,28 +455,11 @@ export const routes: Record<string, Handler> = {
     if (!spec.template) return json(res, 400, { error: 'spec 未声明 template' });
     if (!fs.existsSync(spec.template)) return json(res, 400, { error: `模板不存在: ${spec.template}` });
 
-    const blocks: RenderBlock[] = [];
-    for (const sheet of spec.sheets) {
-      for (const b of sheet.blocks) {
-        const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
-        const result = await runCompiled(compiled, (sql) => db.query(sql));
-        blocks.push({
-          sheet: sheet.name,
-          anchor: b.anchor,
-          colLabels: result.colLabels,
-          rows: result.matrix.map((m) => ({ label: m.label, values: m.values })),
-          format: b.value.format,
-          writeRowLabels: false,   // 模板已预置行标签
-          writeColLabels: false,   // 模板已预置列标签
-        });
-      }
-    }
-
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     const outName = output ? safeName(output) : `${safeName(spec.id)}-${p.year ?? ''}${String(p.month ?? '').padStart(2, '0')}.xlsx`;
     const outPath = path.join(OUTPUT_DIR, outName);
 
-    const result = await renderTemplate(spec.template, outPath, blocks);
+    const result = await renderReport(spec, p, outPath);
     json(res, 200, { ...result, download: `/download/${encodeURIComponent(outName)}` });
   },
 };
@@ -502,40 +498,155 @@ function serveStatic(res: http.ServerResponse, url: URL) {
   fs.createReadStream(full).pipe(res);
 }
 
+const WORKSPACE = workspacePath();
+interface OperationState {
+  operationId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  code?: number;
+}
+interface ServerRuntime {
+  instanceId: string;
+  token: string;
+  chain: Promise<unknown>;
+  closing: boolean;
+  operations: Map<string, OperationState>;
+  enqueue: <T>(task: () => Promise<T>) => Promise<T>;
+  lock: { release: () => void };
+}
+let serverRuntime: ServerRuntime | null = null;
+let stopping: Promise<void> | null = null;
+
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
-  const key = `${req.method} ${url.pathname}`;
-
-  const handler = routes[key];
-  const run = handler
-    ? () => handler(req, res)
-    : url.pathname.startsWith('/download/')
-      ? () => serveDownload(req, res, url)
-      : () => { serveStatic(res, url); return Promise.resolve(); };
-
-  run().catch((e) => {
-    const err = e as Error;
-    if (err instanceof SpecError) return json(res, 400, { error: `spec 校验失败: ${err.message}` });
-    console.error(`[${key}]`, err);
-    if (!res.headersSent) json(res, 500, { error: err.message });
+  void handleRequest(req, res).catch((error) => {
+    if (res.headersSent) { res.destroy(); return; }
+    json(res, error instanceof SpecError ? 400 : 500, { error: (error as Error).message });
   });
 });
 
-/** 启动服务。端口传 0 时由内核分配（测试用），返回实际端口。 */
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+  const runtime = serverRuntime;
+  if (!runtime || runtime.closing) return json(res, 503, { error: '服务正在启动或停止' });
+  const address = server.address();
+  const host = typeof address === 'object' && address ? '127.0.0.1:' + address.port : '';
+  if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== 'http://' + host)
+    || req.headers['sec-fetch-site'] === 'cross-site') return json(res, 403, { error: '来源不允许' });
+  const url = new URL(req.url ?? '/', 'http://' + host);
+  if (url.pathname === '/api/runtime' || url.pathname.startsWith('/api/operations')) {
+    if (req.headers.origin || req.headers.authorization !== 'Bearer ' + runtime.token) {
+      return json(res, 401, { error: '本地连接凭据无效' });
+    }
+    if (url.pathname === '/api/runtime' && req.method === 'GET') {
+      return json(res, 200, { protocolVersion: SERVICE_PROTOCOL, workspace: WORKSPACE,
+        instanceId: runtime.instanceId, database: databasePath() });
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/api/operations/')) {
+      const operationId = url.pathname.slice('/api/operations/'.length);
+      return json(res, 200, runtime.operations.get(operationId) ?? { operationId, status: 'unknown' });
+    }
+    if (req.method !== 'POST' || url.pathname !== '/api/operations') return json(res, 405, { error: 'Method not allowed' });
+    if (!String(req.headers['content-type']).startsWith('application/json')) return json(res, 415, { error: '需要 JSON' });
+    const body = await readJson<{ operationId?: string; workspace?: string; instanceId?: string; argv?: unknown }>(req);
+    if (body.instanceId !== runtime.instanceId || body.workspace !== WORKSPACE) return json(res, 409, { error: '工作区或实例身份不匹配' });
+    if (!body.operationId || !/^[a-f0-9-]{36}$/.test(body.operationId)) return json(res, 400, { error: '操作标识无效' });
+    if (!Array.isArray(body.argv) || !body.argv.every((arg) => typeof arg === 'string')) return json(res, 400, { error: 'argv 必须为字符串数组' });
+    const { parseCliArgs } = await import('./cli.ts');
+    const { isDatabaseInvocation } = await import('./runtime/operations.ts');
+    if (!isDatabaseInvocation(parseCliArgs(body.argv).kind)) return json(res, 400, { error: '此入口只接受已命名的数据库操作' });
+    if (runtime.closing) return json(res, 503, { error: '服务正在停止' });
+    if (runtime.operations.has(body.operationId)) return json(res, 409, { error: '操作标识已使用，请查询状态，不要重试' });
+    if (runtime.operations.size >= 4096) return json(res, 503, { error: '本实例操作记录已满，请在空闲时重启服务' });
+    const state: OperationState = { operationId: body.operationId, status: 'queued' };
+    runtime.operations.set(state.operationId, state);
+    console.error('[operation]', state.operationId, 'queued');
+    const result = await runtime.enqueue(async () => {
+      state.status = 'running';
+      let stdout = '', stderr = '';
+      try {
+        const code = await runInvocation(body.argv as string[], { out: (t) => { stdout += t; }, err: (t) => { stderr += t; } });
+        state.code = code;
+        state.status = code === 0 ? 'completed' : 'failed';
+        return { operationId: state.operationId, code, stdout, stderr };
+      } catch (error) {
+        state.code = 1; state.status = 'failed';
+        return { operationId: state.operationId, code: 1, stdout: '', stderr: (error as Error).message + '\n' };
+      } finally { console.error('[operation]', state.operationId, state.status); }
+    });
+    return json(res, 200, result);
+  }
+  const key = req.method + ' ' + url.pathname;
+  const handler = routes[key];
+  if (handler) {
+    return runtime.enqueue(async () => {
+      await db.refresh();
+      await handler(req, res);
+    });
+  }
+  if (url.pathname.startsWith('/download/')) return runtime.enqueue(() => serveDownload(req, res, url));
+  serveStatic(res, url);
+}
+
+/** Own the workspace until all accepted operations and connections have drained. */
 export async function start(port = PORT): Promise<number> {
-  await db.open();
-  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
-  const addr = server.address();
-  return typeof addr === 'object' && addr ? addr.port : port;
+  if (serverRuntime) throw new Error('服务已启动');
+  const peer = await servicePeer(WORKSPACE);
+  if (peer) throw new Error('同一工作区已有健康 Web 服务：' + peer.url);
+  const lock = await acquireWorkspaceLock(WORKSPACE);
+  const runtime: ServerRuntime = {
+    instanceId: randomUUID(), token: randomUUID(), chain: Promise.resolve(), closing: false, operations: new Map(), lock,
+    enqueue: (task) => {
+      const next = runtime.chain.then(task);
+      runtime.chain = next.catch(() => undefined);
+      return next;
+    },
+  };
+  try {
+    const afterLock = await servicePeer(WORKSPACE);
+    if (afterLock) throw new Error('同一工作区已有健康 Web 服务：' + afterLock.url);
+    await db.open();
+    serverRuntime = runtime;
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => { server.off('listening', onListen); reject(error); };
+      const onListen = () => { server.off('error', onError); resolve(); };
+      server.once('error', onError);
+      server.once('listening', onListen);
+      server.listen(port, '127.0.0.1');
+    });
+    const actualPort = (server.address() as { port: number }).port;
+    writeServiceState({ protocolVersion: SERVICE_PROTOCOL, workspace: WORKSPACE, database: databasePath(),
+      instanceId: runtime.instanceId, token: runtime.token, pid: process.pid, port: actualPort, startedAt: new Date().toISOString() });
+    stopping = null;
+    return actualPort;
+  } catch (error) {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    serverRuntime = null;
+    db.close();
+    lock.release();
+    throw error;
+  }
 }
 
-export function stop() {
-  server.close();
+export function stop(): Promise<void> {
+  if (stopping) return stopping;
+  const runtime = serverRuntime;
+  if (!runtime) return Promise.resolve();
+  runtime.closing = true;
+  stopping = (async () => {
+    try {
+      await runtime.chain;
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      db.close();
+      clearServiceState(WORKSPACE, runtime.instanceId);
+    } finally { runtime.lock.release(); serverRuntime = null; }
+  })();
+  return stopping;
 }
 
-// 只在直接运行时自动启动（被 import 时不监听，便于测试在进程内起服务）
 if (import.meta.main) {
-  const port = await start();
-  console.log(`bi-lite → http://127.0.0.1:${port}`);
-  console.log('（只监听本机回环，数据不出本机）');
+  void (async () => {
+    try {
+      const port = await start();
+      console.log('bi-lite → http://127.0.0.1:' + port);
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void stop().catch(console.error); });
+    } catch (error) { console.error((error as Error).message); process.exitCode = 1; }
+  })();
 }

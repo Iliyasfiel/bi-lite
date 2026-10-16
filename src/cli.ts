@@ -28,11 +28,9 @@ import fs from 'node:fs';
 // ⚠️ 类型必须用顶层 `import type` —— `const { f, type T } = await import(...)` 是**语法错误**
 //    （`type` 修饰符只在 import 语句里合法，解构里不认）。而且 `import type` 会被完全擦除，
 //    所以 "help / lint 不加载 xlsx-populate" 这条性质不受影响。
-import type { RenderBlock } from './render/excel.ts';
 import { looksLikeIngestDoc } from './spec/geometry.ts';
-import { compileBlock } from './spec/compile.ts';
-import { parseSpec } from './spec/types.ts';
 import { declaredFactsOf } from './gen/parse.ts';
+import { parseSpec } from './spec/types.ts';
 
 // ---------------- IO（可注入，便于 e2e 在进程内跑而不杀测试进程） ----------------
 
@@ -94,6 +92,7 @@ export type Invocation =
   | { kind: 'preview-spec'; specFile: string; params: Record<string, string> }
   | { kind: 'diff-spec'; beforeFile: string; afterFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
+  | { kind: 'skill-install'; scope: 'project' | 'user'; force: boolean }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
 const HELP_FLAGS = new Set(['-h', '--help']);
@@ -433,10 +432,20 @@ function parseReplayArgs(tokens: readonly string[]): Invocation {
 }
 
 function parseSkillArgs(tokens: readonly string[]): Invocation {
-  const hint = 'bilite skill export --help';
+  const hint = 'bilite skill --help';
   const sub = tokens[0];
   if (sub === undefined || HELP_FLAGS.has(sub)) return { kind: 'help', command: 'skill' };
-  if (sub !== 'export') return usage(`skill 没有子命令「${sub}」（只有 export）`, hint);
+  if (sub === 'install') {
+    const rest = tokens.slice(1);
+    if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'skill' };
+    const args = scanArgs(rest, ['--scope'], ['--force'], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const scope = args.values['--scope']?.[0] ?? 'project';
+    if (!['project', 'user'].includes(scope) || (args.values['--scope']?.length ?? 0) > 1) return usage('--scope 需要 project 或 user，且只能指定一次', hint);
+    if (args.positionals.length) return usage('skill install 不接受位置参数', hint);
+    return { kind: 'skill-install', scope: scope as 'project' | 'user', force: '--force' in args.values };
+  }
+  if (sub !== 'export') return usage(`skill 没有子命令「${sub}」（支持 install / export）`, hint);
 
   const rest = tokens.slice(1);
   if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'skill' };
@@ -552,6 +561,7 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'preview-spec',
   'diff-spec',
   'skill-export',
+  'skill-install',
 ];
 
 /** `--decisions` 给的是文件路径；读出来交给 ingest 侧**唯一**的校验实现 */
@@ -590,6 +600,18 @@ async function agentOutput(io: CliIO, value: unknown): Promise<number> {
 
 export const COMMANDS: CliCommand[] = [
   {
+    invocation: 'skill-install',
+    name: 'skill install',
+    summary: '按需安装 Codex skill 独立副本；已有文件需显式 --force',
+    usage: 'bilite skill install [--scope project|user] [--force]',
+    async run(inv, io) {
+      if (inv.kind !== 'skill-install') throw new Error('命令表与 Invocation 不匹配');
+      const { installSkill } = await import('./skill/install.ts');
+      jsonTo(io, installSkill(inv));
+      return EXIT.OK;
+    },
+  },
+  {
     invocation: 'ingest-lint',
     name: 'ingest lint',
     summary: '静态诊断接入规格：只读 YAML 文本，不读源文件、不碰数据库',
@@ -598,12 +620,11 @@ export const COMMANDS: CliCommand[] = [
       if (inv.kind !== 'ingest-lint') throw new Error('命令表与 Invocation 不匹配');
       // ★ 静态诊断只需要"已注册的口径"，而它来自 staticCatalog() —— **零 DB 访问**。
       //   于是 lint 在服务端正持有库锁时也能跑（§7.2 的"被占用就报错"对它不适用）。
-      const { diagnoseIngest } = await import('./ingest/types.ts');
-      const { staticCatalog } = await import('./semantic/query.ts');
       // ★ 目标表也是判据的一部分：声明的投影**不碰库**，所以 lint 照旧零 DB 访问
-      const { declaredFactsOf } = await import('./gen/parse.ts');
       const text = readSpecFile(inv.specFile);
-      const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
+      const { diagnoseIngest } = await import('./ingest/types.ts');
+      const { PERIOD_TYPES } = await import('./db/schema.ts');
+      const d = diagnoseIngest(text, { periodTypes: PERIOD_TYPES.map((p) => p.id), facts: declaredFactsOf() });
       const errors = d.issues.filter((i) => i.level === 'error');
       const warns = d.issues.filter((i) => i.level === 'warn');
       jsonTo(io, {
@@ -631,18 +652,14 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite ingest dry-run <规格.yaml> [--source 源.xlsx] [--decisions <decisions.json>]',
     async run(inv, io) {
       if (inv.kind !== 'ingest-dry-run') throw new Error('命令表与 Invocation 不匹配');
-      const { diagnoseIngest, parseIngestSpec, parseDecisions } = await import('./ingest/types.ts');
-      const { masterCatalog } = await import('./ingest/master.ts');
+      const { parseDecisions } = await import('./ingest/types.ts');
       const { runIngest } = await import('./ingest/run.ts');
 
       // 先读规格文本再开库：规格都不存在时，不该先去碰库
       const text = readSpecFile(inv.specFile);
       await openDb();
-      const cat = await masterCatalog();
-      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
-      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
-      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
-      const d = diagnoseIngest(text, lintCtx);
+      const { prepareIngest } = await import('./operations/ingest.ts');
+      const { cat, d, spec } = await prepareIngest(text);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -654,7 +671,6 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest dry-run: 静态诊断没通过，未读源文件\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         planOnly: true,
@@ -685,17 +701,13 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite ingest run <规格.yaml> [--source 源.xlsx] [--decisions <decisions.json>] [--strict]',
     async run(inv, io) {
       if (inv.kind !== 'ingest-run') throw new Error('命令表与 Invocation 不匹配');
-      const { diagnoseIngest, parseIngestSpec, parseDecisions } = await import('./ingest/types.ts');
-      const { masterCatalog } = await import('./ingest/master.ts');
+      const { parseDecisions } = await import('./ingest/types.ts');
       const { runIngest } = await import('./ingest/run.ts');
 
       const text = readSpecFile(inv.specFile);
       await openDb();
-      const cat = await masterCatalog();
-      // ★ 同一份 ctx 给两次调用（诊断 + 解析）—— 少给一次就会出现
-      //   "工具说没问题、落库却被拒"（判据漂移的老毛病，铁律 17）
-      const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
-      const d = diagnoseIngest(text, lintCtx);
+      const { prepareIngest } = await import('./operations/ingest.ts');
+      const { cat, d, spec } = await prepareIngest(text);
       if (d.willBeRejected) {
         jsonTo(io, {
           from: inv.specFile,
@@ -707,7 +719,6 @@ export const COMMANDS: CliCommand[] = [
         io.err('bilite ingest run: 静态诊断没通过，一行都没写\n');
         return EXIT.FAILED;
       }
-      const spec = parseIngestSpec(text, lintCtx);
       const r = await runIngest(spec, {
         catalog: cat,
         decisions: parseDecisions(await loadDecisions(inv.decisionsPath)),
@@ -730,11 +741,7 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite render <报表规格.yaml> [--param k=v]... [--out 文件名]',
     async run(inv, io) {
       if (inv.kind !== 'render') throw new Error('命令表与 Invocation 不匹配');
-      const db = await import('./db/index.ts');
-      const { parseSpec } = await import('./spec/types.ts');
-      const { compileBlock, runCompiled } = await import('./spec/compile.ts');
-      const { declaredFactsOf } = await import('./gen/parse.ts');
-      const { renderTemplate } = await import('./render/excel.ts');
+      const { renderReport } = await import('./operations/report.ts');
 
       if (!fs.existsSync(inv.specFile)) throw new Error(`报表规格文件不存在：${inv.specFile}`);
       const spec = parseSpec(fs.readFileSync(inv.specFile, 'utf8'), { facts: declaredFactsOf() });
@@ -744,31 +751,13 @@ export const COMMANDS: CliCommand[] = [
       await openDb();
       const p = { ...(spec.params ?? {}), ...inv.params };
 
-      const blocks: RenderBlock[] = [];
-      for (const sheet of spec.sheets) {
-        for (const b of sheet.blocks) {
-          // ↓ 数值只在本地变量里停留，绝不进返回值（与 MCP 的 render_report 同一条纪律）
-          const compiled = compileBlock(b, p, { factName: spec.fact, facts: declaredFactsOf() });
-          const result = await runCompiled(compiled, (sql) => db.query(sql));
-          blocks.push({
-            sheet: sheet.name,
-            anchor: b.anchor,
-            colLabels: result.colLabels,
-            rows: result.matrix.map((m) => ({ label: m.label, values: m.values })),
-            format: b.value.format,
-            writeRowLabels: false,
-            writeColLabels: false,
-          });
-        }
-      }
-
       const dir = 'output';
       fs.mkdirSync(dir, { recursive: true });
       const base = spec.id.replace(/[^\w\u4e00-\u9fa5.\-]/g, '_');
       const name = inv.out ?? `${base}-${p.year ?? ''}${String(p.month ?? '').padStart(2, '0')}.xlsx`;
       const outPath = `${dir}/${name.split('/').pop()}`;
 
-      const r = await renderTemplate(spec.template, outPath, blocks);
+      const r = await renderReport(spec, p, outPath);
       jsonTo(io, {
         from: inv.specFile,
         outputPath: r.outputPath,
@@ -790,11 +779,10 @@ export const COMMANDS: CliCommand[] = [
       "bilite query --measure '指标:口径' [--measure ...] [--by 维度]... [--filter 维度=值]...",
     async run(inv, io) {
       if (inv.kind !== 'query') throw new Error('命令表与 Invocation 不匹配');
-      const { queryMetrics } = await import('./semantic/query.ts');
-      const { declaredFactsOf } = await import('./gen/parse.ts');
-      const db = await import('./db/index.ts');
       await openDb();
 
+      const { queryMetrics } = await import('./semantic/query.ts');
+      const { query } = await import('./db/index.ts');
       const r = await queryMetrics(
         {
           measures: inv.measures,
@@ -804,7 +792,7 @@ export const COMMANDS: CliCommand[] = [
           //   这里写死，不留任何可被参数覆盖的分支 —— 与 Web 入口同一套纪律。
           audience: 'human',
         },
-        (sql) => db.query(sql),
+        (sql) => query(sql),
         declaredFactsOf(),
       );
 
@@ -1069,9 +1057,8 @@ export const COMMANDS: CliCommand[] = [
 
       if (looksIngest) {
         const { diagnoseIngest } = await import('./ingest/types.ts');
-        const { staticCatalog } = await import('./semantic/query.ts');
-        const { declaredFactsOf } = await import('./gen/parse.ts');
-        const d = diagnoseIngest(text, { periodTypes: staticCatalog().periodTypes.map((p) => p.id), facts: declaredFactsOf() });
+        const { PERIOD_TYPES } = await import('./db/schema.ts');
+        const d = diagnoseIngest(text, { periodTypes: PERIOD_TYPES.map((p) => p.id), facts: declaredFactsOf() });
         const c = count(d.issues);
         jsonTo(io, {
           kind: 'ingest',
@@ -1134,9 +1121,10 @@ export const COMMANDS: CliCommand[] = [
     usage: 'bilite agent generate [--template 模板.xlsx] [--sheet 名称]... [--id ID] [--title 标题]',
     async run(inv, io) {
       if (inv.kind !== 'generate-spec') throw new Error('命令表与 Invocation 不匹配');
-      const { generateSpec, guessedAxes } = await import('./mcp/tools.ts');
+      const { generateSpec } = await import('./mcp/tools.ts');
+      await openDb();
       const result = await generateSpec({ template: inv.template ?? undefined, sheets: inv.sheets.length ? inv.sheets : undefined, id: inv.id ?? undefined, title: inv.title ?? undefined });
-      const output = { ...result, guessedAxes: guessedAxes(result), note: '草稿是提案；guessedAxes 与 unmatched 需人工确认后再渲染' };
+      const output = { ...result, guessedAxes: result.guessed, note: '草稿是提案；guessedAxes 与 unmatched 需人工确认后再渲染' };
       return agentOutput(io, output);
     },
   },
@@ -1237,7 +1225,7 @@ function readVersion(io: CliIO): string {
 
 /** 有专门帮助页的主题：总览(null)、每个命令名、以及 "ingest" 这个分组 */
 function isKnownHelpTopic(command: string): boolean {
-  return command === 'ingest' || command === 'agent' || COMMANDS.some((c) => c.name === command);
+  return command === 'ingest' || command === 'agent' || command === 'skill' || COMMANDS.some((c) => c.name === command);
 }
 
 function helpText(io: CliIO, command: string | null): string {
@@ -1247,8 +1235,12 @@ function helpText(io: CliIO, command: string | null): string {
         `bi-lite ${readVersion(io)} —— 本地 BI 引擎的命令行入口`,
         '',
         '用法： bilite <命令> [选项]',
+        '全局入口：bilite [--workspace <目录>] <命令>；或 BILITE_WORKSPACE 指定工作区',
+        '初始化： bilite init [目录] [--preset finance]（默认空工作区；财务模型按需添加）',
         '',
         '命令：',
+        '  web                前台启动网页服务（--port / --no-open），CLI 自动转交数据库操作',
+        '  operation status   查询转交操作状态（不返回结果值）',
         ...COMMANDS.map((c) => `  ${c.name.padEnd(18)} ${c.summary}`),
         '  help [命令]        看帮助',
         '  version            看版本（等价于 --version）',
@@ -1267,7 +1259,11 @@ function helpText(io: CliIO, command: string | null): string {
   if (command === 'skill') {
     return (
       [
-        '用法： bilite skill export [--format json|prompt]',
+        '用法： bilite skill install [--scope project|user] [--force]',
+        '       bilite skill export [--format json|prompt]',
+        '',
+        '默认安装到所选工作区 .agents/skills/bi-lite-ingest；--scope user 安装到 CODEX_HOME/skills。',
+        '已有文件默认拒绝；--force 覆盖模板文件、保留其他自定义文件。安装不会配置 MCP。',
         '',
         '把手册里**可对拍**的事实从实现投影出来（架构 §8.2 ①：规则是实现的投影，不是实现的说明）。',
         '',
@@ -1370,11 +1366,13 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
   }
 }
 
-// 只在直接运行时自启动（被 import 时不退出进程 —— e2e 就是这样在进程内跑 CLI 的）
+
+// Defer the direct-source entry until this module has finished evaluating.
 if (import.meta.main) {
-  const io = processIO();
-  const code = await main(process.argv.slice(2), io);
-  // ★ 惰性：没开过库就连 @duckdb/node-api 都不加载（--help / lint 走不到这里）
-  if (dbOpened) (await import('./db/index.ts')).close();
-  process.exit(code);
+  void (async () => {
+    try {
+      const { runStandalone } = await import('./runtime/invocation.ts');
+      process.exitCode = await runStandalone(process.argv.slice(2), processIO());
+    } catch (error) { console.error('bilite:', (error as Error).message); process.exitCode = 1; }
+  })();
 }

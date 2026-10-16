@@ -16,7 +16,7 @@
  *   而那会动到本仓库最受保护的那段代码（铁律 17 的"判据只有一份，禁止另写"）。
  *   **本模块没有做那件事**，而是把缺口显式列出来。
  */
-import { API_VERSION, META } from '../meta/columns.ts';
+import { API_VERSION, currentMeta } from '../meta/columns.ts';
 import { PERIOD_TYPES } from '../db/schema.ts';
 import { staticCatalog } from '../semantic/query.ts';
 
@@ -54,7 +54,7 @@ export function skillFactsFrom(tools: Array<{ name: string; description: string 
     registries: {
       periodTypes: PERIOD_TYPES.map((p) => ({ id: p.id, label: p.label, derivable: p.derivable })),
       dimensions: cat.dimensions.map((d) => ({ name: d.name, label: d.label })),
-      objects: META.map((o) => ({ name: o.name, kind: o.kind, columns: o.columns.length })),
+      objects: currentMeta().map((o) => ({ name: o.name, kind: o.kind, columns: o.columns.length })),
     },
     notCovered: NOT_COVERED,
   };

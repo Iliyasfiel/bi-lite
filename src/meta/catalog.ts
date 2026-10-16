@@ -86,18 +86,21 @@ async function objects(): Promise<CatalogObject[]> {
 /** 完整导出（成三层）。给 `bilite catalog dump` 与将来的 MCP 工具用 */
 export async function catalogDump(): Promise<Catalog> {
   const static_ = staticCatalog();
+  const live = new Set((await query<{ table_name: string }>(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
+  )).map((r) => r.table_name));
   return {
     metricDefinitions: loadMetrics(),
     apiVersion: API_VERSION,
     asOf: new Date().toISOString(),
     ddlHash: await schemaFingerprint(),
     members: {
-      metrics: await query<{ name: string; category: string | null; unit: string | null }>(
+      metrics: live.has('dim_metric') ? await query<{ name: string; category: string | null; unit: string | null }>(
         `SELECT name, category, unit FROM dim_metric ORDER BY name`,
-      ),
-      companies: await query<{ name: string; group_name: string | null; level: number | null }>(
+      ) : [],
+      companies: live.has('dim_company') ? await query<{ name: string; group_name: string | null; level: number | null }>(
         `SELECT name, group_name, level FROM dim_company ORDER BY level NULLS LAST, name`,
-      ),
+      ) : [],
       periodTypes: static_.periodTypes.map((p) => p.id),
       dimensions: static_.dimensions.map((d) => d.name),
     },

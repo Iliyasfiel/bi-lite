@@ -1,0 +1,32 @@
+# 公司维度（声明式：这份 YAML 是这张表的**唯一真相**）——
+# 改这里 → `bilite plan` 看 diff → `bilite apply` 落地。表的 DDL 不再手写在 src/db/schema.ts。
+kind: dimension
+title: 公司维度（含层级与板块）
+# 维度表的"一行"就是主键，不需要 grain。
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    semantic: org
+    comment: 主数据 id（新建时是名字的纯函数）
+  - name: name
+    type: varchar
+    notNull: true
+    semantic: org
+  - name: parent_id
+    type: varchar
+    role: dim_fk
+    refs: dim_company
+    semantic: org
+    comment: 自引用：集团 → 子公司多层树
+  - name: level
+    type: integer
+    comment: 层级深度，1 = 集团
+  - name: group_name
+    type: varchar
+    comment: 所属板块
+provenance:
+  - name: alias
+    type: varchar[]
+    comment: 导入时识别到的别名

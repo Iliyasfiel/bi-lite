@@ -19,7 +19,10 @@ export async function open(
   dbPath = process.env.BILITE_DB ?? 'data/bi.duckdb',
   opts: { models?: 'ensure' | 'skip' } = {},
 ) {
-  if (instance) return;
+  if (instance) {
+    if (opts.models !== 'skip') await refresh();
+    return;
+  }
 
   // 确保归档目录存在（路径常量只有一份，见 db/compact.ts）
   fs.mkdirSync(path.join(PARQUET_ROOT), { recursive: true });
@@ -47,14 +50,19 @@ export async function open(
   //   `apply` 要自己报告它落了什么，而不是被 open() 抢先做掉）。
   if (opts.models !== 'skip') {
     try {
-      await ensureModels();
-      const { syncMetrics } = await import('../metrics/sync.ts');
-      await syncMetrics();
+      await refresh();
     } catch (e) {
       close();
       throw e;
     }
   }
+}
+
+/** Called inside the owner's serial queue so each operation uses current YAML. */
+export async function refresh(): Promise<void> {
+  await ensureModels();
+  const { syncMetrics } = await import('../metrics/sync.ts');
+  await syncMetrics();
 }
 
 /**

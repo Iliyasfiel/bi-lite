@@ -22,20 +22,23 @@ agent 只编写规格；金额读取、计算、落库、填表由本地引擎�
 
 ## 本地 CLI（未配置 MCP 时使用）
 
-在项目根目录运行；Web、CLI、MCP 轮流使用同一数据库。未配置 MCP 时可以使用以下 CLI。
+优先使用已安装的全局 `bilite`。在目标 BI 工作区根目录运行，或在命令前加 `--workspace <工作区绝对路径>`。
+新工作区用 `bilite init <目录>` 建立空目录；财务模型按需用 `bilite init <目录> --preset finance` 补入。
+初始化不复制业务指标、源文件或数据库。Web 运行时 CLI 自动转交数据库操作；MCP 暂须单独占库。
 
 | MCP 操作 | 对应 CLI |
 |---|---|
-| 目录 | `node src/cli.ts catalog dump --format prompt` |
-| 源结构 | `node src/cli.ts agent look <源.xlsx>` |
-| 模板结构 | `node src/cli.ts agent template --template <模板.xlsx>` |
-| 生成草稿 | `node src/cli.ts agent generate --template <模板.xlsx>` |
-| 校验/预览 | `node src/cli.ts validate <规格.yaml>`、`node src/cli.ts agent preview <规格.yaml>` |
-| 接入 | `node src/cli.ts ingest lint <规格.yaml>`、`node src/cli.ts ingest dry-run <规格.yaml>`、`node src/cli.ts ingest run <规格.yaml>` |
-| 填表 | `node src/cli.ts render <规格.yaml> --out <文件.xlsx>` |
+| 目录 | `bilite catalog dump --format prompt` |
+| 源结构 | `bilite agent look <源.xlsx>` |
+| 模板结构 | `bilite agent template --template <模板.xlsx>` |
+| 生成草稿 | `bilite agent generate --template <模板.xlsx>` |
+| 校验/预览 | `bilite validate <规格.yaml>`、`bilite agent preview <规格.yaml>` |
+| 接入 | `bilite ingest lint <规格.yaml>`、`bilite ingest dry-run <规格.yaml>`、`bilite ingest run <规格.yaml>` |
+| 填表 | `bilite render <规格.yaml> --out <文件.xlsx>` |
 
-CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态。全局安装方案见 `docs/CLI升级计划.md`，当前不依赖尚未完成的全局分发功能。
-项目 skill 可通过 `.agents/skills/bi-lite-ingest` 链接到本目录。
+所有相对路径属于所选 BI 工作区，不属于引擎安装目录或当前聊天目录。CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态；不要改用返回精确值的查询入口。
+`bilite skill install` 将手册副本装入工作区 `.agents/skills/bi-lite-ingest`；`--scope user` 装入用户的 `CODEX_HOME/skills`。
+安装不配置 MCP；已有副本默认保留，确认更新时用 `--force`。引擎升级不会自动覆盖手册中的用户修改。
 
 ## 接入流程与字段
 
@@ -81,12 +84,8 @@ sheets:
 报表声明 `id`、`template`、`fact`（可省略，默认财务表）、`params` 与 `sheets[].blocks[]`。
 区块包含 `anchor`、`rows`、`cols`、`value`、`scope`；轴使用 `dim` 与 `order`。
 指标与口径必须确定，累计需指定期末，参数要实际被引用。
-示例见 `specs/月度保送表.yaml`；窗口、场景和币种定义见 `models/fact_finance.yml`。
+窗口、场景和币种以工作区模型声明为准；使用财务预设时见 `models/fact_finance.yml`。
 模板格式与公式由引擎保留，精细排版在人使用的 Excel 中完成。
 
-## 本项目的18期测试包
-
-使用 `ingest/18期经营测试.yaml` 和 `specs/18期经营报送.yaml`，数据解释见 `docs/18期经营测试.md`。
-源表的同比/环比列不落金额事实；去年同期由2025年窗口取数。报送模板保留增长率公式，并使用“上月取数”辅助表。
-改报告期时同时调整 `previousYear`、`previousMonth`，一月的上月为上一年十二月。导出后在 Excel 打开以重算模板公式。
-集团合并主体与本部/子公司是两种观察范围，做集团汇总时只选择合并主体，不将五个主体一起加总。
+集团合并主体与子公司是不同观察范围；不要将合并主体与其子公司再次加总。
+源表同比等派生列不作为基础金额导入；导出后可在 Excel 中重算模板原有公式。

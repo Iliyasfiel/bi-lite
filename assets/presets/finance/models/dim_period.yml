@@ -1,0 +1,18 @@
+# 期间维度：财务期与自然月可能不一致
+kind: dimension
+title: 期间维度（财务期）
+keys:
+  - name: fin_month
+    type: date
+    key: true
+    notNull: true
+    semantic: period
+  - name: year
+    type: integer
+    semantic: period
+  - name: month
+    type: integer
+    semantic: period
+  - name: is_audited
+    type: boolean
+    default: 'FALSE'
