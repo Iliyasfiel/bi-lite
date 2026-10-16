@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2024"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noCheck": true,
+    "outDir": "dist",
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true,
+    "strict": false,
+    "target": "ES2024",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

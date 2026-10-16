@@ -21,3 +21,7 @@ npm-debug.log*
 .idea/
 .vscode/
 *.swp
+# npm 发布产物
+dist/
+*.tgz
+.bilite/

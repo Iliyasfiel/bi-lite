@@ -22,20 +22,22 @@ agent 只编写规格；金额读取、计算、落库、填表由本地引擎�
 
 ## 本地 CLI（未配置 MCP 时使用）
 
-在项目根目录运行；Web、CLI、MCP 轮流使用同一数据库。未配置 MCP 时可以使用以下 CLI。
+优先使用已安装的全局 `bilite`。在目标 BI 工作区根目录运行，或在命令前加 `--workspace <工作区绝对路径>`。
+新工作区可先用 `bilite init <目录>` 建立基础模型与空目录；初始化不复制业务指标、源文件或数据库。
+Web、CLI、MCP 轮流使用同一数据库。全局命令未安装时，才在引擎项目根目录使用 `node src/cli.ts` 入口。
 
 | MCP 操作 | 对应 CLI |
 |---|---|
-| 目录 | `node src/cli.ts catalog dump --format prompt` |
-| 源结构 | `node src/cli.ts agent look <源.xlsx>` |
-| 模板结构 | `node src/cli.ts agent template --template <模板.xlsx>` |
-| 生成草稿 | `node src/cli.ts agent generate --template <模板.xlsx>` |
-| 校验/预览 | `node src/cli.ts validate <规格.yaml>`、`node src/cli.ts agent preview <规格.yaml>` |
-| 接入 | `node src/cli.ts ingest lint <规格.yaml>`、`node src/cli.ts ingest dry-run <规格.yaml>`、`node src/cli.ts ingest run <规格.yaml>` |
-| 填表 | `node src/cli.ts render <规格.yaml> --out <文件.xlsx>` |
+| 目录 | `bilite catalog dump --format prompt` |
+| 源结构 | `bilite agent look <源.xlsx>` |
+| 模板结构 | `bilite agent template --template <模板.xlsx>` |
+| 生成草稿 | `bilite agent generate --template <模板.xlsx>` |
+| 校验/预览 | `bilite validate <规格.yaml>`、`bilite agent preview <规格.yaml>` |
+| 接入 | `bilite ingest lint <规格.yaml>`、`bilite ingest dry-run <规格.yaml>`、`bilite ingest run <规格.yaml>` |
+| 填表 | `bilite render <规格.yaml> --out <文件.xlsx>` |
 
-CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态。全局安装方案见 `docs/CLI升级计划.md`，当前不依赖尚未完成的全局分发功能。
-项目 skill 可通过 `.agents/skills/bi-lite-ingest` 链接到本目录。
+所有相对路径属于所选 BI 工作区，不属于引擎安装目录或当前聊天目录。CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态；不要改用返回精确值的查询入口。
+项目 skill 安装在 `.agents/skills/bi-lite-ingest`，链接至本目录，无需 MCP 也可执行以上流程。
 
 ## 接入流程与字段
 

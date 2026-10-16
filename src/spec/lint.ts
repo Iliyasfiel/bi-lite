@@ -65,7 +65,8 @@ export interface LintIssue {
     | 'FACT_UNKNOWN'
     | 'DIM_NOT_ON_FACT'
     | 'CUMULATIVE_TIME_UNPINNED'
-    | 'DIM_MIXED_AGGREGATION';
+    | 'DIM_MIXED_AGGREGATION'
+    | 'CALIBER_AXIS_COLS_ONLY';
   /** 出问题的位置，人能直接对着 YAML 找（如 `sheets[0].blocks[1]`） */
   at: string;
   message: string;

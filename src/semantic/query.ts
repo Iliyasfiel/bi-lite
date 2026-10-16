@@ -52,12 +52,15 @@ const DIM_LABELS: Record<DimName, string> = {
 
 /** 完整目录（含 DB 里的公司/指标主数据）—— 只有元数据，不含任何金额 */
 export async function catalog(): Promise<Catalog> {
-  const metrics = await query<{ id: string; name: string; category: string | null; unit: string | null }>(
+  const live = new Set((await query<{ table_name: string }>(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
+  )).map((r) => r.table_name));
+  const metrics = live.has('dim_metric') ? await query<{ id: string; name: string; category: string | null; unit: string | null }>(
     'SELECT id, name, category, unit FROM dim_metric ORDER BY name',
-  );
-  const companies = await query<{ id: string; name: string; group_name: string | null; level: number | null }>(
+  ) : [];
+  const companies = live.has('dim_company') ? await query<{ id: string; name: string; group_name: string | null; level: number | null }>(
     'SELECT id, name, group_name, level FROM dim_company ORDER BY level NULLS LAST, name',
-  );
+  ) : [];
   const definitions = loadMetrics();
   return { ...staticCatalog(), metrics: metrics.map((m) => ({ ...m, definition: metricOf(m.name, definitions) })), companies };
 }

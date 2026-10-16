@@ -3,18 +3,27 @@
   "version": "0.1.0",
   "description": "轻量 BI：长表 → 口径规格 → 多形态产出。财务数据不进 LLM 上下文。",
   "type": "module",
+  "files": [
+    "assets/presets/finance/models",
+    "bin",
+    "dist",
+    "README.md"
+  ],
   "private": true,
   "engines": {
     "node": ">=22.6"
   },
   "bin": {
-    "bilite": "src/cli.ts"
+    "bilite": "bin/bilite.mjs"
   },
   "scripts": {
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",
     "start": "node src/server.ts",
-    "fixtures:business": "node test/prepare-business-fixtures.ts"
+    "fixtures:business": "node test/prepare-business-fixtures.ts",
+    "build": "tsc --project tsconfig.json && npm run sync-assets",
+    "sync-assets": "node scripts/sync-package-assets.mjs",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.5",
@@ -24,6 +33,8 @@
     "yaml": "^2.6.1"
   },
   "devDependencies": {
-    "exceljs": "^4.4.0"
+    "@types/node": "^24.19.2",
+    "exceljs": "^4.4.0",
+    "typescript": "^5.9.3"
   }
 }

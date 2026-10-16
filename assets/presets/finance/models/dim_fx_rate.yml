@@ -1,0 +1,57 @@
+# 汇率（月 × 币种 → 兑人民币，P5 刀 22）—— 表名 dim_fx_rate：它是一张维表，沿用 dim_ 前缀—— ccy selector 换算的取率表。
+#
+# ★ 为什么是"声明内嵌行"的维表而不是事实表：fact 形态要求 company+metric+measure
+#   （declaredFacts 才会认它），汇率两样都没有；带声明行的维表是零机制路线 ——
+#   `bilite rebuild` 全量对齐就是唯一写路径，行在声明里 = git 即审计。
+#   行数到万级（逐日汇率、多币种）再换成 Excel 接入源 + 事实表。
+#
+# ★ 取率语义（compileMetrics 的 ccy selector）：**按行落窗期取率** ——
+#   JOIN fx_s ON fx_s.rate_month = f.fin_month AND fx_s.ccy = f.ccy。
+#   去年同期累计行落在 2025-06 → 用 2025-06 的率（历史正确），与查询的 as-of 期无关。
+#
+# ★ 换算公式：f.amount × fx_s.rate / fx_u.rate（fx_u = selector 币种当月率）。
+#   人民币恒 1.0：换算的基准就是人民币，没有 1.0 这行换算除零。
+#
+# ★ rate_month × ccy 必须唯一（行就写在这份声明里，review 一眼可见）——
+#   取率 JOIN 没有去重防线，重复一行 = 金额被静默加倍（错得最安静的那一种）。
+kind: dimension
+title: 汇率（月 × 币种 → 兑人民币）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    comment: fx_<nameHash>，名字的纯函数，由 sync 派生
+  - name: name
+    type: varchar
+    notNull: true
+    comment: 行身份 = "<币种> <月份>"（带声明行的维表必须有 id 与 name）
+  - name: rate_month
+    type: date
+    notNull: true
+    comment: 取率月份 —— 按行落窗期取率（f.fin_month），不是 as-of 期
+  - name: ccy
+    type: varchar
+    notNull: true
+    semantic: ccy
+  - name: rate
+    type: decimal(12,6)
+    notNull: true
+    comment: 1 单位 ccy 兑人民币
+rows:
+  - name: 人民币 2025-06
+    rate_month: "2025-06-01"
+    ccy: 人民币
+    rate: 1.0
+  - name: 人民币 2026-06
+    rate_month: "2026-06-01"
+    ccy: 人民币
+    rate: 1.0
+  - name: 美元 2025-06
+    rate_month: "2025-06-01"
+    ccy: 美元
+    rate: 7.15
+  - name: 美元 2026-06
+    rate_month: "2026-06-01"
+    ccy: 美元
+    rate: 7.12

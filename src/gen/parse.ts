@@ -587,6 +587,12 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
   const files = listModelFiles(dir);
   const issues: GenIssue[] = [];
   if (files.length === 0) {
+    if (path.resolve(dir) === path.resolve(MODELS_DIR) && fs.existsSync('bilite.config.json')) {
+      const config = JSON.parse(fs.readFileSync('bilite.config.json', 'utf8'));
+      if (config.workspace === true && config.version === 1) {
+        return { ir: { apiVersion: MODEL_API_VERSION, tables: [] }, issues: [] };
+      }
+    }
     return { ir: null, issues: [issue('error', 'MODEL_DIR_EMPTY', dir, `没有找到任何声明文件（${dir}/*.yml）`)] };
   }
   const tables: IrTable[] = [];

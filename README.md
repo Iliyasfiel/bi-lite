@@ -3,8 +3,8 @@
 轻量的本地 BI 引擎：把不同形态的 Excel 按 YAML 规格导入 DuckDB，再按指定模板生成报送 Excel。
 主要目标是模板填表报送；查询与图表是辅助能力。数据与计算留在本机。
 
-当前工作区使用5主体、6指标、18期的经营测试配置，先运行 `npm run fixtures:business`，再按 [18期经营测试](docs/18期经营测试.md) 试跑。
-自动验收使用独立的小型指标配置，不修改本地测试源和业务库。CLI 产品化目标与实施顺序见 [CLI升级计划](docs/CLI升级计划.md)，npm 正式分发及 `bilite web` 尚待实现。
+当前工作区已准备5主体、6指标、18期的经营测试包，先按 [18期经营测试](docs/18期经营测试.md) 试跑。
+该配置与下方原有小型示例不同；项目自动验收使用独立指标配置，不会修改测试包或本地业务库。
 
 ## 开始使用
 
@@ -137,9 +137,29 @@ transforms:
 当前 YAML 只用于确定规格 id；`--source` 可指定当前文件做对拍。结果中的 `specSource`
 说明采用了快照还是传入规格；无快照的旧批次继续按传入规格重放。
 
+## CLI 与网页共用
+
+`bilite web` 前台启动服务；Web 运行时，CLI 会自动通过服务提交导入、出表、查询和模型命令，单一进程持有 DuckDB。正常停止或崩溃后 CLI 可继续独立使用。
+
 ## CLI 使用
 
-在仓库根目录运行 `node src/cli.ts <命令>`，用 `--help` 查看参数。
+`npm pack` 会先转译发布目录再生成安装包；真实 `.tgz` 安装后可直接使用全局 `bilite`。开发仓库仍可用 `npm link` 调试，代码更新后直接生效。
+
+```bash
+# 在任意目录，操作已有的 bi-lite 工作区
+bilite --workspace "D:/Documents/Codes/bi-lite" agent preview specs/18期经营报送.yaml
+
+# 或建立独立工作区，之后使用该目录自己的模型、指标和数据库
+bilite init "D:/Documents/My BI"
+bilite --workspace "D:/Documents/My BI" catalog dump --format prompt
+```
+
+`--workspace`（简写 `-C`）放在命令前；也可用 `BILITE_WORKSPACE` 环境变量指定工作区，未指定时使用当前目录。
+初始化默认建立空工作区，不复制模型、指标、测试数据或数据库；`bilite init <目录> --preset finance` 补入受控财务模型。已有模型时预设补入会被拒绝，不会覆盖文件。
+源文件、规格、模板、输出及默认数据库路径均相对所选工作区；先把源文件放入该工作区允许的目录（例如 `data/`）。
+若设置了 `BILITE_DB`，数据库位置仍按该显式设置处理。Windows 新终端需能找到 npm 的全局命令目录。
+
+仍可在仓库根目录运行 `node src/cli.ts <命令>`，用 `--help` 查看参数。
 CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 stdout，日志写到 stderr。
 
 | 命令 | 功能 |

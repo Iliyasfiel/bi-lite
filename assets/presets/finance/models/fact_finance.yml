@@ -1,0 +1,74 @@
+# 财务事实：三维交点 × 窗口 × 正交维度（口径是**窗口声明**不是行上字符串，铁律 5"五值拆三件"）
+# ★ 刀 23：period_type 列退场 —— 口径的唯一承载是窗口（period_from），**窗口即口径坐标**（入主键）：
+#   同一 fin_month 下三种窗口互斥成三行；同一窗口不存两份（重复申报 = 同坐标，撞库拒绝）。
+kind: fact
+title: 财务事实（公司 × 指标 × 期间 × 窗口 × 场景 × 币种）
+grain: [fin_month, period_from, company_id, metric_id, scenario, ccy]
+# 口径体系（铁律 5）：窗口起点落在 period_from，终点 ≡ fin_month（semantic: period 那列）。
+# - 窗口实存（单月 / 本年累计 / 账面累计）：行上存窗口，查询展开成 period_from 谓词；
+# - 窗口平移（去年同期累计）：装载即落去年窗口（shift: -1），查询期标签 +1 年对齐 x 轴
+#   ——同一窗口不存两份（存两份必然在审计调整时漂移）；
+# - calculator（单月同比）：不落行，语义层算，缺去年行拒绝不静默。
+queryDefaults: { scenario: 实际, ccy: 人民币 }
+windowFrom: period_from
+calibers:
+  - name: 单月
+    from: same
+  - name: 本月累计
+    from: same
+  - name: 本年累计
+    from: year_start
+  - name: 去年同期累计
+    from: year_start
+    shift: -1
+  - name: 账面累计
+    from: since
+    since: "2025-01"
+  - name: 单月同比
+    calculator: true
+    operand: 单月
+keys:
+  - name: fin_month
+    type: date
+    key: true
+    notNull: true
+    semantic: period
+  - name: period_from
+    type: date
+    key: true
+    notNull: true
+    comment: 窗口起点（终点 ≡ fin_month）——口径是窗口声明（铁律 5），窗口即口径坐标（刀 23 升键）
+  - name: company_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_company
+    notNull: true
+    semantic: org
+  - name: metric_id
+    type: varchar
+    role: dim_fk
+    key: true
+    refs: dim_metric
+    notNull: true
+    semantic: metric
+  - name: scenario
+    type: varchar
+    key: true
+    notNull: true
+    semantic: scenario
+    comment: 场景（正交维度，刀 22）：行内退化列，成员枚举见 dim_scenario 声明行（MODEL_ROWS_OWNER_BAD，不加外键）
+  - name: ccy
+    type: varchar
+    key: true
+    notNull: true
+    semantic: ccy
+    comment: 记账币种（正交维度，刀 22）：行内退化列；换算是查询侧 selector（fx_rate 按行落窗期取率）
+measures:
+  - name: amount
+    type: decimal(18,2)
+    unit: 元
+    semantic: money
+provenance:
+  - name: batch_id
+    type: varchar

@@ -1,0 +1,23 @@
+# 币种维度（正交维度，P5 刀 22）—— 人民币 / 美元。
+#
+# ★ fact_finance 上的 ccy 是**行内退化列**（记账币种：这笔钱当初按什么币种记的账），
+#   这里的声明行只管「枚举有哪些成员」（与 dim_scenario 同一先例：带声明行的维表
+#   不许被事实表引用，MODEL_ROWS_OWNER_BAD）。
+#
+# ★ 换算是查询侧的事：selector ccy=美元 → compileMetrics 按**行落窗期**取 fx_rate
+#   （f.amount × fx_s.rate / fx_u.rate），本表不参与换算。
+kind: dimension
+title: 币种维度（人民币 / 美元）
+keys:
+  - name: id
+    type: varchar
+    key: true
+    notNull: true
+    comment: cc_<nameHash>，名字的纯函数，由 sync 派生
+  - name: name
+    type: varchar
+    notNull: true
+    semantic: ccy
+rows:
+  - name: 人民币
+  - name: 美元
