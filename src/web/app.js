@@ -528,12 +528,12 @@ async function loadCatalog() {
   $('qPeriod').innerHTML = periods
     .map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
 
-  const months = CATALOG.periodTypes.length ? await fetchMonths() : [];
+  const months = CATALOG.metrics.length && CATALOG.periodTypes.length ? await fetchMonths() : [];
   const years = [...new Set(months.map((m) => m.slice(0, 4)))].sort();
   $('qYear').innerHTML = `<option value="">全部</option>` +
     years.map((y) => `<option value="${y}">${y}</option>`).join('');
 
-  $('qMonth').innerHTML += Array.from({ length: 12 }, (_, i) => `<option value="${String(i + 1).padStart(2, '0')}">${i + 1} 月</option>`).join('');
+  $('qMonth').innerHTML = '<option value="">全部</option>' + Array.from({ length: 12 }, (_, i) => `<option value="${String(i + 1).padStart(2, '0')}">${i + 1} 月</option>`).join('');
   const latest = [...months].sort().at(-1);
   if (latest) { $('qYear').value = latest.slice(0, 4); $('qMonth').value = latest.slice(5); }
   // 默认选中常用项 —— 让用户一进来就能查到东西
@@ -994,8 +994,26 @@ function dimLabel(name) {
 }
 
 // ═══════════════ 启动 ═══════════════
+$('workspaceFinance').addEventListener('click', async () => {
+  const button = $('workspaceFinance');
+  button.disabled = true;
+  $('workspaceSetupMsg').textContent = '正在添加…';
+  try {
+    await api('/api/workspace/preset', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    $('workspaceSetupMsg').textContent = '基础模型已添加；请声明业务指标，再上传源文件并编写接入规格。';
+    await loadCatalog();
+  } catch (error) {
+    $('workspaceSetupMsg').textContent = error.message;
+    button.disabled = false;
+  }
+});
+
 (async () => {
   try {
+    const workspace = await api('/api/workspace');
+    $('workspaceSetup').classList.toggle('hidden', !workspace.empty);
     await loadCatalog();
     $('conn').textContent = '本机运行';
     $('conn').className = 'pill ok';

@@ -34,7 +34,7 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 3. agent 只接触结构与元数据，不接触金额、不执行 SQL。Web 给本机用户显示精确值。
 4. 接入与报表复用现有解析、校验与编译逻辑；模板既有格式、公式、合并等应保留。
 5. 累计是期末窗口值，账面累计按源文件实存；场景、币种与期数要明确。
-6. Node ≥22.6 原生运行 TypeScript，导入带 `.ts`。不引入构建步骤或外部服务。
+6. 开发使用 Node ≥22.6 原生运行 TypeScript，导入带 `.ts`；仅 npm 打包时转译为 JavaScript，安装时不编译。不引入外部服务。
    DuckDB 使用版本锁定的 `@duckdb/node-api`；exceljs 仅用于生成测试假数据。
 7. 生产接入源放在稳定的 `data/` 路径；`test/fixtures/` 只用于可重建的示例。
    保存 `ingest/*.yaml` 只是保存规格，执行导入才写库。
@@ -59,4 +59,5 @@ npm run e2e --cache /tmp/bi-lite-npm-cache
 npm start --cache /tmp/bi-lite-npm-cache
 ```
 
-Web 默认监听 `127.0.0.1:4319`。DuckDB 单写者：Web、CLI、MCP 不同时占用同一库。
+Web 默认监听 `127.0.0.1:4319`。DuckDB 单写者：Web 运行时 CLI 转交服务，独立 CLI 取得工作区锁；MCP 暂须单独占库。
+`npm run package:check` 在临时目录验证真实安装包；当前分发实测 Windows / Node 24.18.0，最低版本和其他平台需另验。

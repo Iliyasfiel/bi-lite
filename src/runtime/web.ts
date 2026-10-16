@@ -2,15 +2,19 @@ import { spawn } from 'node:child_process';
 import { servicePeer, workspacePath } from './service.ts';
 import type { CliIO } from '../cli.ts';
 
-async function openBrowser(url: string, io: CliIO): Promise<void> {
+export async function openBrowser(url: string, io: CliIO, launch = spawn): Promise<void> {
   const [command, args] = process.platform === 'win32'
     ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]] as const
     : process.platform === 'darwin' ? ['open', [url]] as const : ['xdg-open', [url]] as const;
   try {
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(command, [...args], { windowsHide: true, stdio: 'ignore' });
-      child.once('error', reject);
-      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error('浏览器启动失败')));
+      const child = launch(command, [...args], { windowsHide: true, stdio: 'ignore' });
+      const timer = setTimeout(() => {
+        child.unref();
+        reject(new Error('浏览器启动超时'));
+      }, 4000);
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error('浏览器启动失败')); });
     });
   } catch { io.err(`无法自动打开浏览器，请访问 ${url}\n`); }
 }
@@ -43,7 +47,11 @@ export async function runWebServer(argv: readonly string[], io: CliIO): Promise<
         ? `端口 ${port} 已占用，请通过 --port 选择其他端口。\n` : `${(error as Error).message}\n`);
       return 1;
     }
-    const shutdown = () => { void server.stop().catch((error) => { io.err(error.message + '\n'); process.exitCode = 1; }); };
+    const shutdown = () => {
+      process.off('SIGINT', shutdown);
+      process.off('SIGTERM', shutdown);
+      void server.stop().catch((error) => { io.err(error.message + '\n'); process.exitCode = 1; });
+    };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
     io.err(`工作区：${workspacePath()}\nbi-lite → ${url}（Ctrl+C 停止）\n`);

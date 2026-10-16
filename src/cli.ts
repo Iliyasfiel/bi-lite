@@ -92,6 +92,7 @@ export type Invocation =
   | { kind: 'preview-spec'; specFile: string; params: Record<string, string> }
   | { kind: 'diff-spec'; beforeFile: string; afterFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
+  | { kind: 'skill-install'; scope: 'project' | 'user'; force: boolean }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
 const HELP_FLAGS = new Set(['-h', '--help']);
@@ -431,10 +432,20 @@ function parseReplayArgs(tokens: readonly string[]): Invocation {
 }
 
 function parseSkillArgs(tokens: readonly string[]): Invocation {
-  const hint = 'bilite skill export --help';
+  const hint = 'bilite skill --help';
   const sub = tokens[0];
   if (sub === undefined || HELP_FLAGS.has(sub)) return { kind: 'help', command: 'skill' };
-  if (sub !== 'export') return usage(`skill 没有子命令「${sub}」（只有 export）`, hint);
+  if (sub === 'install') {
+    const rest = tokens.slice(1);
+    if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'skill' };
+    const args = scanArgs(rest, ['--scope'], ['--force'], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const scope = args.values['--scope']?.[0] ?? 'project';
+    if (!['project', 'user'].includes(scope) || (args.values['--scope']?.length ?? 0) > 1) return usage('--scope 需要 project 或 user，且只能指定一次', hint);
+    if (args.positionals.length) return usage('skill install 不接受位置参数', hint);
+    return { kind: 'skill-install', scope: scope as 'project' | 'user', force: '--force' in args.values };
+  }
+  if (sub !== 'export') return usage(`skill 没有子命令「${sub}」（支持 install / export）`, hint);
 
   const rest = tokens.slice(1);
   if (rest.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'skill' };
@@ -550,6 +561,7 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'preview-spec',
   'diff-spec',
   'skill-export',
+  'skill-install',
 ];
 
 /** `--decisions` 给的是文件路径；读出来交给 ingest 侧**唯一**的校验实现 */
@@ -588,6 +600,18 @@ async function agentOutput(io: CliIO, value: unknown): Promise<number> {
 
 export const COMMANDS: CliCommand[] = [
   {
+    invocation: 'skill-install',
+    name: 'skill install',
+    summary: '按需安装 Codex skill 独立副本；已有文件需显式 --force',
+    usage: 'bilite skill install [--scope project|user] [--force]',
+    async run(inv, io) {
+      if (inv.kind !== 'skill-install') throw new Error('命令表与 Invocation 不匹配');
+      const { installSkill } = await import('./skill/install.ts');
+      jsonTo(io, installSkill(inv));
+      return EXIT.OK;
+    },
+  },
+  {
     invocation: 'ingest-lint',
     name: 'ingest lint',
     summary: '静态诊断接入规格：只读 YAML 文本，不读源文件、不碰数据库',
@@ -598,8 +622,11 @@ export const COMMANDS: CliCommand[] = [
       //   于是 lint 在服务端正持有库锁时也能跑（§7.2 的"被占用就报错"对它不适用）。
       // ★ 目标表也是判据的一部分：声明的投影**不碰库**，所以 lint 照旧零 DB 访问
       const text = readSpecFile(inv.specFile);
-      const { prepareIngest } = await import('./operations/ingest.ts');
-      const { d, errors, warnings: warns } = await prepareIngest(text);
+      const { diagnoseIngest } = await import('./ingest/types.ts');
+      const { PERIOD_TYPES } = await import('./db/schema.ts');
+      const d = diagnoseIngest(text, { periodTypes: PERIOD_TYPES.map((p) => p.id), facts: declaredFactsOf() });
+      const errors = d.issues.filter((i) => i.level === 'error');
+      const warns = d.issues.filter((i) => i.level === 'warn');
       jsonTo(io, {
         from: inv.specFile,
         id: d.spec?.id ?? null,
@@ -1029,8 +1056,9 @@ export const COMMANDS: CliCommand[] = [
       });
 
       if (looksIngest) {
-              const { prepareIngest } = await import('./operations/ingest.ts');
-              const { d } = await prepareIngest(text);
+        const { diagnoseIngest } = await import('./ingest/types.ts');
+        const { PERIOD_TYPES } = await import('./db/schema.ts');
+        const d = diagnoseIngest(text, { periodTypes: PERIOD_TYPES.map((p) => p.id), facts: declaredFactsOf() });
         const c = count(d.issues);
         jsonTo(io, {
           kind: 'ingest',
@@ -1197,7 +1225,7 @@ function readVersion(io: CliIO): string {
 
 /** 有专门帮助页的主题：总览(null)、每个命令名、以及 "ingest" 这个分组 */
 function isKnownHelpTopic(command: string): boolean {
-  return command === 'ingest' || command === 'agent' || COMMANDS.some((c) => c.name === command);
+  return command === 'ingest' || command === 'agent' || command === 'skill' || COMMANDS.some((c) => c.name === command);
 }
 
 function helpText(io: CliIO, command: string | null): string {
@@ -1231,7 +1259,11 @@ function helpText(io: CliIO, command: string | null): string {
   if (command === 'skill') {
     return (
       [
-        '用法： bilite skill export [--format json|prompt]',
+        '用法： bilite skill install [--scope project|user] [--force]',
+        '       bilite skill export [--format json|prompt]',
+        '',
+        '默认安装到所选工作区 .agents/skills/bi-lite-ingest；--scope user 安装到 CODEX_HOME/skills。',
+        '已有文件默认拒绝；--force 覆盖模板文件、保留其他自定义文件。安装不会配置 MCP。',
         '',
         '把手册里**可对拍**的事实从实现投影出来（架构 §8.2 ①：规则是实现的投影，不是实现的说明）。',
         '',

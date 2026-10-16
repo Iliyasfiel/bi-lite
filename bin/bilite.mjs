@@ -28,7 +28,9 @@ try {
     } else console.log(JSON.stringify(initializeWorkspace(args.slice(1), workspace, root), null, 2));
   } else {
     const help = args.length === 0 || ['help', '--help', '-h', '--version', '-v', 'version'].includes(args[0]) || args.includes('--help') || args.includes('-h');
-    if (!help) process.chdir(locateWorkspace(workspace));
+    const userSkill = args[0] === 'skill' && args[1] === 'install'
+      && args.some((arg, i) => arg === '--scope' && args[i + 1] === 'user');
+    if (!help && !userSkill) process.chdir(locateWorkspace(workspace));
     const invocation = await import(moduleUrl('runtime/invocation'));
     const business = await import(moduleUrl('cli'));
     cli = business;

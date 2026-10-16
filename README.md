@@ -8,7 +8,8 @@
 
 ## 开始使用
 
-需要 Node ≥22.6，无构建步骤、无外部数据库服务。
+开发需要 Node ≥22.6，直接运行 TypeScript；仅打包时转译 JavaScript，安装时无需编译器，无外部数据库服务。
+实际安装包当前在 Windows / Node 24.18.0 验收；最低 Node 和其他平台分发支持待确认。
 
 ```bash
 npm install --cache /tmp/bi-lite-npm-cache
@@ -140,6 +141,7 @@ transforms:
 ## CLI 与网页共用
 
 `bilite web` 前台启动服务；Web 运行时，CLI 会自动通过服务提交导入、出表、查询和模型命令，单一进程持有 DuckDB。正常停止或崩溃后 CLI 可继续独立使用。
+`--port` 指定端口，`--no-open` 保持前台运行但不打开浏览器；默认打开浏览器，失败时保留服务并输出地址。空工作区可在网页按需添加财务基础模型。
 
 ## CLI 使用
 
@@ -154,10 +156,15 @@ bilite init "D:/Documents/My BI"
 bilite --workspace "D:/Documents/My BI" catalog dump --format prompt
 ```
 
-`--workspace`（简写 `-C`）放在命令前；也可用 `BILITE_WORKSPACE` 环境变量指定工作区，未指定时使用当前目录。
+`--workspace`（简写 `-C`）放在命令前；也可用 `BILITE_WORKSPACE` 环境变量指定工作区，未指定时从当前目录向上识别工作区标识。
 初始化默认建立空工作区，不复制模型、指标、测试数据或数据库；`bilite init <目录> --preset finance` 补入受控财务模型。已有模型时预设补入会被拒绝，不会覆盖文件。
 源文件、规格、模板、输出及默认数据库路径均相对所选工作区；先把源文件放入该工作区允许的目录（例如 `data/`）。
 若设置了 `BILITE_DB`，数据库位置仍按该显式设置处理。Windows 新终端需能找到 npm 的全局命令目录。
+
+可选安装 Codex 手册：`bilite skill install` 默认复制到所选工作区 `.agents/skills/bi-lite-ingest`；
+`--scope user` 安装到 `CODEX_HOME/skills`（未设置时为 `~/.codex/skills`），不要求当前目录是工作区。
+安装记录版本，不配置 MCP；已有文件默认拒绝覆盖，确认更新用 `--force`。更新只覆盖随包模板文件，其他自定义文件保留；链接目录须先由用户整理。
+引擎更新不会自动修改已安装的手册。
 
 仍可在仓库根目录运行 `node src/cli.ts <命令>`，用 `--help` 查看参数。
 CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 stdout，日志写到 stderr。
@@ -173,6 +180,9 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `agent generate / preview / diff` | 推断报表草稿、预览坐标、比较规格差异 |
 | `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
+| `skill install` | 可选安装项目/用户级手册副本；`--force` 显式更新 |
+
+开发验收：`npm run e2e` 复用隔离主链路，`npm run package:check` 生成并安装真实包，在临时目录验证 CLI、网页和 skill。后者需要依赖缓存或可用的 npm 网络连接。
 
 导入并出表的示例：
 

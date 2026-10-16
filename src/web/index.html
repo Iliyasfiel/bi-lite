@@ -18,6 +18,15 @@
 </header>
 
 <main>
+  <section id="workspaceSetup" class="card hidden" aria-live="polite">
+    <h2>准备工作区</h2>
+    <p>这个工作区还没有数据模型。可以添加财务基础模型，或在工作区的 models 目录中编写自己的模型。</p>
+    <p class="hint">添加基础模型只提供表结构和口径，不导入指标、源文件或示例数据。</p>
+    <div class="actions">
+      <button id="workspaceFinance" class="primary">添加财务基础模型</button>
+      <span id="workspaceSetupMsg" class="hint"></span>
+    </div>
+  </section>
   <!-- ═══════════ 1. 数据导入 ═══════════ -->
   <section id="tab-import" class="panel active">
     <!-- ── 主路径：接入规格（声明式）──

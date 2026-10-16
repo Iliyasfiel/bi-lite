@@ -14,13 +14,14 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import * as db from './db/index.ts';
 import type { DimDecision } from './ingest/types.ts';
 import { normalizeName, type DimKind } from './ingest/resolve.ts';
 import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semantic/query.ts';
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
-import { declaredFactsOf } from './gen/parse.ts';
+import { declaredFactsOf, loadModels } from './gen/parse.ts';
 import { renderReport } from './operations/report.ts';
 import { prepareIngest } from './operations/ingest.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
@@ -115,6 +116,22 @@ const diagIngest = prepareIngest;
 
 /** HTTP 路由表，与本地 Web 共用。 */
 export const routes: Record<string, Handler> = {
+  'GET /api/workspace': async (_req, res) => {
+    const ir = loadModels();
+    json(res, 200, { workspace: WORKSPACE, modelCount: ir.tables.length, empty: ir.tables.length === 0 });
+  },
+
+  'POST /api/workspace/preset': async (req, res) => {
+    const body = await readJson<Record<string, unknown>>(req);
+    if (!body || Object.keys(body).length) return json(res, 400, { error: '此入口只添加财务基础模型，不接受其他配置' });
+    try {
+      const { initializeWorkspace } = await import('../bin/workspace.mjs');
+      const result = initializeWorkspace(['--preset', 'finance'], WORKSPACE, fileURLToPath(new URL('../', import.meta.url)));
+      await db.refresh();
+      json(res, 200, result);
+    } catch (error) { json(res, 400, { error: (error as Error).message }); }
+  },
+
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
   'GET /api/catalog': async (_req, res) => {
     json(res, 200, await catalog());
