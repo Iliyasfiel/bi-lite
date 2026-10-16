@@ -5,17 +5,17 @@ export function locateWorkspace(explicit, cwd = process.cwd()) {
   if (explicit !== undefined) {
     const target = path.resolve(cwd, explicit);
     validateWorkspace(target);
-    return fs.realpathSync(target);
+    return fs.realpathSync.native(target);
   }
   for (let dir = cwd; ; dir = path.dirname(dir)) {
     if (fs.existsSync(path.join(dir, 'bilite.config.json'))) {
       validateWorkspace(dir);
-      return fs.realpathSync(dir);
+      return fs.realpathSync.native(dir);
     }
     if (path.dirname(dir) === dir) break;
   }
   validateWorkspace(cwd);
-  return fs.realpathSync(cwd);
+  return fs.realpathSync.native(cwd);
 }
 
 function validateWorkspace(dir) {

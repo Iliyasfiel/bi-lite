@@ -151,6 +151,15 @@ try {
   assert.equal(JSON.parse(at('replay', source)).ok, true);
   await start(entry, port);
   await stop(false);
+  if (process.platform === 'win32') {
+    // A stale owner may have recorded an 8.3 or differently cased path to this same directory.
+    for (const name of ['service.json', 'db.lock']) {
+      const file = path.join(workspace, '.bilite', name);
+      const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      state.workspace = path.resolve(workspace).toUpperCase();
+      fs.writeFileSync(file, JSON.stringify(state));
+    }
+  }
   assert.equal(JSON.parse(at('catalog', 'dump')).drift.length, 0);
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/service.json')), false);
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/db.lock')), false);

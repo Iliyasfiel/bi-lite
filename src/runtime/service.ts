@@ -3,9 +3,10 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SERVICE_PROTOCOL, readServiceState, clearServiceState, type ServiceState } from './workspace.ts';
+import { canonicalPath, samePath } from './paths.ts';
 
-export const workspacePath = () => fs.realpathSync(process.cwd());
-export const databasePath = () => path.resolve(process.env.BILITE_DB ?? 'data/bi.duckdb');
+export const workspacePath = () => canonicalPath(process.cwd());
+export const databasePath = () => canonicalPath(process.env.BILITE_DB ?? 'data/bi.duckdb');
 
 function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -17,7 +18,7 @@ export interface RuntimePeer { state: ServiceState; url: string }
 export async function servicePeer(workspace = workspacePath()): Promise<RuntimePeer | null> {
   const state = readServiceState(workspace);
   if (!state) return null;
-  if (state.workspace !== workspace || state.protocolVersion !== SERVICE_PROTOCOL) {
+  if (!samePath(state.workspace, workspace) || state.protocolVersion !== SERVICE_PROTOCOL) {
     throw new Error('工作区运行状态身份或协议不匹配，请核对 .bilite/service.json');
   }
   if (!processAlive(state.pid)) return null;
@@ -28,8 +29,8 @@ export async function servicePeer(workspace = workspacePath()): Promise<RuntimeP
       headers: { authorization: `Bearer ${state.token}` }, signal: AbortSignal.timeout(700), redirect: 'error',
     });
     const body = await response.json();
-    if (!response.ok || body.instanceId !== state.instanceId || body.workspace !== workspace
-      || body.protocolVersion !== SERVICE_PROTOCOL || body.database !== databasePath()) {
+    if (!response.ok || body.instanceId !== state.instanceId || !samePath(body.workspace, workspace)
+      || body.protocolVersion !== SERVICE_PROTOCOL || !samePath(body.database, databasePath())) {
       throw new Error('服务身份或数据库配置不匹配');
     }
     return { state, url };
@@ -60,8 +61,10 @@ export async function acquireWorkspaceLock(workspace = workspacePath(), timeoutM
       const acquired = withGuard(workspace, () => {
         if (fs.existsSync(file)) {
           const old = JSON.parse(fs.readFileSync(file, 'utf8'));
-          if (!Number.isInteger(old.pid) || old.workspace !== workspace) throw new Error('执行锁损坏或身份不匹配，请核对 .bilite/db.lock');
-          if (processAlive(old.pid)) return false;
+          if (!Number.isInteger(old.pid) || !samePath(old.workspace, workspace)) throw new Error('执行锁损坏或身份不匹配，请核对 .bilite/db.lock');
+      if (processAlive(old.pid)) return false;
+      const stale = readServiceState(workspace);
+      if (stale && processAlive(stale.pid) === false) clearServiceState(workspace, stale.instanceId);
           fs.unlinkSync(file);
         }
         fs.writeFileSync(file, JSON.stringify({ pid: process.pid, token, workspace }) + '\n', { flag: 'wx', mode: 0o600 });
