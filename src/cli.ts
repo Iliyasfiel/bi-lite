@@ -1095,7 +1095,7 @@ export const COMMANDS: CliCommand[] = [
   {
     invocation: 'source-look',
     name: 'agent look',
-    summary: '查看源 Excel 文本结构；数字格只标记，不返回值',
+    summary: '先检查空白结构样表；含数据则停止，不返回内容',
     usage: 'bilite agent look <源.xlsx> [--sheet 名称] [--range A1:L40] [--max-rows 60] [--max-cols 30]',
     async run(inv, io) {
       if (inv.kind !== 'source-look') throw new Error('命令表与 Invocation 不匹配');
@@ -1122,9 +1122,11 @@ export const COMMANDS: CliCommand[] = [
     async run(inv, io) {
       if (inv.kind !== 'generate-spec') throw new Error('命令表与 Invocation 不匹配');
       const { generateSpec } = await import('./mcp/tools.ts');
+      const { assertBlankWorkbook } = await import('./spec/blank.ts');
+      await assertBlankWorkbook(inv.template ?? 'test/fixtures/月度保送表.xlsx');
       await openDb();
       const result = await generateSpec({ template: inv.template ?? undefined, sheets: inv.sheets.length ? inv.sheets : undefined, id: inv.id ?? undefined, title: inv.title ?? undefined });
-      const output = { ...result, guessedAxes: result.guessed, note: '草稿是提案；guessedAxes 与 unmatched 需人工确认后再渲染' };
+      const output = { ...result, guessedAxes: result.guessed };
       return agentOutput(io, output);
     },
   },

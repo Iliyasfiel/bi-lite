@@ -1,7 +1,7 @@
 /**
  * MCP 工具集（docs/需求与架构.md §7.1）
  *
- * ★ 这是 agent 与数据之间的**唯一**接缝。设计上只有五个工具，且**没有一个能取数**。
+ * Agent 结构入口先检查空表；数据试运行/导入工具仅返回拒绝状态。
  *
  * 安全不变量（铁律 1）：本文件导出的任何函数都不得把金额写进返回值。
  *   - `list_metrics`       只读维度表，零金额
@@ -25,11 +25,11 @@ import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
 import { declaredFactsOf } from '../gen/parse.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
 import { readTemplateSchema, textAt } from '../spec/template.ts';
+import { assertBlankWorkbook } from '../spec/blank.ts';
 import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
 import { chartShape, type ChartSpec } from '../render/chart.ts';
-import { diagnoseIngest, parseIngestSpec, parseDecisions, type IngestSpec } from '../ingest/types.ts';
+import { diagnoseIngest } from '../ingest/types.ts';
 import { resolveSource } from '../ingest/dryrun.ts';
-import { runIngest, type IngestRunResult } from '../ingest/run.ts';
 import { masterCatalog } from '../ingest/master.ts';
 
 const OUTPUT_DIR = 'output';
@@ -121,9 +121,11 @@ function resolveAnchor(
 export async function getTemplateSchema(args: { template?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
+  await assertBlankWorkbook(tpl);
   const schema = await readTemplateSchema(tpl);
 
   return {
+    safety: { checked: true, policy: 'blank-only-v1' },
     template: schema.template,
     sheets: schema.sheets,
     anchors: schema.anchors.map((a) => ({
@@ -205,6 +207,7 @@ async function lintSpecTool(args: { spec?: string; specFile?: string }) {
  */
 export async function previewSpec(args: { spec?: string; specFile?: string; params?: Record<string, string | number> }) {
   const { spec, from } = loadSpec(args);
+  if (spec.template) await assertBlankWorkbook(spec.template);
   const p = { ...(spec.params ?? {}), ...(args.params ?? {}) };
 
   const wb = spec.template && fs.existsSync(spec.template) ? await XLSXPopulate.fromFileAsync(spec.template) : null;
@@ -276,6 +279,7 @@ async function renderReport(args: {
   output?: string;
 }) {
   const { spec } = loadSpec(args);
+  if (spec.template) await assertBlankWorkbook(spec.template);
   const p = { ...(spec.params ?? {}), ...(args.params ?? {}) };
   if (!spec.template) throw new Error('spec 未声明 template，无法渲染 Excel');
   if (!fs.existsSync(spec.template)) throw new Error(`模板不存在: ${spec.template}`);
@@ -415,6 +419,7 @@ export async function diffReport(args: { before?: string; after?: string; before
 export async function generateSpec(args: { template?: string; sheets?: string[]; id?: string; title?: string }) {
   const tpl = args.template ?? DEFAULT_TEMPLATE;
   if (!fs.existsSync(tpl)) throw new Error(`模板不存在: ${tpl}`);
+  await assertBlankWorkbook(tpl);
 
   const cat = await catalog();
   const registry: Registry = {
@@ -445,6 +450,7 @@ export async function generateSpec(args: { template?: string; sheets?: string[];
     yaml: r.yaml,
     draftValid,
     draftError,
+    requiresConfirmation: true,
     blocks: r.blocks.map((b) => ({
       sheet: b.sheet,
       anchor: b.anchor,
@@ -469,11 +475,11 @@ export async function generateSpec(args: { template?: string; sheets?: string[];
     unmatched: r.unmatched,
     issues: r.issues,
     note:
-      '这是**草稿**，不是定稿。source=guessed 的轴与 issues 里的 warn/error 需要人工确认；' +
+      '这是**草稿**，不是定稿。所有草稿都须逐项向用户说明语义、歧义与矛盾并等待明确确认，不能因校验通过就自动注册、保存到生效目录或执行；' +
       'unmatched 里的名字不在注册表中，导入数据前必须先建映射（文档 R1 主数据对齐）。' +
       'draftValid=false 表示这份草稿**直接被校验拒绝**（通常是模板里没有指标信息），' +
       '请先按 issues 里的 error 补上约束再保存 —— 不要试图绕过校验。' +
-      '本工具只读模板结构与标签文本，不读模板里的任何数字，也不查数据库。',
+      '含数据文件在返回结构前拒绝；数据试运行与导入交给用户在 Web 页面手动完成。',
   };
 }
 
@@ -505,6 +511,7 @@ export async function lookAtSource(args: { source?: string; sheet?: string; rang
   if (!args.source) throw new Error('需要 source（源 Excel 路径，相对仓库根）');
   const resolved = resolveSource(args.source);
   if (!fs.existsSync(resolved)) throw new Error(`源文件不存在: ${args.source}`);
+  await assertBlankWorkbook(resolved);
   let wb: Workbook;
   try {
     wb = await XLSXPopulate.fromFileAsync(resolved);
@@ -569,14 +576,11 @@ export async function lookAtSource(args: { source?: string; sheet?: string; rang
     truncated: { rows: stop.row > lastRow, cols: stop.col > lastCol },
     legend: {
       text: '文本格原样回传（表头/行标签/期数多在这里）',
-      num: '数字格 —— **只报"这里有个数"，值不回传**（哪几列是数据列看这个）',
-      date: '日期格式格（值不回传）',
       formula: '带公式的格（模板里的「合计」行多在这里，写 drop 时要排除）',
     },
     rows,
     note:
-      '这是源文件的文本视图，用来写接入规格：先看表头在第几行、行标签在哪一列、' +
-      '哪几列是 num、哪些行 formula=true（要 drop）。金额永远看不到，也不需要看到。',
+      '这是通过空表检查的结构样表视图，不代表业务语义已确认。草稿须等待用户确认，真实数据由用户在 Web 手动导入。',
   };
 }
 
@@ -604,49 +608,10 @@ async function lintIngestTool(args: { spec?: string; specFile?: string }) {
   };
 }
 
-/** 2.8 dry_run_ingest —— 干跑：形状 + 主数据判定，一次库都不写 */
-async function dryRunIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; source?: string }) {
-  const { text, from } = loadIngestSpecText(args);
-  const cat = await masterCatalog();
-  const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
-  const d = diagnoseIngest(text, lintCtx);
-  if (d.willBeRejected) {
-    return {
-      from,
-      ok: false,
-      refused: true,
-      errors: d.issues.filter((i) => i.level === 'error'),
-      note: '规格没通过静态诊断，先按 errors 改规格（这一步连源文件都没读）。',
-    };
-  }
-  const spec = parseIngestSpec(text, lintCtx);
-  const r = await runIngest(spec, { catalog: cat, planOnly: true, decisions: parseDecisions(args.decisions), source: args.source });
-  return { from, planOnly: true, ...r };
-}
-
-/** 2.9 run_ingest —— 真正落库（源 Excel → 星型表）。这是唯一会写库的接入工具 */
-async function runIngestTool(args: { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean; source?: string }) {
-  const { text, from } = loadIngestSpecText(args);
-  const cat = await masterCatalog();
-  const lintCtx = { periodTypes: cat.periodTypes, facts: cat.facts };
-  const d = diagnoseIngest(text, lintCtx);
-  if (d.willBeRejected) {
-    return {
-      from,
-      ok: false,
-      refused: true,
-      errors: d.issues.filter((i) => i.level === 'error'),
-      note: '规格没通过静态诊断，没有落任何数据。',
-    };
-  }
-  const spec = parseIngestSpec(text, lintCtx);
-  const r: IngestRunResult = await runIngest(spec, {
-    catalog: cat,
-    decisions: parseDecisions(args.decisions),
-    strict: args.strict === true,
-    source: args.source,
-  });
-  return { from, ...r };
+/** Data inspection/import is a human Web operation, never an agent tool action. */
+function manualIngestOnly() {
+  return { ok: false, refused: true, code: 'MANUAL_WEB_IMPORT_REQUIRED',
+    note: 'agent 不执行数据试运行或导入。请用户在 Web 数据导入页自行选择本机源文件、载入已确认的接入规格、试运行并确认导入。' };
 }
 
 /**
@@ -691,7 +656,7 @@ export const TOOLS: ToolDef[] = [
     name: 'get_template_schema',
     description:
       '解析一个 Excel 报送模板的结构：sheet 列表、定义名称锚点、锚点上方的表头、锚点左方的行标签、合并单元格。' +
-      '用于把"人工做好的空模板"翻译成 spec 的 rows/cols/anchor。只返回标签文本，模板里的任何数字都不会回传。',
+      '先进行本地全工作簿空表检查；有数值或疑似数值文本立即拒绝，不返回标签。仅干净空模板可继续，草稿必须等待用户确认。',
     inputSchema: {
       type: 'object',
       properties: { template: { type: 'string', description: '模板路径；省略则用默认示例模板' } },
@@ -773,8 +738,8 @@ export const TOOLS: ToolDef[] = [
     description:
       '从一个 Excel 报送模板**推断**出 spec 草稿（YAML）。识别表头口径、预置行标签、定义名称锚点，' +
       '并自动排除模板里的公式行（如「合计 =SUM(...)」）。返回草稿 YAML + 证据链 + 未识别清单（unmatched）。' +
-      'source=guessed 的轴是推断的，必须人工确认后再用 preview_spec / render_report。' +
-      '本工具只读模板标签文本，不读任何数字，也不查数据库。',
+      '所有草稿（包括没有 guessed 项的草稿）均须解释语义并等待用户明确确认，之后才可注册与执行。' +
+      '本工具先本地检查全工作簿；含数据即拒绝，检查通过才返回草稿标签。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -790,9 +755,8 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'look_at_source',
     description:
-      '看一份源 Excel（或报表模板）的**文本视图**：表头文本、行标签文本、哪些格是数字（只报"这里有个数"，' +
-      '永不回传数值）、哪些格带公式（模板里的「合计」行）。写接入规格前先用它确认表头在第几行、' +
-      '行标签在哪一列、数据列是哪几列、哪些行要 drop。金额看不到，也不需要看到。',
+      '只查看通过本地全工作簿空表检查的结构样表。发现数值、含数字文本或无法确认的内容立即拒绝，不返回标签；' +
+      '不得用于查看真实业务源文件。草稿语义须由用户确认，数据试运行和导入交给用户在 Web 手动完成。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -824,10 +788,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'dry_run_ingest',
-    description:
-      '**干跑**一份接入规格：读出形状（数据行数、被 drop 的行、重复的行键、值列与口径、坐标完整性、期数、' +
-      '库里对不上的主数据名）并做一次主数据判定（哪些会自动归并、哪些要人拍板、哪些会新建），' +
-      '一次库都不写。返回里没有任何金额。人手拍板前用这个把结论摆出来。',
+    description: '已禁用 agent 数据试运行；仅返回拒绝状态，用户须在 Web 手动试运行。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -842,14 +803,11 @@ export const TOOLS: ToolDef[] = [
       },
       additionalProperties: false,
     },
-    handler: (a) => dryRunIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; source?: string }),
+    handler: () => manualIngestOnly(),
   },
   {
     name: 'run_ingest',
-    description:
-      '按接入规格把源 Excel **真正落库**（展开成星型表的 (公司,指标,期数,口径,金额) 行）。' +
-      '有歧义的名字（像已有主数据但不确定）会整批拒绝、一行都不写，并把要拍板的清单回给你；' +
-      '给出 decisions 后重跑即可。重复坐标按规格的 onConflict 处理（默认整批拒绝，不静默覆盖）。',
+    description: '已禁用 agent 数据导入；仅返回拒绝状态，用户须在 Web 手动确认导入。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -865,7 +823,7 @@ export const TOOLS: ToolDef[] = [
       },
       additionalProperties: false,
     },
-    handler: (a) => runIngestTool(a as { spec?: string; specFile?: string; decisions?: unknown; strict?: boolean; source?: string }),
+    handler: () => manualIngestOnly(),
   },
   {
     name: 'get_catalog',

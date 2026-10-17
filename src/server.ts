@@ -22,6 +22,7 @@ import { catalog, queryMetrics, QueryRefused, type MetricsQuery } from './semant
 import { parseSpec, diagnoseSpec, SpecError } from './spec/types.ts';
 import { compileBlock, runCompiled, planOf } from './spec/compile.ts';
 import { declaredFactsOf, loadModels } from './gen/parse.ts';
+import { DEFAULT_TARGET } from './gen/ir.ts';
 import { renderReport } from './operations/report.ts';
 import { prepareIngest } from './operations/ingest.ts';
 import { toEChartsOption, chartShape, chartInputFromMetrics, type ChartSpec } from './render/chart.ts';
@@ -134,7 +135,13 @@ export const routes: Record<string, Handler> = {
 
   /** 元数据目录（维度/口径/指标/公司）—— 零金额，可安全下发到浏览器 */
   'GET /api/catalog': async (_req, res) => {
-    json(res, 200, await catalog());
+    const result = await catalog();
+    const fact = declaredFactsOf().find((f) => f.name === DEFAULT_TARGET);
+    const months = fact ? await db.query<{ month: string }>(
+      `SELECT DISTINCT strftime(fin_month, '%Y-%m') AS month
+       FROM "${fact.name}" WHERE fin_month IS NOT NULL ORDER BY month`,
+    ) : [];
+    json(res, 200, { ...result, query: { fact: fact?.name ?? null, months: months.map((r) => r.month) } });
   },
 
   /** 导入批次列表（可追溯，N4） */
