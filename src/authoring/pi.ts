@@ -4,6 +4,11 @@ import type { AssistantMessageEventStream, TranscriptContext } from '@earendil-w
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import type { Tool } from '@earendil-works/pi-ai';
 import { Type } from 'typebox';
+import {
+  AUTHORING_PROVIDER_ID,
+  DEFAULT_AUTHORING_BASE_URL,
+  DEFAULT_AUTHORING_MODEL_ID,
+} from './config.ts';
 
 export type { Agent, Model };
 
@@ -108,8 +113,8 @@ const submitSpecProposalTool: Tool = {
 };
 
 const DEFAULTS = {
-  baseUrl: 'https://api.deepseek.com/v1',
-  modelId: 'deepseek-chat',
+  baseUrl: DEFAULT_AUTHORING_BASE_URL,
+  modelId: DEFAULT_AUTHORING_MODEL_ID,
   contextWindow: 128_000,
   maxTokens: 8_192,
   timeoutMs: 120_000,
@@ -129,7 +134,7 @@ export function createAuthoringModels(options: PiRuntimeOptions = {}) {
     id: options.modelId ?? DEFAULTS.modelId,
     name: options.modelId ?? DEFAULTS.modelId,
     api: 'openai-completions',
-    provider: 'bi-lite-authoring',
+    provider: AUTHORING_PROVIDER_ID,
     baseUrl: options.baseUrl ?? DEFAULTS.baseUrl,
     reasoning: false,
     input: ['text'],

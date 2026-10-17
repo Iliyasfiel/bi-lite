@@ -93,6 +93,15 @@ export type Invocation =
   | { kind: 'diff-spec'; beforeFile: string; afterFile: string }
   | { kind: 'skill-export'; format: 'json' | 'prompt' }
   | { kind: 'skill-install'; scope: 'project' | 'user'; force: boolean }
+  | {
+      kind: 'authoring-setup';
+      modelId: string | null;
+      baseUrl: string | null;
+      apiKeyFromStdin: boolean;
+      force: boolean;
+    }
+  | { kind: 'authoring-status' }
+  | { kind: 'authoring-test'; send: boolean }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
 const HELP_FLAGS = new Set(['-h', '--help']);
@@ -184,6 +193,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'validate') return parseValidateArgs(tokens.slice(1));
   if (first === 'replay') return parseReplayArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
+  if (first === 'authoring') return parseAuthoringArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
 }
 
@@ -457,6 +467,47 @@ function parseSkillArgs(tokens: readonly string[]): Invocation {
   return { kind: 'skill-export', format: fmt };
 }
 
+function parseAuthoringArgs(tokens: readonly string[]): Invocation {
+  const hint = 'bilite authoring --help';
+  const sub = tokens[0];
+  if (sub === undefined || HELP_FLAGS.has(sub)) return { kind: 'help', command: 'authoring' };
+  if (sub === 'status') {
+    if (tokens.length > 1 && tokens.slice(1).some((token) => HELP_FLAGS.has(token))) {
+      return { kind: 'help', command: 'authoring status' };
+    }
+    if (tokens.length !== 1) return usage(`status 不接受参数（收到 ${tokens[1]}）`, hint);
+    return { kind: 'authoring-status' };
+  }
+  if (sub === 'test') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring test' };
+    const args = scanArgs(rest, [], ['--send'], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    if (args.positionals.length > 0) {
+      return usage(`test 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+    }
+    return { kind: 'authoring-test', send: '--send' in args.values };
+  }
+  if (sub !== 'setup') return usage(`authoring 没有子命令「${sub}」`, hint);
+
+  const rest = tokens.slice(1);
+  if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring setup' };
+  const args = scanArgs(rest, ['--model', '--base-url'], ['--api-key-stdin', '--force'], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`setup 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+  }
+  if ((args.values['--model']?.length ?? 0) > 1) return usage('--model 只能指定一次', hint);
+  if ((args.values['--base-url']?.length ?? 0) > 1) return usage('--base-url 只能指定一次', hint);
+  return {
+    kind: 'authoring-setup',
+    modelId: args.values['--model']?.[0] ?? null,
+    baseUrl: args.values['--base-url']?.[0] ?? null,
+    apiKeyFromStdin: '--api-key-stdin' in args.values,
+    force: '--force' in args.values,
+  };
+}
+
 function parseQueryArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite query --help';
   if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'query' };
@@ -562,6 +613,9 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'diff-spec',
   'skill-export',
   'skill-install',
+  'authoring-setup',
+  'authoring-status',
+  'authoring-test',
 ];
 
 /** `--decisions` 给的是文件路径；读出来交给 ingest 侧**唯一**的校验实现 */
@@ -599,6 +653,228 @@ async function agentOutput(io: CliIO, value: unknown): Promise<number> {
 }
 
 export const COMMANDS: CliCommand[] = [
+  {
+    invocation: 'authoring-setup',
+    name: 'authoring setup',
+    summary: '配置内置助手供应商：默认 DeepSeek，交互输入 API key，仅存本机',
+    usage:
+      'bilite authoring setup [--model deepseek-flash] [--base-url https://api.deepseek.com/v1] [--api-key-stdin] [--force]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-setup') throw new Error('命令表与 Invocation 不匹配');
+      const {
+        defaultAuthoringAuthPath,
+        defaultAuthoringConfig,
+        defaultAuthoringConfigPath,
+        loadAuthoringConfig,
+        resolveAuthoringApiKey,
+        writeAuthoringConfig,
+        writeAuthoringCredential,
+      } = await import('./authoring/config.ts');
+      const { readSecretFromStdin, readSecretLine } = await import('./authoring/input.ts');
+
+      const configFile = defaultAuthoringConfigPath();
+      const authFile = defaultAuthoringAuthPath();
+      const config = defaultAuthoringConfig({
+        modelId: inv.modelId ?? undefined,
+        baseUrl: inv.baseUrl ?? undefined,
+      });
+
+      if (!inv.force && fs.existsSync(configFile)) {
+        let existing;
+        try {
+          existing = loadAuthoringConfig({ file: configFile });
+        } catch (error) {
+          throw new Error(
+            `已有配置无法读取（${(error as Error).message}）；如需覆盖请加 --force`,
+          );
+        }
+        if (
+          existing.api !== config.api ||
+          existing.baseUrl !== config.baseUrl ||
+          existing.modelId !== config.modelId ||
+          existing.apiKeyEnv !== config.apiKeyEnv
+        ) {
+          throw new Error(
+            `已有配置不同（${existing.baseUrl} / ${existing.modelId}）；如需覆盖请加 --force`,
+          );
+        }
+      }
+
+      let apiKey: string;
+      if (inv.apiKeyFromStdin) {
+        io.err('bilite authoring setup: 从标准输入读取 API key\n');
+        apiKey = await readSecretFromStdin();
+      } else {
+        apiKey = await readSecretLine('API key（输入不回显）: ', io.err);
+      }
+      if (!apiKey) throw new Error('API key 不能为空');
+
+      writeAuthoringConfig(config, { file: configFile });
+      writeAuthoringCredential(apiKey, { file: authFile });
+      const resolved = resolveAuthoringApiKey(config, { authFile });
+
+      jsonTo(io, {
+        configFile,
+        authFile,
+        api: config.api,
+        baseUrl: config.baseUrl,
+        modelId: config.modelId,
+        apiKey: { present: true, source: resolved.source },
+        networkChecked: false,
+        next: [
+          'bilite authoring status',
+          'bilite authoring test',
+          'bilite authoring test --send',
+        ],
+      });
+      io.err(
+        `bilite authoring setup: 已保存 ${config.baseUrl} / ${config.modelId}；` +
+          `密钥写入 ${authFile}（0600）。尚未做网络连通性检查。\n`,
+      );
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-status',
+    name: 'authoring status',
+    summary: '查看内置助手供应商配置与密钥来源；不发起网络请求、不回显密钥',
+    usage: 'bilite authoring status',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-status') throw new Error('命令表与 Invocation 不匹配');
+      const {
+        defaultAuthoringAuthPath,
+        defaultAuthoringConfigPath,
+        loadAuthoringConfig,
+        resolveAuthoringApiKey,
+      } = await import('./authoring/config.ts');
+
+      const configFile = defaultAuthoringConfigPath();
+      const authFile = defaultAuthoringAuthPath();
+      let config;
+      try {
+        config = loadAuthoringConfig({ file: configFile });
+      } catch (error) {
+        const failure = error as Error & { code?: string };
+        jsonTo(io, {
+          configured: false,
+          ready: false,
+          configFile,
+          authFile,
+          error: { code: failure.code ?? 'AUTHORING_CONFIG_INVALID', message: failure.message },
+          next: ['bilite authoring setup'],
+        });
+        io.err(`bilite authoring status: ${failure.message}\n`);
+        return EXIT.FAILED;
+      }
+
+      let key;
+      try {
+        key = resolveAuthoringApiKey(config, { authFile });
+      } catch (error) {
+        const failure = error as Error & { code?: string };
+        jsonTo(io, {
+          configured: true,
+          ready: false,
+          configFile,
+          authFile,
+          api: config.api,
+          baseUrl: config.baseUrl,
+          modelId: config.modelId,
+          apiKey: { present: false, source: null },
+          error: { code: failure.code ?? 'AUTHORING_API_KEY_MISSING', message: failure.message },
+          next: ['bilite authoring setup'],
+        });
+        io.err(`bilite authoring status: ${failure.message}\n`);
+        return EXIT.FAILED;
+      }
+
+      jsonTo(io, {
+        configured: true,
+        ready: true,
+        configFile,
+        authFile,
+        api: config.api,
+        baseUrl: config.baseUrl,
+        modelId: config.modelId,
+        apiKey: { present: true, source: key.source },
+        networkChecked: false,
+      });
+      io.err(
+        `bilite authoring status: 已配置 ${config.baseUrl} / ${config.modelId}；` +
+          `密钥来源 ${key.source}。尚未做网络连通性检查。\n`,
+      );
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-test',
+    name: 'authoring test',
+    summary: '用示例结构检查供应商配置；默认只预览，--send 才发起真实请求',
+    usage: 'bilite authoring test [--send]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-test') throw new Error('命令表与 Invocation 不匹配');
+      const {
+        defaultAuthoringAuthPath,
+        defaultAuthoringConfigPath,
+        loadAuthoringConfig,
+        resolveAuthoringApiKey,
+        runtimeFromAuthoringConfig,
+      } = await import('./authoring/config.ts');
+      const { AUTHORING_SMOKE_USER_TEXT, authoringSmokeTask, runAuthoringSmoke } =
+        await import('./authoring/smoke.ts');
+      const { buildAuthoringTurnInput } = await import('./authoring/context.ts');
+
+      const configFile = defaultAuthoringConfigPath();
+      const authFile = defaultAuthoringAuthPath();
+      const config = loadAuthoringConfig({ file: configFile });
+      const task = authoringSmokeTask();
+      const input = buildAuthoringTurnInput(task, AUTHORING_SMOKE_USER_TEXT);
+
+      let keySource: string | null = null;
+      try {
+        keySource = resolveAuthoringApiKey(config, { authFile }).source;
+      } catch {
+        keySource = null;
+      }
+
+      if (!inv.send) {
+        jsonTo(io, {
+          sent: false,
+          configFile,
+          authFile,
+          api: config.api,
+          baseUrl: config.baseUrl,
+          modelId: config.modelId,
+          apiKey: { present: keySource !== null, source: keySource },
+          preview: input.preview,
+          note: '只生成发送预览，没有网络请求；确认后加 --send。',
+        });
+        io.err('bilite authoring test: 发送预览已输出，未发起网络请求\n');
+        return EXIT.OK;
+      }
+
+      const runtime = runtimeFromAuthoringConfig(config, process.env, { authFile });
+      const result = await runAuthoringSmoke(runtime);
+      jsonTo(io, {
+        sent: true,
+        configFile,
+        baseUrl: config.baseUrl,
+        modelId: config.modelId,
+        text: result.text,
+        stopReason: result.stopReason,
+        errorMessage: result.errorMessage,
+        requestCount: result.requestCount,
+        proposalCount: result.proposals.length,
+        toolResults: result.toolResults.map((item) => ({ name: item.name, blocked: item.blocked })),
+      });
+      io.err(
+        result.errorMessage
+          ? `bilite authoring test: 请求结束但有错误：${result.errorMessage}\n`
+          : `bilite authoring test: 请求完成（${result.requestCount} 次模型请求）\n`,
+      );
+      return result.errorMessage ? EXIT.FAILED : EXIT.OK;
+    },
+  },
   {
     invocation: 'skill-install',
     name: 'skill install',
@@ -1227,7 +1503,8 @@ function readVersion(io: CliIO): string {
 
 /** 有专门帮助页的主题：总览(null)、每个命令名、以及 "ingest" 这个分组 */
 function isKnownHelpTopic(command: string): boolean {
-  return command === 'ingest' || command === 'agent' || command === 'skill' || COMMANDS.some((c) => c.name === command);
+  return command === 'ingest' || command === 'agent' || command === 'skill' ||
+    command === 'authoring' || COMMANDS.some((c) => c.name === command);
 }
 
 function helpText(io: CliIO, command: string | null): string {
@@ -1288,6 +1565,22 @@ function helpText(io: CliIO, command: string | null): string {
       '这些命令是 agent 专用入口：只返回结构、坐标与状态，不返回金额。',
       '接入执行仍用 ingest；渲染仍用 render。',
     ].join('\n') + '\n';
+  }
+  if (command === 'authoring') {
+    return (
+      [
+        '用法： bilite authoring <子命令>',
+        '',
+        '子命令：',
+        ...COMMANDS.filter((c) => c.name.startsWith('authoring ')).map(
+          (c) => `  ${c.name.slice('authoring '.length).padEnd(8)} ${c.summary}`,
+        ),
+        '',
+        '默认供应商：DeepSeek（https://api.deepseek.com/v1），模型 deepseek-flash。',
+        '`setup` 交互输入 API key；密钥单独写入用户配置目录的 authoring-auth.json（0600），',
+        '不写入项目工作区，也不读取 ~/.pi/agent。',
+      ].join('\n') + '\n'
+    );
   }
   if (command === 'catalog') {
     return (

@@ -34,7 +34,8 @@ try {
     const help = args.length === 0 || ['help', '--help', '-h', '--version', '-v', 'version'].includes(args[0]) || args.includes('--help') || args.includes('-h');
     const userSkill = args[0] === 'skill' && args[1] === 'install'
       && args.some((arg, i) => arg === '--scope' && args[i + 1] === 'user');
-    if (!help && !userSkill) process.chdir(locateWorkspace(workspace));
+    const globalConfig = args[0] === 'authoring';
+    if (!help && !userSkill && !globalConfig) process.chdir(locateWorkspace(workspace));
     const invocation = await import(moduleUrl('runtime/invocation'));
     const business = await import(moduleUrl('cli'));
     cli = business;

@@ -25,9 +25,9 @@ let child: ReturnType<typeof spawn> | undefined;
 let childExit: Promise<number | null>;
 let logs = '';
 
-function command(args: string[], cwd = caller, extraEnv = {}, expected = 0) {
+function command(args: string[], cwd = caller, extraEnv = {}, expected = 0, input?: string) {
   const result = spawnSync(process.execPath, args, {
-    cwd, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 60000,
+    cwd, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 60000, input,
     maxBuffer: 2 * 1024 * 1024, windowsHide: true,
   });
   if (result.error) throw result.error;
@@ -98,6 +98,21 @@ try {
   assert.equal(fs.existsSync(path.join(installed, 'src')), false);
   assert.match(cli(['--version']), /\d+\.\d+\.\d+/);
   assert.match(cli(['skill', '--help']), /install/);
+  const configHome = path.join(temporary, 'authoring-config');
+  const authoring = JSON.parse(command(
+    [entry, 'authoring', 'setup', '--api-key-stdin'],
+    caller,
+    { XDG_CONFIG_HOME: configHome },
+    0,
+    'sk-package-test\n',
+  ));
+  assert.equal(authoring.modelId, 'deepseek-flash');
+  const authoringStatus = JSON.parse(cli(['authoring', 'status'], caller, { XDG_CONFIG_HOME: configHome }));
+  assert.equal(authoringStatus.ready, true);
+  assert.equal(authoringStatus.apiKey.source, 'credential-file');
+  const authoringPreview = JSON.parse(cli(['authoring', 'test'], caller, { XDG_CONFIG_HOME: configHome }));
+  assert.equal(authoringPreview.sent, false);
+  assert.equal(authoringPreview.modelId, 'deepseek-flash');
   cli(['init', workspace]);
   const at = (...args: string[]) => cli(['--workspace', workspace, ...args]);
   const empty = JSON.parse(at('catalog', 'dump'));

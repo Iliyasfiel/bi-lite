@@ -4,10 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
 import {
+  AuthoringAuthError,
   AuthoringConfigError,
+  defaultAuthoringAuthPath,
+  defaultAuthoringConfig,
   defaultAuthoringConfigPath,
   loadAuthoringConfig,
+  resolveAuthoringApiKey,
   runtimeFromAuthoringConfig,
+  writeAuthoringConfig,
+  writeAuthoringCredential,
 } from '../src/authoring/config.ts';
 import { buildAuthoringTurnInput } from '../src/authoring/context.ts';
 import { checkAuthoringRuntime, probeAuthoringProtocol, runAuthoringTurn } from '../src/authoring/pi.ts';
@@ -120,18 +126,48 @@ assert.equal((await checkAuthoringRuntime({})).authStatus, 'missing');
       apiKeyEnv: 'BILITE_AUTHORING_FAKE_KEY',
     }), { mode: 0o600 });
     const config = loadAuthoringConfig({ file });
+    const authFile = path.join(dir, 'authoring-auth.json');
     assert.equal(config.baseUrl, 'https://example.com/v1');
     assert.equal(config.modelId, 'fake-model');
     assert.equal(config.apiKeyEnv, 'BILITE_AUTHORING_FAKE_KEY');
-    assert.equal(runtimeFromAuthoringConfig(config, { BILITE_AUTHORING_FAKE_KEY: 'fake-key' }).apiKey, 'fake-key');
-    assert.throws(
-      () => runtimeFromAuthoringConfig(config, {}),
-      (error) => error instanceof AuthoringConfigError && error.code === 'AUTHORING_API_KEY_MISSING',
+    assert.equal(
+      runtimeFromAuthoringConfig(config, { BILITE_AUTHORING_FAKE_KEY: 'fake-key' }, { authFile }).apiKey,
+      'fake-key',
     );
+    assert.throws(
+      () => runtimeFromAuthoringConfig(config, {}, { authFile }),
+      (error) => error instanceof AuthoringAuthError && error.code === 'AUTHORING_API_KEY_MISSING',
+    );
+    writeAuthoringCredential('stored-key', { file: authFile });
+    assert.equal(fs.statSync(authFile).mode & 0o777, 0o600);
+    assert.equal(runtimeFromAuthoringConfig(config, {}, { authFile }).apiKey, 'stored-key');
+    assert.equal(resolveAuthoringApiKey(config, { authFile }).source, 'credential-file');
+    assert.equal(
+      runtimeFromAuthoringConfig(config, { BILITE_AUTHORING_FAKE_KEY: 'env-key' }, { authFile }).apiKey,
+      'env-key',
+    );
+    if (process.platform !== 'win32') {
+      fs.chmodSync(authFile, 0o644);
+      assert.throws(
+        () => resolveAuthoringApiKey(config, { authFile }),
+        (error) => error instanceof AuthoringAuthError && error.code === 'AUTHORING_AUTH_INSECURE',
+      );
+      fs.chmodSync(authFile, 0o600);
+    }
     assert.equal(
       defaultAuthoringConfigPath({ BILITE_AUTHORING_CONFIG: file }, 'darwin', dir),
       file,
     );
+    assert.equal(
+      defaultAuthoringAuthPath({ BILITE_AUTHORING_CONFIG: file }, 'darwin', dir),
+      path.join(dir, 'authoring-auth.json'),
+    );
+
+    const written = path.join(dir, 'written.json');
+    const preset = defaultAuthoringConfig();
+    assert.equal(preset.modelId, 'deepseek-flash');
+    writeAuthoringConfig(preset, { file: written });
+    assert.deepEqual(loadAuthoringConfig({ file: written }), preset);
 
     fs.writeFileSync(file, JSON.stringify({
       version: 1,

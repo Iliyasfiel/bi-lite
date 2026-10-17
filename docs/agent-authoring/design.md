@@ -1,7 +1,7 @@
 # 内置规格助手：方案与架构设计
 
 状态：实施基线；附件准备层、源码开发 reset、pi SDK 收口、供应商配置和受控发送 DTO 已实现，
-Web 对话、草稿确认及后续能力以开发计划为准。
+DeepSeek `deepseek-flash` 示例结构在线烟测已通过；Web 对话、草稿确认及后续能力以开发计划为准。
 当前交付状态、优先级和验证入口以 [开发计划](../开发计划.md) 为准；
 现有引擎能力以 [需求与架构](../需求与架构.md) 为准。
 
@@ -116,7 +116,8 @@ Web 显示当前业务理解、纯文本对话、本地模板结构及最终确�
 
 当前锁定 `pi-agent-core`/`pi-ai` 1.3.0（MIT，Node >=22.19.0），采用 Agent、显式 Models 集合
 与官方 `openai-completions` 协议适配器。离线验收使用受控 fetch，验证请求中的工具声明、
-输出上限、超时与重试配置；受控投影上下文与在线供应商仍待接入。
+输出上限、超时与重试配置；受控投影上下文与供应商配置已接入服务层。
+DeepSeek `deepseek-flash` 示例结构在线烟测已通过，Web 请求仍待接入。
 接入或升级按目标版本的官方文档、随包类型和示例核对接口；只有未定义的行为才使用有界探针。
 若该组合存在已确认的能力缺口，再评估 full-control coding-agent SDK，显式替换工具、资源、设置和会话。
 ModelRuntime 属于 coding-agent 集成层，不是 agent-core 自带的配置加载器。
@@ -137,7 +138,7 @@ bi-lite 提供薄配置界面，复用 pi 的供应商、模型、凭据格式�
 
 当前配置为独立 JSON 文件，默认位于用户配置目录的 `bilite/authoring.json`，
 可用 `BILITE_AUTHORING_CONFIG` 指定测试文件。字段为 `version`、`api`、`baseUrl`、
-`modelId`、`apiKeyEnv`；`api` 首批只接受 `openai-completions`，密钥只从指定环境变量读取，
+`modelId`、`apiKeyEnv`；`api` 首批只接受 `openai-completions`，
 `apiKeyEnv` 必须以 `BILITE_AUTHORING_` 开头，默认变量为 `BILITE_AUTHORING_API_KEY`。
 配置不接受 skills、MCP、扩展、命令等额外字段，
 基址必须为 HTTPS，本机回环端点可使用 HTTP。
@@ -147,12 +148,17 @@ bi-lite 提供薄配置界面，复用 pi 的供应商、模型、凭据格式�
   "version": 1,
   "api": "openai-completions",
   "baseUrl": "https://api.deepseek.com/v1",
-  "modelId": "deepseek-chat",
+  "modelId": "deepseek-flash",
   "apiKeyEnv": "BILITE_AUTHORING_API_KEY"
 }
 ```
 
-配置文件只保存端点和密钥变量名，不保存密钥；建议使用用户可读权限。
+配置文件只保存端点和密钥变量名，不保存密钥。
+`bilite authoring setup` 默认写入 DeepSeek 端点和 `deepseek-flash`，交互输入 API key；
+密钥保存到同目录的 `authoring-auth.json`（0600），可用 `BILITE_AUTHORING_AUTH` 指定测试文件。
+运行时先读取 `apiKeyEnv` 指定的环境变量，未设置时再读取凭据文件。
+`bilite authoring status` 只报告配置、密钥来源和就绪状态，不发起网络请求，也不回显密钥。
+首版不读取 `~/.pi/agent`，也不复用 pi 的全局认证文件。
 
 `src/authoring/context.ts` 生成发送预览与实际请求输入：只复制投影中的工作表、单元格标签、
 公式存在标记和锚点，以及用户文字；不复制附件路径、文件名、文件字节或缓存值。
@@ -161,12 +167,14 @@ bi-lite 提供薄配置界面，复用 pi 的供应商、模型、凭据格式�
 源码手动烟测只发送示例结构，不读取业务文件：
 
 ```bash
-npm run test:pi:live -- --preview
-BILITE_AUTHORING_API_KEY=... npm run test:pi:live -- --send
+bilite authoring test
+bilite authoring test --send
 ```
 
-`--preview` 不发起网络请求；`--send` 必须显式指定。未设置
+默认只输出发送预览，不发起网络请求；`--send` 必须显式指定。未设置
 `BILITE_AUTHORING_CONFIG` 时读取用户配置目录的 `bilite/authoring.json`。
+也可以继续用 `BILITE_AUTHORING_API_KEY` 临时覆盖已保存的密钥。
+当前已验证组合为 DeepSeek `deepseek-flash`，烟测只使用示例结构。
 
 产品契约、领域指南、任务状态由 bi-lite 显式注入，不发现项目/全局 AGENTS.md、skills、扩展或 MCP。
 提示只能约束行为，真实权限由工具注册和服务层决定。
