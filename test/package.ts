@@ -25,9 +25,9 @@ let child: ReturnType<typeof spawn> | undefined;
 let childExit: Promise<number | null>;
 let logs = '';
 
-function command(args: string[], cwd = caller, extraEnv = {}, expected = 0) {
+function command(args: string[], cwd = caller, extraEnv = {}, expected = 0, input?: string) {
   const result = spawnSync(process.execPath, args, {
-    cwd, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 60000,
+    cwd, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 60000, input,
     maxBuffer: 2 * 1024 * 1024, windowsHide: true,
   });
   if (result.error) throw result.error;
@@ -81,6 +81,7 @@ try {
   const packed = JSON.parse(command([npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', temporary], root));
   const pack = Array.isArray(packed) ? packed[0] : Object.values(packed)[0] as { filename: string; files: { path: string }[] };
   const paths = pack.files.map((file: { path: string }) => file.path);
+  assert.ok(!paths.some((file: string) => /(?:^|\/)(?:dev|development)(?:\/|\.)|\.test\.js$/.test(file)));
   assert.ok(paths.includes('dist/server.js') && paths.includes('dist/skill/install.js'));
   assert.ok(!paths.some((file: string) => /^(data|output|test|src|metrics)\//.test(file) || /\.duckdb|\.xlsx$|\.bilite\//.test(file)));
   const installation = path.join(temporary, 'installation');
@@ -97,6 +98,21 @@ try {
   assert.equal(fs.existsSync(path.join(installed, 'src')), false);
   assert.match(cli(['--version']), /\d+\.\d+\.\d+/);
   assert.match(cli(['skill', '--help']), /install/);
+  const configHome = path.join(temporary, 'authoring-config');
+  const authoring = JSON.parse(command(
+    [entry, 'authoring', 'setup', '--api-key-stdin'],
+    caller,
+    { XDG_CONFIG_HOME: configHome },
+    0,
+    'sk-package-test\n',
+  ));
+  assert.equal(authoring.modelId, 'deepseek-flash');
+  const authoringStatus = JSON.parse(cli(['authoring', 'status'], caller, { XDG_CONFIG_HOME: configHome }));
+  assert.equal(authoringStatus.ready, true);
+  assert.equal(authoringStatus.apiKey.source, 'credential-file');
+  const authoringPreview = JSON.parse(cli(['authoring', 'test'], caller, { XDG_CONFIG_HOME: configHome }));
+  assert.equal(authoringPreview.sent, false);
+  assert.equal(authoringPreview.modelId, 'deepseek-flash');
   cli(['init', workspace]);
   const at = (...args: string[]) => cli(['--workspace', workspace, ...args]);
   const empty = JSON.parse(at('catalog', 'dump'));
@@ -106,7 +122,10 @@ try {
   const port = await unusedPort();
   await start(entry, port);
   const url = `http://127.0.0.1:${port}`;
-  assert.equal((await fetch(url)).status, 200);
+  const page = await fetch(url);
+  assert.equal(page.status, 200);
+  assert.ok(!(await page.text()).includes('devReset'));
+  assert.equal((await fetch(url + '/api/dev/reset', { method: 'POST' })).status, 404);
   assert.equal((await (await fetch(url + '/api/workspace')).json()).empty, true);
   const firstPid = child!.pid;
   at('web', '--no-open');
@@ -149,6 +168,13 @@ try {
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/service.json')), false);
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/db.lock')), false);
   assert.equal(JSON.parse(at('replay', source)).ok, true);
+
+  const resetResult = spawnSync(process.execPath, [entry, '--workspace', workspace, 'dev', 'reset', '--confirm', '业务 工作区'], {
+    cwd: caller, env: { ...env, BILITE_DEV_RESET: 'allow' }, encoding: 'utf8', timeout: 15000,
+  });
+  assert.equal(resetResult.status, 2, resetResult.stderr || resetResult.stdout);
+  assert.match(String(resetResult.stderr), /未知命令/);
+  assert.notEqual(JSON.parse(at('catalog', 'dump')).objects.length, 0);
   await start(entry, port);
   await stop(false);
   if (process.platform === 'win32') {

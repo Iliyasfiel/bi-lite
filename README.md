@@ -203,7 +203,26 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 ## Agent 接入配置
 
 当前外部 agent 配置如下。后续内置规格助手、CLI 能力分层及仅开发阶段 reset 的统一方案见
-[方案与架构设计](docs/agent-authoring/design.md)，尚未实现。
+[方案与架构设计](docs/agent-authoring/design.md)。模板准备层、pi 最小会话、供应商配置和受控
+发送 DTO 已提供；Web 业务对话与版本确认尚未接入。
+仅源码开发的测试工作区 reset 见 [贡献指南](CONTRIBUTING.md)。
+
+### 配置内置助手供应商
+
+默认使用 DeepSeek 与 `deepseek-flash`，交互输入 API key：
+
+```bash
+bilite authoring setup
+bilite authoring status
+bilite authoring test
+bilite authoring test --send
+```
+
+配置保存在用户配置目录的 `bilite/authoring.json`，密钥单独写入同目录
+`authoring-auth.json`（0600），不进入项目工作区，也不读取 `~/.pi/agent`。
+`status` 和默认的 `test` 只检查本地配置并输出发送预览；只有 `test --send`
+才用示例结构发起一次真实模型请求。
+当前已验证组合为 DeepSeek `deepseek-flash`，烟测只使用示例结构。
 
 ### 安装 skill（以 Codex 为例）
 

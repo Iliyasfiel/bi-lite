@@ -127,6 +127,11 @@ export async function readTemplateSchema(template: string): Promise<TemplateSche
     throw e;
   }
 
+  return templateSchemaOf(wb, template);
+}
+
+/** Shared layout extraction for file callers and checked upload snapshots. */
+export function templateSchemaOf(wb: Workbook, template = ''): TemplateSchema {
   const sheets = wb.sheets().map((s) => {
     const ur = s.usedRange();
     return {

@@ -26,11 +26,16 @@ try {
     if (args.slice(1).some((arg) => ['--help', '-h'].includes(arg))) {
       console.log('用法：bilite init [目录] [--preset finance]\n默认建立空工作区；finance 添加财务模型，已有文件不覆盖。');
     } else console.log(JSON.stringify(initializeWorkspace(args.slice(1), workspace, root), null, 2));
+  } else if (engine === 'src' && args[0] === 'dev') {
+    const { runDevelopmentCommand } = await import(new URL('../dev/reset.ts', import.meta.url).href);
+    const target = workspace === undefined ? locateWorkspace(undefined) : path.resolve(workspace);
+    code = await runDevelopmentCommand(args, target);
   } else {
     const help = args.length === 0 || ['help', '--help', '-h', '--version', '-v', 'version'].includes(args[0]) || args.includes('--help') || args.includes('-h');
     const userSkill = args[0] === 'skill' && args[1] === 'install'
       && args.some((arg, i) => arg === '--scope' && args[i + 1] === 'user');
-    if (!help && !userSkill) process.chdir(locateWorkspace(workspace));
+    const globalConfig = args[0] === 'authoring';
+    if (!help && !userSkill && !globalConfig) process.chdir(locateWorkspace(workspace));
     const invocation = await import(moduleUrl('runtime/invocation'));
     const business = await import(moduleUrl('cli'));
     cli = business;

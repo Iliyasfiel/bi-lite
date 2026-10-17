@@ -3,6 +3,7 @@ data/
 *.duckdb
 *.duckdb.wal
 output/
+drafts/
 *.报送.xlsx
 *.已填.xlsx
 templates/uploads/

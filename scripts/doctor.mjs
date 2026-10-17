@@ -20,7 +20,7 @@ report(process.versions.node === baseline ? 'OK' : 'WARN',
 if (Number(process.versions.node.split('.')[0]) < Number(baseline.split('.')[0])) {
   report('FAIL', 'Switch to the development baseline before troubleshooting native TypeScript.');
 }
-report('INFO', `${process.platform}/${process.arch}; package verification currently covers Windows.`);
+report('INFO', `${process.platform}/${process.arch}; platform validation scope is documented in CONTRIBUTING.md.`);
 const npmVersion = process.env.npm_config_user_agent?.match(/(?:^| )npm\/(\S+)/)?.[1];
 report(npmVersion ? 'INFO' : 'WARN', npmVersion ? `npm ${npmVersion}` : 'Run via npm run doctor to include the npm version.');
 for (const tool of ['git', 'rg']) {
@@ -36,8 +36,15 @@ for (const dependency of Object.keys(declared)) {
   try {
     if (declared[dependency] !== locked[dependency]) throw new Error('package.json and package-lock.json declarations differ');
     let entry;
-    try { entry = require.resolve(`${dependency}/package.json`); }
-    catch { entry = require.resolve(dependency); }
+    try {
+      entry = require.resolve(`${dependency}/package.json`);
+    } catch (error) {
+      if (error.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED' && error.code !== 'ERR_MODULE_NOT_FOUND' && error.code !== 'MODULE_NOT_FOUND') throw error;
+      const manifestFile = path.join(root, 'node_modules', dependency, 'package.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      if (manifest.name !== dependency) throw new Error('package metadata missing');
+      entry = manifestFile;
+    }
     let directory = path.dirname(entry);
     let installed;
     for (;;) {
