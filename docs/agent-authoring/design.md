@@ -1,6 +1,7 @@
 # 内置规格助手：方案与架构设计
 
-状态：实施基线；附件准备层和源码开发 reset 已实现，其余为后续设计。
+状态：实施基线；附件准备层、源码开发 reset、pi SDK 收口、供应商配置和受控发送 DTO 已实现，
+Web 对话、草稿确认及后续能力以开发计划为准。
 当前交付状态、优先级和验证入口以 [开发计划](../开发计划.md) 为准；
 现有引擎能力以 [需求与架构](../需求与架构.md) 为准。
 
@@ -113,17 +114,59 @@ Web 显示当前业务理解、纯文本对话、本地模板结构及最终确�
 
 ## 5. pi 与供应商接入
 
-下一步先核实并锁定官方包版本、许可证和 Node/分发兼容性，验证最小文本会话。
-优先评估 agent-core/pi-ai 与官方供应商运行时的组合；若锁定版本组合受限，
-使用 full-control coding-agent SDK，显式替换工具、资源、设置和会话。
+当前锁定 `pi-agent-core`/`pi-ai` 1.3.0（MIT，Node >=22.19.0），采用 Agent、显式 Models 集合
+与官方 `openai-completions` 协议适配器。离线验收使用受控 fetch，验证请求中的工具声明、
+输出上限、超时与重试配置；受控投影上下文与在线供应商仍待接入。
+接入或升级按目标版本的官方文档、随包类型和示例核对接口；只有未定义的行为才使用有界探针。
+若该组合存在已确认的能力缺口，再评估 full-control coding-agent SDK，显式替换工具、资源、设置和会话。
 ModelRuntime 属于 coding-agent 集成层，不是 agent-core 自带的配置加载器。
 不自行复制一套供应商协议、认证或 OAuth 刷新实现。
+
+适配契约：启动前取消不发请求，运行中取消桥接 `Agent.abort()` 并在结束时移除监听；
+助手答复从助手消息事件取得，工具错误读取工具结束事件顶层 `isError`。
+工具回执不充当助手答复，轮数耗尽保留最后一次助手停止原因。
+默认预算为 120 秒超时、最多 1 次重试、重试等待上限 5 秒、输出上限 8192 token、
+最多 6 个模型轮次和 24000 字符提示上限；预算在 Agent 到供应商适配器之间显式传递。
+新增契约或版本差异只保留稳定结论与对应验收入口，不记录终端试错过程。
 
 bi-lite 提供薄配置界面，复用 pi 的供应商、模型、凭据格式及兼容端点能力。
 配置位于独立用户目录，CLI/Web 共用；不放业务工作区，不自动读取 ~/.pi/agent。
 允许显式导入供应商数据，不导入 skills、MCP、扩展或 !command。
 首版验收环境变量/API key 和一个明确服务组合，OAuth 在锁定版本验证登录流程与权限后开放。
 密钥只送明确配置的服务，日志/浏览器响应不回显；不自动切换未知供应商。
+
+当前配置为独立 JSON 文件，默认位于用户配置目录的 `bilite/authoring.json`，
+可用 `BILITE_AUTHORING_CONFIG` 指定测试文件。字段为 `version`、`api`、`baseUrl`、
+`modelId`、`apiKeyEnv`；`api` 首批只接受 `openai-completions`，密钥只从指定环境变量读取，
+`apiKeyEnv` 必须以 `BILITE_AUTHORING_` 开头，默认变量为 `BILITE_AUTHORING_API_KEY`。
+配置不接受 skills、MCP、扩展、命令等额外字段，
+基址必须为 HTTPS，本机回环端点可使用 HTTP。
+
+```json
+{
+  "version": 1,
+  "api": "openai-completions",
+  "baseUrl": "https://api.deepseek.com/v1",
+  "modelId": "deepseek-chat",
+  "apiKeyEnv": "BILITE_AUTHORING_API_KEY"
+}
+```
+
+配置文件只保存端点和密钥变量名，不保存密钥；建议使用用户可读权限。
+
+`src/authoring/context.ts` 生成发送预览与实际请求输入：只复制投影中的工作表、单元格标签、
+公式存在标记和锚点，以及用户文字；不复制附件路径、文件名、文件字节或缓存值。
+发送预览尚未接入 Web 页面。
+
+源码手动烟测只发送示例结构，不读取业务文件：
+
+```bash
+npm run test:pi:live -- --preview
+BILITE_AUTHORING_API_KEY=... npm run test:pi:live -- --send
+```
+
+`--preview` 不发起网络请求；`--send` 必须显式指定。未设置
+`BILITE_AUTHORING_CONFIG` 时读取用户配置目录的 `bilite/authoring.json`。
 
 产品契约、领域指南、任务状态由 bi-lite 显式注入，不发现项目/全局 AGENTS.md、skills、扩展或 MCP。
 提示只能约束行为，真实权限由工具注册和服务层决定。
