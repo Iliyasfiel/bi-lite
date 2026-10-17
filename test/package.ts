@@ -81,6 +81,7 @@ try {
   const packed = JSON.parse(command([npm, 'pack', '--ignore-scripts', '--json', '--pack-destination', temporary], root));
   const pack = Array.isArray(packed) ? packed[0] : Object.values(packed)[0] as { filename: string; files: { path: string }[] };
   const paths = pack.files.map((file: { path: string }) => file.path);
+  assert.ok(!paths.some((file: string) => /(?:^|\/)(?:dev|development)(?:\/|\.)|\.test\.js$/.test(file)));
   assert.ok(paths.includes('dist/server.js') && paths.includes('dist/skill/install.js'));
   assert.ok(!paths.some((file: string) => /^(data|output|test|src|metrics)\//.test(file) || /\.duckdb|\.xlsx$|\.bilite\//.test(file)));
   const installation = path.join(temporary, 'installation');
@@ -106,7 +107,10 @@ try {
   const port = await unusedPort();
   await start(entry, port);
   const url = `http://127.0.0.1:${port}`;
-  assert.equal((await fetch(url)).status, 200);
+  const page = await fetch(url);
+  assert.equal(page.status, 200);
+  assert.ok(!(await page.text()).includes('devReset'));
+  assert.equal((await fetch(url + '/api/dev/reset', { method: 'POST' })).status, 404);
   assert.equal((await (await fetch(url + '/api/workspace')).json()).empty, true);
   const firstPid = child!.pid;
   at('web', '--no-open');
@@ -149,6 +153,13 @@ try {
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/service.json')), false);
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/db.lock')), false);
   assert.equal(JSON.parse(at('replay', source)).ok, true);
+
+  const resetResult = spawnSync(process.execPath, [entry, '--workspace', workspace, 'dev', 'reset', '--confirm', '业务 工作区'], {
+    cwd: caller, env: { ...env, BILITE_DEV_RESET: 'allow' }, encoding: 'utf8', timeout: 15000,
+  });
+  assert.equal(resetResult.status, 2, resetResult.stderr || resetResult.stdout);
+  assert.match(String(resetResult.stderr), /未知命令/);
+  assert.notEqual(JSON.parse(at('catalog', 'dump')).objects.length, 0);
   await start(entry, port);
   await stop(false);
   if (process.platform === 'win32') {

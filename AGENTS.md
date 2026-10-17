@@ -29,6 +29,8 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 | `src/gen/`、`src/db/`、`src/meta/` | YAML 模型生成、数据库与元数据 |
 | `src/web/`、`src/server.ts` | 本地 Web 界面与 HTTP 入口 |
 | `src/cli.ts`、`src/mcp/` | CLI 与 agent 入口 |
+| `src/authoring/` | 内置助手的本地模板检查、结构投影与附件任务；pi 尚待接入 |
+| `dev/` | 仅源码开发的维护工具，不进入正式安装包 |
 | `models/` | 表结构、维度、窗口口径、聚合与桥接声明 |
 | `metrics/`、`src/metrics/` | 指标身份、单位/分类、公式声明与主数据同步 |
 | `ingest/`、`specs/`、`templates/` | 接入规格、报表规格、空白模板 |
@@ -49,6 +51,8 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 7. 生产接入源放在稳定的 `data/` 路径；`test/fixtures/` 只用于可重建的示例。
    保存 `ingest/*.yaml` 只是保存规格，执行导入才写库。
 8. 功能或架构变化同步更新相应说明，保持简短。清理文档不代表删除运行时校验。
+9. 内置助手准备与接入按 `docs/agent-authoring/design.md` 实施，状态以开发计划为准。
+   模型上下文只取受控结构投影，不直接序列化含本地路径的附件任务；开发 reset 只在独立测试工作区验收。
 
 ## 测试纪律（第二版）
 

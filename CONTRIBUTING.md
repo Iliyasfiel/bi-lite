@@ -6,9 +6,9 @@
 ## 首次配置
 
 开发基线由 `.node-version` 固定，目前为 **Node 24.18.0**；使用随 Node 安装的 npm，
-当前实测 npm 12.0.2。已有 Node 版本管理器时让它读取该文件，不要求全员安装同一种管理器。
+已有 Node 版本管理器时让它读取该文件，不要求全员安装同一种管理器。
 包的 `engines` 仍声明 `>=22.6`，它不是已验证的开发基线；最低分发版本另行验收，不据此在旧 Node 上反复尝试。
-目前端到端实测为 Windows；macOS/Linux 可按相同流程验证，有差异须记录支持边界。
+端到端与安装包验收覆盖 Windows 和 macOS arm64；Linux 和最低 Node 分发版本尚待验收。
 
 必需工具为 Git、Node 和 npm；建议备有 `rg` 用于搜索。编辑器和 agent 宿主自选，
 不要求全局 TypeScript、Python、Docker、独立 DuckDB 服务或全局 `bilite`。
@@ -42,6 +42,7 @@ npm run doctor
 | 环境与依赖 | `npm run doctor` | 只读环境检查；原生驱动仅用内存 |
 | 接入、语义计算、模型或渲染 | `npm run e2e` | 临时副本和假数据，结束后清理 |
 | CLI、工作区、服务生命周期或发布资源 | `npm run package:check` | 临时安装真实 `.tgz`，启动回环服务后清理 |
+| 源码开发 reset | `npm run test:development` | 临时工作区，检查真实锁、链接拒绝与配置保留 |
 | 打包输出 | `npm run build` / `npm pack` | 生成 `dist/` / `.tgz`，不提交产物 |
 | 文档或简单样式 | `git diff --check` 及相关针对性检查 | 不默认跑全套验收 |
 
@@ -67,6 +68,22 @@ node bin/bilite.mjs --workspace <业务工作区> catalog dump --format prompt
 并核对命令实际指向的 checkout；链接和 PATH 是本机状态，不是协作前提。
 Web 运行时 CLI 自动转交数据库操作；MCP 目前仍须单独占库。
 不要复制另一设备的 `.bilite/`、数据库锁或 `node_modules/` 来恢复环境。
+
+### 重置独立测试工作区（仅源码开发）
+
+先停止目标工作区的 Web 服务，再使用源码命令标记、预览和确认：
+
+```bash
+node bin/bilite.mjs --workspace <测试工作区> dev enable
+node bin/bilite.mjs --workspace <测试工作区> dev reset
+node bin/bilite.mjs --workspace <测试工作区> dev reset --confirm <工作区名>
+```
+
+`enable` 只在工作区标识中写入开发标记；不带 `--confirm` 的 reset 只输出清单。
+确认后清空模型、指标、模板、规格、草稿、数据库、会话、输出与受管缓存，重建空业务目录。
+工作区标识和工作区外的供应商配置保留，不自动重装财务预设。
+源码/Git/包目录、未知文件、链接、外部数据库和活动持锁服务会被拒绝，不自动杀进程。
+该实现放在 `dev/`，测试在 `test/development.ts`，正式包不包含实现或 Web reset 入口；上线前移除源码功能。
 
 ## 配置和常见阻塞
 

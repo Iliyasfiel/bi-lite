@@ -203,7 +203,8 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 ## Agent 接入配置
 
 当前外部 agent 配置如下。后续内置规格助手、CLI 能力分层及仅开发阶段 reset 的统一方案见
-[方案与架构设计](docs/agent-authoring/design.md)，尚未实现。
+[方案与架构设计](docs/agent-authoring/design.md)。模板准备层已提供；pi、业务对话与版本确认尚未接入。
+仅源码开发的测试工作区 reset 见 [贡献指南](CONTRIBUTING.md)。
 
 ### 安装 skill（以 Codex 为例）
 

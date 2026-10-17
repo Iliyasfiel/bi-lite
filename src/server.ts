@@ -30,6 +30,7 @@ import { inferSpec, guessedAxes, type Registry } from './spec/infer.ts';
 import { diagnoseIngest, parseIngestSpec, type IngestSpec } from './ingest/types.ts';
 import { runIngest } from './ingest/run.ts';
 import { masterCatalog } from './ingest/master.ts';
+import { createTemplateTask, getAuthoringTask } from './authoring/attachment.ts';
 import { SERVICE_PROTOCOL, clearServiceState, writeServiceState } from './runtime/workspace.ts';
 import { acquireWorkspaceLock, servicePeer, workspacePath, databasePath } from './runtime/service.ts';
 import { runInvocation } from './runtime/invocation.ts';
@@ -120,6 +121,25 @@ export const routes: Record<string, Handler> = {
   'GET /api/workspace': async (_req, res) => {
     const ir = loadModels();
     json(res, 200, { workspace: WORKSPACE, modelCount: ir.tables.length, empty: ir.tables.length === 0 });
+  },
+
+  'POST /api/authoring/template': async (req, res) => {
+    const rawName = String(req.headers['x-filename'] ?? '模板.xlsx');
+    const name = safeName(decodeURIComponent(rawName));
+    if (!name) return json(res, 400, { error: '缺少文件名' });
+    const buf = await readBody(req, 32 * 1024 * 1024);
+    if (!buf.length) return json(res, 400, { error: '文件为空' });
+    const task = await createTemplateTask(name, buf, WORKSPACE);
+    if (task.status === 'template-rejected') return json(res, 403, task);
+    if (task.status === 'template-unsupported' || task.status === 'template-unclear') return json(res, 422, task);
+    json(res, 200, task);
+  },
+
+  'GET /api/authoring/task': async (req, res) => {
+    const taskId = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('id') ?? '';
+    const task = getAuthoringTask(taskId, WORKSPACE);
+    if (!task) return json(res, 404, { error: '任务不存在' });
+    json(res, 200, task);
   },
 
   'POST /api/workspace/preset': async (req, res) => {

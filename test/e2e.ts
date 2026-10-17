@@ -272,6 +272,24 @@ async function verify() {
     }
     const blankTemplate = await callTool('get_template_schema', { template: spec.template });
     assert.equal(JSON.parse(blankTemplate.text).safety.policy, 'blank-only-v1');
+    const { createTemplateTask, getAuthoringTask } = await import('../src/authoring/attachment.ts');
+    const beforeMetrics = fs.readFileSync('metrics/finance.yml', 'utf8');
+    const templateBook = await XLSX.fromFileAsync('test/fixtures/盈利指标表.xlsx');
+    templateBook.sheet(0).cell('A4').value('尚未注册的业务指标');
+    const authoring = await createTemplateTask('干净模板.xlsx', Buffer.from(await templateBook.outputAsync()));
+    assert.equal(authoring.status, 'ready');
+    assert.ok(authoring.projection?.sheets[0].cells.some((cell) => cell.text === '本年累计'));
+    assert.ok(authoring.projection?.sheets[0].cells.some((cell) => cell.text === '尚未注册的业务指标'));
+    assert.ok(!JSON.stringify(authoring.projection).includes('template.xlsx'));
+    assert.equal(fs.readFileSync('metrics/finance.yml', 'utf8'), beforeMetrics);
+    assert.equal(getAuthoringTask(authoring.id)?.template.sha256, authoring.template.sha256);
+    const brokenTask = await createTemplateTask('损坏.xlsx', Buffer.from('invalid workbook'));
+    assert.equal(brokenTask.status, 'template-unsupported');
+    assert.match(brokenTask.refusal!, /TEMPLATE_PARSE_FAILED/);
+    const dirtyTask = await createTemplateTask('含数据模板.xlsx', fs.readFileSync('test/fixtures/含数据模板.xlsx'));
+    assert.equal(dirtyTask.status, 'template-rejected');
+    assert.match(dirtyTask.refusal ?? '', /TEMPLATE_DATA_BLOCKED/);
+    assert.equal(dirtyTask.projection, null);
     const toolRender = await callTool('render_report', { specFile, output: 'output/mcp.xlsx' });
     assert.equal(toolRender.ok, true);
     assert.deepEqual(findAmountLike(JSON.parse(toolRender.text)), []);
