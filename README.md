@@ -177,7 +177,7 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `render` | 按报表规格填充模板，输出 Excel；只返回路径与状态 |
 | `query` | 按指标、口径与范围查询精确值，供人使用 |
 | `catalog dump / show` | 查看业务成员与模型结构 |
-| `agent look / template` | 查看源或模板结构，数字格只返回类型标记 |
+| `agent look / template` | 先检查空白结构样表；含数据、疑似数值或检查失败时拒绝返回内容 |
 | `agent generate / preview / diff` | 推断报表草稿、预览坐标、比较规格差异 |
 | `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
@@ -196,9 +196,14 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 
 执行导入前确认试运行中的主数据待办；示例需先运行 `npm run fixtures`。
 报表写到 `output/`。agent 使用结构与状态命令，不使用返回精确金额的 `query`。
+这些导入命令供本机用户手动执行。agent 不执行数据试运行/导入，应先检查空白样表、说明草稿语义并等待用户确认，再交接用户在 Web 手动导入真实源文件。
+不要向聊天上传含业务数据的文件；本地检查无法撤回上传造成的模型接触，也不保证覆盖图片、批注、附件等内容。
 `agent preview` 支持坐标锚点和模板中的定义名称锚点，与 MCP 复用预览逻辑。
 
 ## Agent 接入配置
+
+当前外部 agent 配置如下。后续内置规格助手、CLI 能力分层及仅开发阶段 reset 的统一方案见
+[方案与架构设计](docs/agent-authoring/design.md)，尚未实现。
 
 ### 安装 skill（以 Codex 为例）
 

@@ -19,29 +19,30 @@
 
 <main>
   <section id="workspaceSetup" class="card hidden" aria-live="polite">
-    <h2>准备工作区</h2>
-    <p>这个工作区还没有数据模型。可以添加财务基础模型，或在工作区的 models 目录中编写自己的模型。</p>
-    <p class="hint">添加基础模型只提供表结构和口径，不导入指标、源文件或示例数据。</p>
+    <h2 id="workspaceSetupTitle">准备工作区</h2>
+    <p id="workspaceSetupText">这个工作区还没有数据模型。可以添加财务基础模型，或在工作区的 models 目录中编写自己的模型。</p>
+    <p class="hint" id="workspaceSetupHint">添加基础模型只提供表结构和口径，不导入指标、源文件或示例数据。</p>
     <div class="actions">
       <button id="workspaceFinance" class="primary">添加财务基础模型</button>
+      <a id="workspaceNext" class="hidden" href="#import">前往数据导入</a>
       <span id="workspaceSetupMsg" class="hint"></span>
     </div>
   </section>
   <!-- ═══════════ 1. 数据导入 ═══════════ -->
   <section id="tab-import" class="panel active">
-    <!-- ── 主路径：接入规格（声明式）──
-         人在这里走完「上传源 → 挑/改规格 → 诊断 → 干跑 → 拍板 → 落库」。
-         这条路的校验判据落在**落库路径本身上**（diagnoseIngest / runIngest），
-         不像旧路径那样"校验只活在浏览器那个 disabled 按钮上"。 -->
     <div class="card">
       <h2>接入数据 <span class="pill" id="igStatus">未开始</span></h2>
       <p class="hint">
-        这条路是<strong>声明式</strong>的：一份「接入规格」YAML 说清这份 Excel 怎么读，
-        引擎按它把网格展开成事实行 —— 它不假设你的表长什么样（下面那条「长表」假设了）。
-        流程：<strong>上传源文件 → 挑/改规格 → 诊断 → 干跑 → 拍板 → 落库</strong>。
-        先干跑是因为它<strong>一次库都不写</strong>：形状、要新建哪些主数据、哪个名字需要你拍板，
-        都在落库之前看清。全过程在本地完成，不经过任何 AI。
+        选择源文件 → 载入或编写接入规格 → 试运行 → 确认名称与范围 → 导入。
+        试运行不写入数据库，确认导入后才保存数据。
       </p>
+      <details class="help">
+        <summary>接入规格与导入说明</summary>
+        <p>接入规格是一份 YAML 文件，说明 Excel 的工作表、读取位置、指标、期间，以及单位和符号转换规则，可复用于相同版式的源文件。</p>
+        <p>页面会检查规格；试运行进一步读取源文件，展示取数范围、候选值格和待确认的公司或指标名称。核对后再确认导入。</p>
+        <p>上传的文件用于本次试运行和导入，优先于规格中的默认源路径；规格文本保持原样。未上传时使用规格中的源路径。</p>
+        <p>保存规格仅保存读取规则，不会导入数据。文件读取、计算和导入均在本机执行。</p>
+      </details>
       <div class="dropzone" id="igDrop">
         <input type="file" id="igFile" accept=".xlsx" hidden>
         <p><button class="primary" id="igPick">选择源 Excel</button></p>
@@ -50,12 +51,7 @@
       <div class="hidden" id="igSource">
         <div class="issue ok"><span class="lv">已就位</span>
           <span>源文件：<code id="igSourcePath"></code></span></div>
-        <p class="hint">规格里的 <code>source:</code> 必须指向它。下面这个按钮替你改那一行 ——
-          改完你能在编辑器里看见，不满意可以自己再改。</p>
-        <div class="actions">
-          <button id="igPoint">把规格的 source 指向这个文件</button>
-          <span class="hint" id="igPointMsg"></span>
-        </div>
+        <p class="hint">本次试运行和导入将使用这个文件，规格中的默认源路径保持不变。</p>
       </div>
 
       <h3 class="sec">接入规格</h3>
@@ -68,18 +64,18 @@
         placeholder="id: 月度经营接入&#10;source: data/uploads/xxx.xlsx&#10;sheets: ..."></textarea>
       <div id="igLint" class="spec-lint"></div>
       <div class="actions">
-        <button class="primary" id="igDryRun" disabled>干跑（不写库）</button>
+        <button class="primary" id="igDryRun" disabled>试运行（不写库）</button>
         <button id="igSave" disabled>保存到 ingest/</button>
         <span class="hint" id="igSaveMsg"></span>
       </div>
     </div>
 
     <div class="card hidden" id="igPlanCard">
-      <h2>干跑结果 <span class="pill" id="igPlanStatus"></span></h2>
+      <h2>试运行结果 <span class="pill" id="igPlanStatus"></span></h2>
       <div id="igPlan"></div>
       <div id="igDecisions"></div>
       <div class="actions">
-        <button class="primary" id="igRun" disabled>确认无误，落库</button>
+        <button class="primary" id="igRun" disabled>确认导入</button>
         <span class="hint" id="igRunMsg"></span>
       </div>
     </div>
@@ -94,7 +90,12 @@
   <section id="tab-explore" class="panel">
     <div class="card">
       <h2>查询条件</h2>
-      <div class="filters">
+      <div id="queryState" class="notice" role="status" aria-live="polite">
+        <strong id="queryStateTitle">正在检查查询条件…</strong>
+        <p id="queryStateText" class="hint"></p>
+        <a id="queryStateLink" class="hidden" href="#import"></a>
+      </div>
+      <div class="filters" id="queryFilters">
         <label>分组维度
           <select id="qGroup" multiple size="5"></select>
         </label>
@@ -115,7 +116,8 @@
         </label>
       </div>
       <div class="actions">
-        <button class="primary" id="doQuery">查询</button>
+        <button class="primary" id="doQuery" disabled>查询</button>
+        <button id="queryRefresh">刷新查询条件</button>
         <span class="hint">金额以精确值展示（本页是人的界面，不是 AI 接口）</span>
       </div>
     </div>

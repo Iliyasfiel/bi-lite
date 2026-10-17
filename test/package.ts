@@ -11,7 +11,7 @@ import { EventEmitter } from 'node:events';
 import { openBrowser } from '../src/runtime/web.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-lite-test-'));
+const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-lite-test-')));
 const env = { ...process.env };
 delete env.BILITE_WORKSPACE;
 delete env.BILITE_DB;
@@ -70,8 +70,8 @@ async function start(entry: string, port: number) {
 async function stop(graceful: boolean) {
   if (!child || child.exitCode !== null) return;
   if (graceful) child.send!('interrupt');
-  else child.kill();
-  const timer = setTimeout(() => child?.kill(), 10000);
+  else child.kill('SIGKILL');
+  const timer = setTimeout(() => child?.kill('SIGKILL'), 10000);
   try { const code = await childExit; if (graceful) assert.equal(code, 0, logs); }
   finally { clearTimeout(timer); }
   child = undefined;
@@ -176,7 +176,7 @@ try {
   assert.ok(warning.includes(url));
   console.log('安装包验收通过：独立安装、空工作区、Web/CLI 导入出表重放、skill 保护及停机/崩溃恢复。');
 } finally {
-  if (child) { child.kill(); await childExit!.catch(() => undefined); }
-  assert.ok(path.resolve(temporary).startsWith(path.resolve(os.tmpdir()) + path.sep));
+  if (child) { child.kill('SIGKILL'); await childExit!.catch(() => undefined); }
+  assert.ok(temporary.startsWith(fs.realpathSync(os.tmpdir()) + path.sep));
   fs.rmSync(temporary, { recursive: true, force: true });
 }

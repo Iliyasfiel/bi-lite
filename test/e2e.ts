@@ -255,10 +255,23 @@ async function verify() {
 
     // 6. MCP 只给结构；HTTP 由入口决定 human；CLI 在释放库后实际渲染。
     const sourceView = await callTool('look_at_source', { source: ingest.source });
-    assert.equal(sourceView.ok, true);
-    const view = JSON.parse(sourceView.text);
-    assert.deepEqual(findAmountLike(view), []);
-    assert.match(sourceView.text, /"num": true/);
+    assert.equal(sourceView.ok, false);
+    assert.match(sourceView.text, /TEMPLATE_DATA_BLOCKED/);
+    const unsafeTemplate = await XLSX.fromFileAsync(spec.template!);
+    unsafeTemplate.addSheet('隐藏明细').hidden(true).cell('ZZ2501').value('0.75%');
+    await unsafeTemplate.toFileAsync('test/fixtures/含数据模板.xlsx');
+    for (const tool of ['get_template_schema', 'generate_spec']) {
+      const blocked = await callTool(tool, { template: 'test/fixtures/含数据模板.xlsx' });
+      assert.equal(blocked.ok, false);
+      assert.match(blocked.text, /TEMPLATE_DATA_BLOCKED/);
+      assert.ok(!blocked.text.includes('0.75') && !blocked.text.includes('隐藏明细'));
+    }
+    for (const tool of ['dry_run_ingest', 'run_ingest']) {
+      const refused = JSON.parse((await callTool(tool, { specFile: '不存在.yaml' })).text);
+      assert.equal(refused.code, 'MANUAL_WEB_IMPORT_REQUIRED');
+    }
+    const blankTemplate = await callTool('get_template_schema', { template: spec.template });
+    assert.equal(JSON.parse(blankTemplate.text).safety.policy, 'blank-only-v1');
     const toolRender = await callTool('render_report', { specFile, output: 'output/mcp.xlsx' });
     assert.equal(toolRender.ok, true);
     assert.deepEqual(findAmountLike(JSON.parse(toolRender.text)), []);
@@ -268,7 +281,7 @@ async function verify() {
     const cliIO = { out: (message: string) => { cliOutput = message; }, err: showCliError };
     assert.equal(await main(['validate', 'metrics/finance.yml'], cliIO), 0);
     assert.equal(JSON.parse(cliOutput).kind, 'metrics');
-    assert.equal(await main(['agent', 'look', ingest.source], cliIO), 0);
+    assert.equal(await main(['agent', 'look', 'test/fixtures/月度保送表.xlsx'], cliIO), 0);
     assert.equal(await main(['agent', 'template', '--template', 'test/fixtures/月度保送表.xlsx'], cliIO), 0);
     assert.equal(await main(['agent', 'preview', specFile], cliIO), 0);
     const preview = JSON.parse(cliOutput);
@@ -289,6 +302,9 @@ async function verify() {
     const server = await import('../src/server.ts');
     stop = () => server.stop();
     const port = await server.start(0);
+    const queryCatalog = await (await fetch(`http://127.0.0.1:${port}/api/catalog`)).json();
+    assert.equal(queryCatalog.query.fact, 'fact_finance');
+    assert.ok(queryCatalog.query.months.includes('2026-06'));
     // Child CLI processes must use the live owner's queue, preserving output and locks.
     const sharedCli = (args: string[]) => new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
       execFile(process.execPath, [path.join(root, 'bin/bilite.mjs'), ...args], { encoding: 'utf8', timeout: 15000 },

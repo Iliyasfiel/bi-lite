@@ -42,12 +42,12 @@ window.addEventListener('hashchange', hashTab);
 //
 // **只有一条路**：接入规格（`src/ingest/`）—— 形状写在 YAML 里，换一份表不用改代码。
 // （旧的"长表导入"页与它背后的 `src/import/longtable.ts` 已退场，见 docs/开发计划.md §1.1。）
-// 前端**不做任何判据** —— 诊断、干跑、落库都调服务端那几条路由，它们又都调
+// 前端**不做任何判据** —— 诊断、试运行、导入都调服务端那几条路由，它们又都调
 // `diagnoseIngest` / `runIngest`。页面只负责把结论摆清楚，否则判据就漂了（铁律 17）。
 
 // ───────── 接入规格（声明式）─────────
 let igSource = null;      // 刚上传的源文件 { file, name, size }
-let igPlan = null;        // 最近一次干跑结果（或落库被拦下的结果）
+let igPlan = null;        // 最近一次试运行结果（或导入被拦下的结果）
 let igDecisions = {};     // key = `${kind}|${raw}` → { kind, raw, action, targetId }
 let igSpecs = [];         // ingest/ 下已定稿的规格（带文本，供载入编辑器）
 let igLintCodes = new Set();  // lint 阶段已知的 issue code（用来挑出"读过文件才知道的提醒"）
@@ -64,7 +64,7 @@ function igStatus(text, cls) {
   el.className = `pill ${cls || ''}`;
 }
 
-/** 还有几个名字没拍板 —— 落库按钮的放行条件就是它归零 */
+/** 还有几个名字没确认 —— 导入按钮的放行条件就是它归零 */
 function igPending() {
   const need = (igPlan && igPlan.needsDecision) || [];
   return need.filter((d) => !igDecisions[igDkey(d.kind, d.raw)]).length;
@@ -107,7 +107,6 @@ async function igUploadSource(file) {
     $('igFileMsg').textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）· 已上传`;
     $('igSource').classList.remove('hidden');
     $('igSourcePath').textContent = body.file;
-    $('igPointMsg').textContent = '';
     igStatus('源文件已就位', 'ok');
   } catch (e) {
     igSource = null;
@@ -115,22 +114,6 @@ async function igUploadSource(file) {
     $('igFileMsg').textContent = `上传失败：${e.message}`;
   }
 }
-
-/**
- * 「指定给这份规格」—— 现在**只选中**，不改写 YAML。
- *
- * ★ source 是执行参数：上传回来的路径存进 `igSource`，干跑/落库的请求体里带上它。
- *   页面不再替人改规格文本 —— 改写 YAML 是"第二份真相"的老毛病：
- *   规格里写着 A、真正跑的是 B，没人看得见。规格里那行 `source:`（若有）照旧兼容读，
- *   只是变成了"默认值"，会被这里选中的文件覆盖。
- */
-$('igPoint').addEventListener('click', () => {
-  const p = igSource && igSource.file;
-  if (!p) return;
-  $('igPointMsg').innerHTML =
-    `已选中 <code>${esc(p)}</code> 作为本次执行的源文件（执行参数，规格文本没动）。` +
-    `直接点「干跑」或「落库」即可。`;
-});
 
 // —— 规格：载入已定稿的，或自己写 ——
 async function igLoadSpecs() {
@@ -151,7 +134,7 @@ $('igSpecs').addEventListener('change', () => {
   runIgLint();
 });
 
-// —— 边改边诊断：把"落库时被拒"提前成"打字时就看见哪里错" ——
+// —— 边改边诊断：把"导入时被拒"提前成"打字时就看见哪里错" ——
 let igLintTimer = null;
 function scheduleIgLint() { clearTimeout(igLintTimer); igLintTimer = setTimeout(runIgLint, 250); }
 $('igYaml').addEventListener('input', scheduleIgLint);
@@ -189,7 +172,7 @@ async function runIgLint() {
   }
   const errs = d.errors || [];
   const warns = d.warnings || [];
-  // 记住"光看规格就知道的那批 code"：干跑结果里**新出现**的提醒才是"读过文件才知道的"，
+  // 记住"光看规格就知道的那批 code"：试运行结果里**新出现**的提醒才是"读过文件才知道的"，
   // 那些必须也摆到人眼前（引擎说了、人看不见 = 等于没说）。
   igLintCodes = new Set([...errs, ...warns].map((i) => i.code));
   if (d.willBeRejected) {
@@ -201,13 +184,13 @@ async function runIgLint() {
         i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('');
     return;
   }
-  igStatus('可以干跑', 'ok');
+  igStatus('可以试运行', 'ok');
   box.innerHTML = warns.length
     ? `<div class="issue warn"><span class="lv">可跑</span>
-         <span>结构没问题，但有 ${warns.length} 条提醒（不挡干跑）。</span></div>` +
+         <span>结构没问题，但有 ${warns.length} 条提醒（不挡试运行）。</span></div>` +
       warns.map((i) => `<div class="issue warn"><span class="lv">提醒</span>
         <span><code>${esc(i.at)}</code>：${esc(i.message)}</span></div>`).join('')
-    : '<div class="issue ok"><span class="lv">通过</span><span>结构没问题，可以干跑。</span></div>';
+    : '<div class="issue ok"><span class="lv">通过</span><span>结构没问题，可以试运行。</span></div>';
 }
 
 function igResetPlan() {
@@ -219,12 +202,12 @@ function igResetPlan() {
   $('igRunMsg').textContent = '';
 }
 
-// —— 干跑：形状 + 主数据判定，一次库都不写 ——
+// —— 试运行：形状 + 主数据判定，一次库都不写 ——
 $('igDryRun').addEventListener('click', async () => {
   const btn = $('igDryRun');
   btn.disabled = true;
-  btn.textContent = '干跑中…';
-  igDecisions = {};       // 新一轮干跑 → 丢掉上一轮的决定
+  btn.textContent = '试运行中…';
+  igDecisions = {};       // 新一轮试运行 → 丢掉上一轮的决定
   try {
     const res = await api('/api/ingest/dry-run', {
       method: 'POST',
@@ -235,10 +218,10 @@ $('igDryRun').addEventListener('click', async () => {
     renderIgPlan(res);
   } catch (e) {
     $('igLint').insertAdjacentHTML('afterbegin',
-      `<div class="issue err"><span class="lv">干跑失败</span><span>${esc(e.message)}</span></div>`);
+      `<div class="issue err"><span class="lv">试运行失败</span><span>${esc(e.message)}</span></div>`);
   } finally {
     btn.disabled = false;
-    btn.textContent = '干跑（不写库）';
+    btn.textContent = '试运行（不写库）';
   }
 });
 
@@ -299,7 +282,7 @@ function renderIgPlan(res) {
   $('igPlanCard').classList.remove('hidden');
   const errs = res.errors || [];
   // ★ 只有**读过文件**才知道的提醒（lint 阶段看不见的那批）—— 必须摆出来。
-  //   例：`PERIOD_PER_ROW`（期数逐行不同，按每行各自落库）、`SOURCE_LOOKS_EMPTY`（这是一份空模板）。
+  //   例：`PERIOD_PER_ROW`（期数逐行不同，按每行各自导入）、`SOURCE_LOOKS_EMPTY`（这是一份空模板）。
   //   少了它，人看到的只是"期数 —"，而引擎其实把话说清楚了。
   const fileWarns = ((res.shape && res.shape.issues) || [])
     .filter((i) => i.level === 'warn' && !igLintCodes.has(i.code));
@@ -319,14 +302,14 @@ function renderIgPlan(res) {
         i.hint ? `<br><span class="ev">→ ${esc(i.hint)}</span>` : ''}</span></div>`).join('') + warnsHtml;
     $('igDecisions').innerHTML = '';
     $('igRun').disabled = true;
-    $('igRun').textContent = '确认无误，落库';
-    igStatus('干跑被拒', 'err');
+    $('igRun').textContent = '确认无误，导入';
+    igStatus('试运行被拒', 'err');
     return;
   }
 
   const blocks = (res.shape && res.shape.blocks) || [];
   const need = res.needsDecision || [];
-  $('igPlanStatus').textContent = need.length ? `${need.length} 个名字待你拍板` : '可以落库';
+  $('igPlanStatus').textContent = need.length ? `${need.length} 个名字待你确认` : '可以导入';
   $('igPlanStatus').className = `pill ${need.length ? 'warn' : 'ok'}`;
 
   $('igPlan').innerHTML = `
@@ -345,11 +328,11 @@ function renderIgPlan(res) {
 
   renderIgDecisions(need);
   igSyncRun();
-  igStatus(need.length ? '待拍板' : '可落库', need.length ? 'warn' : 'ok');
+  igStatus(need.length ? '待确认' : '可导入', need.length ? 'warn' : 'ok');
 }
 
 /**
- * 把「疑似同一家」的名字交给人拍板（铁律 16）。
+ * 把「疑似同一家」的名字交给人确认（铁律 16）。
  *
  * ★ 与旧路径那张卡片是同一个立场：**合并两家公司比不合并危险得多**。
  *   不合并时数字明显不对、人会来查；错合并则报表看起来完全正常，没人会来查。
@@ -393,12 +376,12 @@ function renderIgDecisions(need) {
   const refresh = () => {
     renderIgDecisions(igPlan.needsDecision);
     // ★ 卡片顶上那颗状态胶囊也要跟着改。只放行按钮而不改胶囊的话，
-    //   人会看到「1 个名字待你拍板」和已经可用的落库按钮同时出现 ——
+    //   人会看到「1 个名字待你确认」和已经可用的导入按钮同时出现 ——
     //   同一类"决定记下了、界面没同步"的 bug 本仓库栽过一次（§6.2 第 2 条）。
     const n = igPending();
     const ps = $('igPlanStatus');
     if (ps) {
-      ps.textContent = n > 0 ? `${n} 个名字待你拍板` : '可以落库';
+      ps.textContent = n > 0 ? `${n} 个名字待你确认` : '可以导入';
       ps.className = `pill ${n > 0 ? 'warn' : 'ok'}`;
     }
     igSyncRun();
@@ -419,13 +402,13 @@ function renderIgDecisions(need) {
   });
 }
 
-// —— 落库：把决定一起交上去；服务端仍会独立复核一遍 ——
+// —— 导入：把决定一起交上去；服务端仍会独立复核一遍 ——
 $('igRun').addEventListener('click', async () => {
   if (!igPlan) return;
   const btn = $('igRun');
   const label = btn.textContent;
   btn.disabled = true;
-  btn.textContent = '落库中…';
+  btn.textContent = '导入中…';
   try {
     const res = await api('/api/ingest/run', {
       method: 'POST',
@@ -433,7 +416,7 @@ $('igRun').addEventListener('click', async () => {
       body: JSON.stringify({ yaml: igYaml(), decisions: Object.values(igDecisions), source: igSource?.file }),
     });
 
-    // 服务端可能回一个「还需要人拍板」的中间态（HTTP 200，不是错误）：
+    // 服务端可能回一个「还需要人确认」的中间态（HTTP 200，不是错误）：
     // 那种情况它一行都没写。把它当待办渲染出来，而不是当成失败。
     if (!res.ok) {
       igPlan = res;
@@ -445,21 +428,21 @@ $('igRun').addEventListener('click', async () => {
     const merged = (res.merged || []).length
       ? `；自动归并 ${res.merged.length} 个写法（${res.merged.map((m) => `${esc(m.raw)}→${esc(m.target)}`).join('、')}）`
       : '';
-    $('igPlan').insertAdjacentHTML('afterbegin', `<div class="issue ok"><span class="lv">已落库</span>
+    $('igPlan').insertAdjacentHTML('afterbegin', `<div class="issue ok"><span class="lv">已导入</span>
       <span>批次 <code>${esc(res.batchId)}</code>：写入 ${res.inserted.toLocaleString()} 行；
       新建公司 ${res.createdCompanies.length} 个、指标 ${res.createdMetrics.length} 个${merged}。
       ${res.archived === false ? '<strong>⚠️ Parquet 归档失败，请查看服务端日志</strong>' : ''}</span></div>`);
-    $('igRunMsg').textContent = '已落库。上面的干跑结果保留着供对照。';
-    // 卡片顶上的胶囊也交代清楚，别让「1 个名字待你拍板」留在已经落完库的画面上
-    $('igPlanStatus').textContent = '已落库';
+    $('igRunMsg').textContent = '已导入。上面的试运行结果保留着供对照。';
+    // 卡片顶上的胶囊也交代清楚，别让「1 个名字待你确认」留在已经落完库的画面上
+    $('igPlanStatus').textContent = '已导入';
     $('igPlanStatus').className = 'pill ok';
-    igStatus('已落库', 'ok');
-    btn.textContent = '已落库';
+    igStatus('已导入', 'ok');
+    btn.textContent = '已导入';
     igPlan = null;
     igDecisions = {};
     await Promise.all([loadBatches(), loadCatalog(), igLoadSpecs()]);
   } catch (e) {
-    $('igRunMsg').textContent = `落库失败：${e.message}`;
+    $('igRunMsg').textContent = `导入失败：${e.message}`;
     btn.disabled = false;
     btn.textContent = label;
   }
@@ -511,55 +494,107 @@ async function loadBatches() {
 let CATALOG = null;
 let LAST = null;      // 上次查询结果
 let chart = null;
+let queryReady = false;
+let queryBusy = false;
+let workspaceAdded = false;
 
-async function loadCatalog() {
-  CATALOG = await api('/api/catalog');
-
-  $('qGroup').innerHTML = CATALOG.dimensions
-    .map((d) => `<option value="${d.name}">${d.label}</option>`).join('');
-
-  $('qCompany').innerHTML = CATALOG.companies
-    .map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
-
-  $('qMetric').innerHTML = CATALOG.metrics
-    .map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join('');
-
-  const periods = CATALOG.periodTypes.filter((p) => !p.derivable);
-  $('qPeriod').innerHTML = periods
-    .map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
-
-  const months = CATALOG.metrics.length && CATALOG.periodTypes.length ? await fetchMonths() : [];
-  const years = [...new Set(months.map((m) => m.slice(0, 4)))].sort();
-  $('qYear').innerHTML = `<option value="">全部</option>` +
-    years.map((y) => `<option value="${y}">${y}</option>`).join('');
-
-  $('qMonth').innerHTML = '<option value="">全部</option>' + Array.from({ length: 12 }, (_, i) => `<option value="${String(i + 1).padStart(2, '0')}">${i + 1} 月</option>`).join('');
-  const latest = [...months].sort().at(-1);
-  if (latest) { $('qYear').value = latest.slice(0, 4); $('qMonth').value = latest.slice(5); }
-  // 默认选中常用项 —— 让用户一进来就能查到东西
-  ['company'].forEach((v) => sel($('qGroup'), v));
-  sel($('qMetric'), CATALOG.metrics[0]?.name);
-  sel($('qPeriod'), periods[0]?.id);
+function queryNotice(title, text, link = '') {
+  $('queryState').classList.remove('hidden');
+  $('queryStateTitle').textContent = title;
+  $('queryStateText').textContent = text;
+  $('queryStateLink').textContent = link;
+  $('queryStateLink').classList.toggle('hidden', !link);
 }
 
-async function fetchMonths() {
+function syncQueryControls() {
+  $('queryFilters').querySelectorAll('select').forEach((el) => { el.disabled = !queryReady || queryBusy; });
+  const selected = vals($('qMetric')).length && vals($('qPeriod')).length;
+  $('doQuery').disabled = !queryReady || queryBusy || !selected;
+  $('queryRefresh').disabled = queryBusy;
+  if (queryReady) {
+    $('queryState').classList.toggle('hidden', !!selected);
+    if (!selected) queryNotice('请选择查询条件', '至少选择一个指标和一个口径后即可查询。');
+  }
+}
+
+function renderWorkspace(workspace) {
+  $('workspaceSetup').classList.toggle('hidden', !workspace.empty && !workspaceAdded);
+  $('workspaceFinance').classList.toggle('hidden', !workspace.empty);
+  $('workspaceNext').classList.toggle('hidden', workspace.empty);
+  $('workspaceSetupTitle').textContent = workspace.empty ? '准备工作区' : '基础模型已添加';
+  $('workspaceSetupText').textContent = workspace.empty
+    ? '这个工作区还没有数据模型。可以添加财务基础模型，或在工作区的 models 目录中编写自己的模型。'
+    : '接下来声明业务指标，再选择源文件和接入规格，试运行后确认导入。';
+  $('workspaceSetupHint').classList.toggle('hidden', !workspace.empty);
+}
+
+async function loadCatalog() {
+  queryReady = false;
+  queryBusy = true;
+  syncQueryControls();
+  queryNotice('正在刷新查询条件…', '检查模型、指标和已导入的数据。');
+  LAST = null;
+  $('resultCard').classList.add('hidden');
+  $('chart').classList.add('hidden');
   try {
-    const r = await api('/api/query', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        measures: [{ metric: CATALOG.metrics[0]?.name ?? '', periodType: CATALOG.periodTypes[0]?.id ?? '' }],
-        groupBy: ['month'],
-      }),
-    });
-    return r.groups ? r.groups.map((g) => g.values[0]).filter(Boolean) : [];
-  } catch (e) { console.error('查询月份目录失败', e); $('qYear').title = `月份目录未加载：${e.message}`; return []; }
+    const [workspace, catalog] = await Promise.all([api('/api/workspace'), api('/api/catalog')]);
+    CATALOG = catalog;
+    if (CATALOG.query.months.length) workspaceAdded = false;
+    renderWorkspace(workspace);
+
+    $('qGroup').innerHTML = CATALOG.dimensions
+      .map((d) => `<option value="${esc(d.name)}">${esc(d.label)}</option>`).join('');
+
+    $('qCompany').innerHTML = CATALOG.companies
+      .map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
+
+    $('qMetric').innerHTML = CATALOG.metrics
+      .map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join('');
+
+    const periods = CATALOG.periodTypes.filter((p) => !p.derivable);
+    $('qPeriod').innerHTML = periods
+      .map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
+
+    const months = CATALOG.query.months;
+    const years = [...new Set(months.map((m) => m.slice(0, 4)))].sort();
+    $('qYear').innerHTML = `<option value="">全部</option>` +
+      years.map((y) => `<option value="${y}">${y}</option>`).join('');
+
+    $('qMonth').innerHTML = '<option value="">全部</option>' + Array.from({ length: 12 }, (_, i) => `<option value="${String(i + 1).padStart(2, '0')}">${i + 1} 月</option>`).join('');
+    const latest = [...months].sort().at(-1);
+    if (latest) { $('qYear').value = latest.slice(0, 4); $('qMonth').value = latest.slice(5); }
+    // 默认选中常用项 —— 让用户一进来就能查到东西
+    ['company'].forEach((v) => sel($('qGroup'), v));
+    sel($('qMetric'), CATALOG.metrics[0]?.name);
+    sel($('qPeriod'), periods[0]?.id);
+    if (workspace.empty || !CATALOG.query.fact) {
+      queryNotice('尚未配置查询模型', '请先添加财务基础模型，或在 models/ 中配置查询所需的财务事实表。', '前往数据导入，准备模型');
+    } else if (!CATALOG.metrics.length) {
+      queryNotice('尚未配置指标', '请在工作区的 metrics/ 中声明业务指标，完成后刷新查询条件。也可通过接入流程确认并创建源文件中的指标。', '前往数据导入');
+    } else if (!months.length) {
+      queryNotice('尚未导入数据', '指标已就绪。请选择源文件和接入规格，试运行并确认导入后再查询。', '前往数据导入');
+    } else if (!periods.length) {
+      queryNotice('尚未配置查询口径', '请在模型中声明可取数的实存口径，完成后刷新查询条件。');
+    } else {
+      queryReady = true;
+    }
+  } catch (error) {
+    queryNotice('查询条件加载失败', `${error.message}。请检查服务后点击“刷新查询条件”重试。`);
+    throw error;
+  } finally {
+    queryBusy = false;
+    syncQueryControls();
+  }
 }
 
 const sel = (el, v) => { for (const o of el.options) if (o.value === v) o.selected = true; };
 const vals = (el) => [...el.selectedOptions].map((o) => o.value);
 
+$('queryFilters').addEventListener('change', syncQueryControls);
+$('queryRefresh').addEventListener('click', () => { void loadCatalog().catch(() => {}); });
+
 $('doQuery').addEventListener('click', async () => {
+  if (!queryReady || queryBusy) return;
   const measures = [];
   for (const metric of vals($('qMetric'))) for (const periodType of vals($('qPeriod'))) measures.push({ metric, periodType });
   if (!measures.length) return alert('请至少选择一个指标和一个口径');
@@ -572,7 +607,8 @@ $('doQuery').addEventListener('click', async () => {
   if ($('qMonth').value && !$('qYear').value) return alert('选择月份时请同时选择年份');
 
   const btn = $('doQuery');
-  btn.disabled = true;
+  queryBusy = true;
+  syncQueryControls();
   btn.textContent = '查询中…';
   try {
     const res = await api('/api/query', {
@@ -591,7 +627,8 @@ $('doQuery').addEventListener('click', async () => {
   } catch (e) {
     alert(`查询失败：${e.message}`);
   } finally {
-    btn.disabled = false;
+    queryBusy = false;
+    syncQueryControls();
     btn.textContent = '查询';
   }
 });
@@ -601,6 +638,10 @@ function renderResult(res, groupBy) {
   $('resultMeta').textContent =
     `${res.meta.rowCount} 行 × ${res.columns.length} 列 · ${res.meta.rowCount * res.columns.length} 格` +
     Object.entries(res.meta.appliedFilter ?? {}).map(([dim, members]) => ` · ${dimLabel(dim)}：${Array.isArray(members) ? members.join('、') : members}`).join('');
+  if (!res.groups.length) {
+    $('resultTable').innerHTML = '<p class="empty">当前查询条件下没有数据，请调整指标、公司或期间。</p>';
+    return;
+  }
 
   const head = [...groupBy.map((g) => dimLabel(g)), ...res.columns.map((c) => c.label)];
   const body = res.groups.map((g) => `<tr>
@@ -1002,8 +1043,11 @@ $('workspaceFinance').addEventListener('click', async () => {
     await api('/api/workspace/preset', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
-    $('workspaceSetupMsg').textContent = '基础模型已添加；请声明业务指标，再上传源文件并编写接入规格。';
+    workspaceAdded = true;
+    renderWorkspace({ empty: false });
+    $('workspaceSetupMsg').textContent = '';
     await loadCatalog();
+    if (igYaml().trim()) await runIgLint();
   } catch (error) {
     $('workspaceSetupMsg').textContent = error.message;
     button.disabled = false;
@@ -1012,8 +1056,6 @@ $('workspaceFinance').addEventListener('click', async () => {
 
 (async () => {
   try {
-    const workspace = await api('/api/workspace');
-    $('workspaceSetup').classList.toggle('hidden', !workspace.empty);
     await loadCatalog();
     $('conn').textContent = '本机运行';
     $('conn').className = 'pill ok';
