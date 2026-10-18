@@ -25,7 +25,7 @@ import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
 import { declaredFactsOf } from '../gen/parse.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
 import { readTemplateSchema, textAt } from '../spec/template.ts';
-import { assertBlankWorkbook } from '../spec/blank.ts';
+import { assertBlankWorkbook, BLANK_TEMPLATE_POLICY } from '../spec/blank.ts';
 import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
 import { chartShape, type ChartSpec } from '../render/chart.ts';
 import { diagnoseIngest } from '../ingest/types.ts';
@@ -125,7 +125,7 @@ export async function getTemplateSchema(args: { template?: string }) {
   const schema = await readTemplateSchema(tpl);
 
   return {
-    safety: { checked: true, policy: 'blank-only-v1' },
+    safety: { checked: true, policy: BLANK_TEMPLATE_POLICY },
     template: schema.template,
     sheets: schema.sheets,
     anchors: schema.anchors.map((a) => ({
@@ -755,7 +755,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'look_at_source',
     description:
-      '只查看通过本地全工作簿空表检查的结构样表。发现数值、含数字文本或无法确认的内容立即拒绝，不返回标签；' +
+      '只查看通过本地全工作簿空表检查的结构样表。发现实存数值、金额样式文本或无法确认的内容立即拒绝，不返回标签；' +
       '不得用于查看真实业务源文件。草稿语义须由用户确认，数据试运行和导入交给用户在 Web 手动完成。',
     inputSchema: {
       type: 'object',

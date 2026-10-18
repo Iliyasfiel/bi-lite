@@ -271,7 +271,19 @@ async function verify() {
       assert.equal(refused.code, 'MANUAL_WEB_IMPORT_REQUIRED');
     }
     const blankTemplate = await callTool('get_template_schema', { template: spec.template });
-    assert.equal(JSON.parse(blankTemplate.text).safety.policy, 'blank-only-v1');
+    assert.equal(JSON.parse(blankTemplate.text).safety.policy, 'blank-structure-v2');
+    const formulaTemplate = await XLSX.fromFileAsync('test/fixtures/盈利指标表.xlsx');
+    formulaTemplate.sheet(0).cell('B4').formula('IF(B3=0,0,B3*1)');
+    formulaTemplate.sheet(0).cell('A2').value('2026年');
+    await formulaTemplate.toFileAsync('test/fixtures/含公式模板.xlsx');
+    const formulaSchema = await callTool('get_template_schema', { template: 'test/fixtures/含公式模板.xlsx' });
+    assert.equal(formulaSchema.ok, true);
+    const numericTextTemplate = await XLSX.fromFileAsync('test/fixtures/盈利指标表.xlsx');
+    numericTextTemplate.sheet(0).cell('B4').value('57.77%');
+    await numericTextTemplate.toFileAsync('test/fixtures/含金额文本模板.xlsx');
+    const numericTextBlocked = await callTool('get_template_schema', { template: 'test/fixtures/含金额文本模板.xlsx' });
+    assert.equal(numericTextBlocked.ok, false);
+    assert.match(numericTextBlocked.text, /TEMPLATE_DATA_BLOCKED/);
     const { createTemplateTask, getAuthoringTask } = await import('../src/authoring/attachment.ts');
     const beforeMetrics = fs.readFileSync('metrics/finance.yml', 'utf8');
     const templateBook = await XLSX.fromFileAsync('test/fixtures/盈利指标表.xlsx');

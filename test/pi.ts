@@ -199,7 +199,7 @@ assert.equal((await checkAuthoringRuntime({})).authStatus, 'missing');
 
 {
   const projection = {
-    policy: 'blank-only-projection-v1',
+    policy: 'blank-structure-projection-v2',
     sheets: [{
       id: 'sheet-1',
       label: '报表',
@@ -229,7 +229,7 @@ assert.equal((await checkAuthoringRuntime({})).authStatus, 'missing');
       checkedAt: new Date(0).toISOString(),
     },
     projection,
-    policy: 'blank-only-projection-v1',
+    policy: 'blank-structure-projection-v2',
     createdAt: new Date(0).toISOString(),
     revision: 1,
   };
