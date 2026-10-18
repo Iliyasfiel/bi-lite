@@ -82,7 +82,7 @@ try {
   const pack = Array.isArray(packed) ? packed[0] : Object.values(packed)[0] as { filename: string; files: { path: string }[] };
   const paths = pack.files.map((file: { path: string }) => file.path);
   assert.ok(!paths.some((file: string) => /(?:^|\/)(?:dev|development)(?:\/|\.)|\.test\.js$/.test(file)));
-  assert.ok(paths.includes('dist/server.js') && paths.includes('dist/skill/install.js'));
+  assert.ok(paths.includes('dist/server.js') && paths.includes('dist/skill/install.js') && paths.includes('dist/runtime/reset.js'));
   assert.ok(!paths.some((file: string) => /^(data|output|test|src|metrics)\//.test(file) || /\.duckdb|\.xlsx$|\.bilite\//.test(file)));
   const installation = path.join(temporary, 'installation');
   const npmConfig = path.join(temporary, 'npmrc');
@@ -125,13 +125,22 @@ try {
   const page = await fetch(url);
   assert.equal(page.status, 200);
   assert.ok(!(await page.text()).includes('devReset'));
-  assert.equal((await fetch(url + '/api/dev/reset', { method: 'POST' })).status, 404);
+  assert.equal((await fetch(url + '/api/workspace/reset', { method: 'POST' })).status, 404);
   assert.equal((await (await fetch(url + '/api/workspace')).json()).empty, true);
   const firstPid = child!.pid;
   at('web', '--no-open');
   assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.bilite/service.json'), 'utf8')).pid, firstPid);
   const other = path.join(temporary, 'other');
   cli(['init', other]);
+  fs.writeFileSync(path.join(other, 'models/test.yml'), 'fake model');
+  const otherEnable = JSON.parse(cli(['--workspace', other, 'reset', 'enable']));
+  assert.equal(otherEnable.development, true);
+  const otherPlan = JSON.parse(cli(['--workspace', other, 'reset']));
+  assert.ok(otherPlan.removed.includes('models'));
+  const otherReset = JSON.parse(cli(['--workspace', other, 'reset', '--confirm', 'other']));
+  assert.ok(otherReset.reinitialized.includes('data'));
+  assert.deepEqual(fs.readdirSync(path.join(other, 'models')), []);
+  assert.ok(fs.existsSync(path.join(configHome, 'bilite/authoring.json')));
   cli(['--workspace', other, 'web', '--port', String(port), '--no-open'], caller, {}, 1);
   assert.equal(fs.existsSync(path.join(other, '.bilite/db.lock')), false);
   assert.equal((await fetch(url + '/api/workspace/preset', {
@@ -169,11 +178,6 @@ try {
   assert.equal(fs.existsSync(path.join(workspace, '.bilite/db.lock')), false);
   assert.equal(JSON.parse(at('replay', source)).ok, true);
 
-  const resetResult = spawnSync(process.execPath, [entry, '--workspace', workspace, 'dev', 'reset', '--confirm', '业务 工作区'], {
-    cwd: caller, env: { ...env, BILITE_DEV_RESET: 'allow' }, encoding: 'utf8', timeout: 15000,
-  });
-  assert.equal(resetResult.status, 2, resetResult.stderr || resetResult.stdout);
-  assert.match(String(resetResult.stderr), /未知命令/);
   assert.notEqual(JSON.parse(at('catalog', 'dump')).objects.length, 0);
   await start(entry, port);
   await stop(false);
@@ -200,7 +204,7 @@ try {
   assert.equal(warning, '');
   await openBrowser(url, { out() {}, err: (text) => { warning += text; } }, launcher(1));
   assert.ok(warning.includes(url));
-  console.log('安装包验收通过：独立安装、空工作区、Web/CLI 导入出表重放、skill 保护及停机/崩溃恢复。');
+  console.log('安装包验收通过：独立安装、空工作区、Web/CLI 导入出表重放、测试区 reset、skill 保护及停机/崩溃恢复。');
 } finally {
   if (child) { child.kill('SIGKILL'); await childExit!.catch(() => undefined); }
   assert.ok(temporary.startsWith(fs.realpathSync(os.tmpdir()) + path.sep));

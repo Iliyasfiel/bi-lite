@@ -26,10 +26,6 @@ try {
     if (args.slice(1).some((arg) => ['--help', '-h'].includes(arg))) {
       console.log('用法：bilite init [目录] [--preset finance]\n默认建立空工作区；finance 添加财务模型，已有文件不覆盖。');
     } else console.log(JSON.stringify(initializeWorkspace(args.slice(1), workspace, root), null, 2));
-  } else if (engine === 'src' && args[0] === 'dev') {
-    const { runDevelopmentCommand } = await import(new URL('../dev/reset.ts', import.meta.url).href);
-    const target = workspace === undefined ? locateWorkspace(undefined) : path.resolve(workspace);
-    code = await runDevelopmentCommand(args, target);
   } else {
     const help = args.length === 0 || ['help', '--help', '-h', '--version', '-v', 'version'].includes(args[0]) || args.includes('--help') || args.includes('-h');
     const userSkill = args[0] === 'skill' && args[1] === 'install'
