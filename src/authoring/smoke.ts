@@ -19,7 +19,7 @@ export function authoringSmokeTask(): AuthoringTask {
       checkedAt: at,
     },
     projection: {
-      policy: 'blank-only-projection-v1',
+      policy: 'blank-structure-projection-v2',
       sheets: [{
         id: 'sheet-1',
         label: '示例报表',
@@ -34,7 +34,7 @@ export function authoringSmokeTask(): AuthoringTask {
       anchors: [],
       omittedHiddenSheets: 0,
     },
-    policy: 'blank-only-projection-v1',
+    policy: 'blank-structure-projection-v2',
     createdAt: at,
     revision: 1,
   };

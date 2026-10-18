@@ -177,7 +177,7 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `render` | 按报表规格填充模板，输出 Excel；只返回路径与状态 |
 | `query` | 按指标、口径与范围查询精确值，供人使用 |
 | `catalog dump / show` | 查看业务成员与模型结构 |
-| `agent look / template` | 先检查空白结构样表；含数据、疑似数值或检查失败时拒绝返回内容 |
+| `agent look / template` | 先检查空白结构样表；含实存数值、金额样式文本或检查失败时拒绝返回内容 |
 | `agent generate / preview / diff` | 推断报表草稿、预览坐标、比较规格差异 |
 | `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |

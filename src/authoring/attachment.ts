@@ -5,7 +5,7 @@ import { readCheckedTemplate, TemplateCheckError } from '../spec/blank.ts';
 import { templateSchemaOf } from '../spec/template.ts';
 import { toRef } from '../render/excel.ts';
 
-export const PROJECTION_POLICY = 'blank-only-projection-v1';
+export const PROJECTION_POLICY = 'blank-structure-projection-v2';
 
 /** Model-visible layout; paths, raw formulas and parser errors have no fields here. */
 export interface TemplateProjection {
