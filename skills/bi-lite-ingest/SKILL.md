@@ -43,7 +43,7 @@ agent 只协助编写和解释规格。真实源文件留在本机，用户在 W
 | 校验/预览 | `bilite validate <规格.yaml>`、`bilite agent preview <规格.yaml>` |
 | 接入规格静态检查 | `bilite ingest lint drafts/<规格.yaml>` |
 | 数据试运行/导入 | agent 不执行；交给用户在 Web 手动完成 |
-| 填表 | 仅用户已确认报表规格且另行明确要求导出时，才使用 `render_report` / `bilite render` |
+| 填表 | 仅用户已确认导出规格且另行明确要求导出时，才使用 `render_report` / `bilite render` |
 
 所有相对路径属于所选 BI 工作区，不属于引擎安装目录或当前聊天目录。CLI 的 agent 命令、接入结果和填表结果只返回结构、计数、路径与状态；不要改用返回精确值的查询入口。
 `bilite skill install` 将手册副本装入工作区 `.agents/skills/bi-lite-ingest`；`--scope user` 装入用户的 `CODEX_HOME/skills`。
@@ -87,13 +87,13 @@ sheets:
 ## 报表流程与字段
 
 空表检查 → `get_catalog` / `get_template_schema` → `generate_spec` 或写草稿 → `lint_spec` → 解释全部语义 → 等待用户确认。
-确认后才可保存/注册报表规格，必要时用 `preview_spec` 核对坐标；不因此自动渲染或导入。
+确认后才可保存/注册导出规格，必要时用 `preview_spec` 核对坐标；不因此自动渲染或导入。
 
 ## Web 交接
 
 告知用户工作区绝对路径和已确认的规格文件名，建议自行运行 `bilite --workspace <目录> web`。
 在“数据导入”页由用户选择本机源 Excel、载入接入规格、点击“试运行”、核对单位/期间/范围和主数据候选，再亲自点击“确认导入”。
-如果只有报表规格而无接入规格，明确缺少接入规则，不把报表规格当接入规格，不自动创建或导入指标/事实。
+如果只有导出规格而无接入规格，明确缺少接入规则，不把导出规格当接入规格，不自动创建或导入指标/事实。
 不要要求用户把源数据发回聊天来排错；可请求不含金额的错误代码、坐标或结构说明。
 
 报表声明 `id`、`template`、`fact`（可省略，默认财务表）、`params` 与 `sheets[].blocks[]`。

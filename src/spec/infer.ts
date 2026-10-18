@@ -258,7 +258,7 @@ function inferSheet(
         sheet: sheetName,
         row: r.row,
         label: r.label,
-        reason: `该行数据格是公式（${r.formulas[0]}），保留模板原样、不写入，避免覆盖模板的合计逻辑`,
+        reason: '该行数据格含公式，保留模板原样、不写入，避免覆盖模板的计算逻辑',
       });
     } else if (r.label !== null) {
       dataRows.push(r);
@@ -532,6 +532,12 @@ export interface InferOptions {
   title?: string;
 }
 
+export class TemplateRegionNotFoundError extends Error {
+  constructor() {
+    super('TEMPLATE_REGION_NOT_FOUND: 现有推断器无法将模板绑定为报表区块，需要补充模型声明或人工指定布局。');
+  }
+}
+
 /**
  * 从模板推断 spec 草稿。
  *
@@ -566,7 +572,7 @@ export async function inferSpec(opts: InferOptions): Promise<InferResult> {
   }
 
   if (sheetSpecs.length === 0) {
-    throw new Error(`未能从模板 ${template} 中识别出任何数据区（没有找到含已注册口径/指标/公司的表头）`);
+    throw new TemplateRegionNotFoundError();
   }
 
   // ★ 期数优先取自模板（取第一个读到的）；读不到才回落默认值。

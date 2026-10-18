@@ -22,6 +22,7 @@
  *   `diagnoseModels()` 列清单；`loadModels()` 是确定性路径，有问题就抛。
  */
 import fs from 'node:fs';
+import { withPublishedFiles } from '../runtime/publication.ts';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import {
@@ -584,8 +585,10 @@ export function listModelFiles(dir = MODELS_DIR): string[] {
  * 一次给全所有问题（本文件的 + 跨表的），有问题就抛 —— 这份 IR 是 plan / apply 的唯一输入。
  */
 export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIssue[] } {
+  return withPublishedFiles(path.dirname(path.resolve(dir)), () => diagnoseModelsUnchecked(dir));
+}
+function diagnoseModelsUnchecked(dir: string): { ir: Ir | null; issues: GenIssue[] } {
   const files = listModelFiles(dir);
-  const issues: GenIssue[] = [];
   if (files.length === 0) {
     if (path.resolve(dir) === path.resolve(MODELS_DIR) && fs.existsSync('bilite.config.json')) {
       const config = JSON.parse(fs.readFileSync('bilite.config.json', 'utf8'));
@@ -593,11 +596,39 @@ export function diagnoseModels(dir = MODELS_DIR): { ir: Ir | null; issues: GenIs
         return { ir: { apiVersion: MODEL_API_VERSION, tables: [] }, issues: [] };
       }
     }
-    return { ir: null, issues: [issue('error', 'MODEL_DIR_EMPTY', dir, `没有找到任何声明文件（${dir}/*.yml）`)] };
+    return {
+      ir: null,
+      issues: [issue('error', 'MODEL_DIR_EMPTY', dir, `没有找到任何声明文件（${dir}/*.yml）`)],
+    };
+  }
+  return diagnoseModelSources(
+    files.map((file) => ({ name: path.basename(file), text: fs.readFileSync(file, 'utf8'), label: file })),
+    { emptyAsValidIr: false },
+  );
+}
+
+/**
+ * Validate model declarations already held in memory.
+ *
+ * Authoring candidates use this path so they never write a draft into models/.
+ */
+export function diagnoseModelSources(
+  sources: Array<{ name: string; text: string; label?: string }>,
+  options: { emptyAsValidIr?: boolean } = {},
+): { ir: Ir | null; issues: GenIssue[] } {
+  const issues: GenIssue[] = [];
+  if (sources.length === 0) {
+    if (options.emptyAsValidIr) return { ir: { apiVersion: MODEL_API_VERSION, tables: [] }, issues: [] };
+    return { ir: null, issues: [issue('error', 'MODEL_DIR_EMPTY', 'models', '没有找到任何声明文件（models/*.yml）')] };
   }
   const tables: IrTable[] = [];
-  for (const f of files) {
-    const d = diagnoseModel(fs.readFileSync(f, 'utf8'), f);
+  for (const source of sources) {
+    if (!/^[a-z_][a-z0-9_]*\.ya?ml$/i.test(source.name)) {
+      issues.push(issue('error', 'MODEL_NAME_BAD', source.name, `表名不合法：${source.name}`));
+      continue;
+    }
+    const file = source.label ?? `models/${source.name}`;
+    const d = diagnoseModel(source.text, file);
     issues.push(...d.issues.filter((i) => i.level === 'error'));
     if (d.table) tables.push(d.table);
   }

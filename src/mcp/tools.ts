@@ -25,8 +25,9 @@ import { compileBlock, runCompiled, planOf } from '../spec/compile.ts';
 import { declaredFactsOf } from '../gen/parse.ts';
 import { renderTemplate, parseRef as excelParseRef, toRef as excelToRef, type RenderBlock } from '../render/excel.ts';
 import { readTemplateSchema, textAt } from '../spec/template.ts';
-import { assertBlankWorkbook, BLANK_TEMPLATE_POLICY } from '../spec/blank.ts';
-import { inferSpec, guessedAxes, type Registry } from '../spec/infer.ts';
+import { assertBlankWorkbook, readCheckedTemplate, BLANK_TEMPLATE_POLICY } from '../spec/blank.ts';
+import { projectCheckedTemplate } from '../authoring/attachment.ts';
+import { inferSpec, guessedAxes, TemplateRegionNotFoundError, type Registry } from '../spec/infer.ts';
 import { chartShape, type ChartSpec } from '../render/chart.ts';
 import { diagnoseIngest } from '../ingest/types.ts';
 import { resolveSource } from '../ingest/dryrun.ts';
@@ -429,20 +430,55 @@ export async function generateSpec(args: { template?: string; sheets?: string[];
     axisNames: cat.dimensions.map((d) => d.label),
   };
 
-  const r = await inferSpec({ template: tpl, registry, sheets: args.sheets, id: args.id, title: args.title });
+  let r;
+  try {
+    r = await inferSpec({ template: tpl, registry, sheets: args.sheets, id: args.id, title: args.title });
+  } catch (error) {
+    if (!(error instanceof TemplateRegionNotFoundError)) throw error;
+    // Unknown business names must not prevent reading a checked layout.
+    const workbook = await readCheckedTemplate(fs.readFileSync(tpl));
+    if (args.sheets?.some((name) => !workbook.sheet(name))) throw new Error('指定的工作表不存在');
+    const projection = projectCheckedTemplate(workbook);
+    if (args.sheets) {
+      const selected = new Set(workbook.sheets().flatMap((sheet, i) => args.sheets!.includes(sheet.name()) ? [`sheet-${i + 1}`] : []));
+      projection.sheets = projection.sheets.filter((sheet) => selected.has(sheet.id));
+      projection.anchors = projection.anchors.filter((anchor) => selected.has(anchor.sheetId));
+    }
+    return {
+      safety: { checked: true, policy: BLANK_TEMPLATE_POLICY },
+      template: tpl,
+      specId: args.id ?? null,
+      title: args.title ?? null,
+      status: 'needs-modeling',
+      yaml: null,
+      draftValid: false,
+      draftError: error.message,
+      requiresConfirmation: true,
+      blocks: [],
+      guessed: [],
+      unmatched: [],
+      projection,
+      issues: [{ level: 'error', code: 'TEMPLATE_REGION_NOT_FOUND', message: error.message }],
+      nextSteps: [
+        '核对结构投影中的工作表、主体列、指标列、口径列和公式位置。',
+        '确认主体范围、指标单位、报告期间及场景/币种，并声明所需业务模型。',
+        '复合行键或公式列布局需人工编写规格；当前推断器不能自动生成这类报表。',
+      ],
+      note: '已读取空白模板结构，尚未生成可执行 YAML。没有添加模型、指标或导入数据，也没有调用模型服务。',
+    };
+  }
 
   // ★ 草稿可能**保存不了** —— 这是特性不是故障。
   //   模板里若没有指标信息（如只有「公司 × 本年累计」的分板块表），
   //   推断器宁可让 parseSpec 拒绝，也不产出一份语法合法、数字却错了的 spec。
   //   这里显式回报"能不能直接用"，让人（和 agent）一眼看到该不该先补东西。
-  let draftValid = true;
-  let draftError: string | null = null;
+  let draftError: string | null = r.issues.find((issue) => issue.level === 'error')?.message ?? null;
   try {
     parseSpec(r.yaml, { facts: declaredFactsOf() });
   } catch (e) {
-    draftValid = false;
     draftError = (e as Error).message;
   }
+  const draftValid = draftError === null;
 
   return {
     template: tpl,

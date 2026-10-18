@@ -604,6 +604,8 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   const handler = routes[key];
   if (handler) {
     return runtime.enqueue(async () => {
+      const { assertPublicationReadable } = await import('./runtime/publication.ts');
+      assertPublicationReadable(WORKSPACE);
       await db.refresh();
       await handler(req, res);
     });

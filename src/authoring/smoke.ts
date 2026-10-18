@@ -34,6 +34,8 @@ export function authoringSmokeTask(): AuthoringTask {
       anchors: [],
       omittedHiddenSheets: 0,
     },
+    formulaCells: [],
+    hiddenSheets: [],
     policy: 'blank-structure-projection-v2',
     createdAt: at,
     revision: 1,

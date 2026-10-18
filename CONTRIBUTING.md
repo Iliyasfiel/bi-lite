@@ -43,6 +43,7 @@ npm run doctor
 |---|---|---|
 | 环境与依赖 | `npm run doctor` | 只读环境检查；原生驱动仅用内存 |
 | pi 会话适配与配置 | `npm run test:pi` | 官方协议受控传输、预算、取消、工具、配置与发送 DTO；不调用真实模型 |
+| 共享规格任务与候选 | `npm run test:authoring` | 任务租约、修订、连续会话、两类候选与无数据库边界；不调用真实模型 |
 | 接入、语义计算、模型或渲染 | `npm run e2e` | 临时副本和假数据，结束后清理 |
 | CLI、工作区、服务生命周期或发布资源 | `npm run package:check` | 临时安装真实 `.tgz`，启动回环服务后清理 |
 | 源码开发 reset | `npm run test:development` | 临时工作区，检查真实锁、链接拒绝与配置保留 |

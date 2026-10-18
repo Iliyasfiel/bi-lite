@@ -25,7 +25,7 @@ let child: ReturnType<typeof spawn> | undefined;
 let childExit: Promise<number | null>;
 let logs = '';
 
-function command(args: string[], cwd = caller, extraEnv = {}, expected = 0, input?: string) {
+function command(args: string[], cwd = caller, extraEnv = {}, expected = 0, input?: string | Buffer) {
   const result = spawnSync(process.execPath, args, {
     cwd, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 60000, input,
     maxBuffer: 2 * 1024 * 1024, windowsHide: true,
@@ -113,6 +113,20 @@ try {
   const authoringPreview = JSON.parse(cli(['authoring', 'test'], caller, { XDG_CONFIG_HOME: configHome }));
   assert.equal(authoringPreview.sent, false);
   assert.equal(authoringPreview.modelId, 'deepseek-flash');
+  cli(['init', caller]);
+  const authoringCaller = path.join(temporary, 'authoring-caller');
+  fs.mkdirSync(authoringCaller);
+  const authoringTask = JSON.parse(command(
+    [entry, '--workspace', caller, 'authoring', 'create', '--inspect', '-'],
+    authoringCaller,
+    { XDG_CONFIG_HOME: configHome },
+    0,
+    fs.readFileSync(path.join(root, 'test/fixtures/盈利指标表.xlsx')),
+  ));
+  assert.equal(authoringTask.accepted, true);
+  assert.equal(authoringTask.task.task.status, 'awaiting-direction');
+  assert.equal(JSON.stringify(authoringTask).includes(path.join(caller, 'data/bi.duckdb')), false);
+  assert.equal(fs.existsSync(path.join(caller, '.bilite/authoring', authoringTask.task.task.id)), true);
   cli(['init', workspace]);
   const at = (...args: string[]) => cli(['--workspace', workspace, ...args]);
   const empty = JSON.parse(at('catalog', 'dump'));

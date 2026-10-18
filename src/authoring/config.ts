@@ -12,7 +12,7 @@ export const DEFAULT_AUTHORING_MODEL_ID = 'deepseek-flash';
 const MAX_CONFIG_BYTES = 16 * 1024;
 const MAX_AUTH_BYTES = 16 * 1024;
 const MAX_API_KEY_LENGTH = 8 * 1024;
-const CONFIG_KEYS = new Set(['version', 'api', 'baseUrl', 'modelId', 'apiKeyEnv']);
+const CONFIG_KEYS = new Set(['version', 'api', 'baseUrl', 'modelId', 'apiKeyEnv', 'maxPromptChars']);
 const AUTH_KEYS = new Set(['version', 'provider', 'credential']);
 const CREDENTIAL_KEYS = new Set(['type', 'key']);
 
@@ -22,6 +22,7 @@ export interface AuthoringConfig {
   baseUrl: string;
   modelId: string;
   apiKeyEnv: string;
+  maxPromptChars?: number;
 }
 
 export class AuthoringConfigError extends Error {
@@ -146,6 +147,9 @@ function validateAuthoringConfig(raw: unknown): AuthoringConfig {
     throw new AuthoringConfigError('AUTHORING_CONFIG_INVALID', 'baseUrl 不能包含凭据、查询参数或片段');
   }
   const apiKeyEnv = record.apiKeyEnv ?? DEFAULT_AUTHORING_API_KEY_ENV;
+  if (record.maxPromptChars !== undefined && (!Number.isSafeInteger(record.maxPromptChars) || (record.maxPromptChars as number) < 1)) {
+    throw new AuthoringConfigError('AUTHORING_CONFIG_INVALID', 'maxPromptChars 必须是正安全整数（本地字符预算，非模型 token 数）');
+  }
   if (typeof apiKeyEnv !== 'string' || !/^BILITE_AUTHORING_[A-Z0-9_]+$/.test(apiKeyEnv)) {
     throw new AuthoringConfigError('AUTHORING_CONFIG_INVALID', 'apiKeyEnv 必须使用 BILITE_AUTHORING_ 前缀');
   }
@@ -155,6 +159,7 @@ function validateAuthoringConfig(raw: unknown): AuthoringConfig {
     baseUrl: baseUrl.toString().replace(/\/$/, ''),
     modelId: record.modelId.trim(),
     apiKeyEnv,
+    ...(record.maxPromptChars === undefined ? {} : { maxPromptChars: record.maxPromptChars as number }),
   };
 }
 
@@ -307,5 +312,6 @@ export function runtimeFromAuthoringConfig(
     apiKey: resolved.key,
     baseUrl: config.baseUrl,
     modelId: config.modelId,
+    maxPromptChars: config.maxPromptChars,
   };
 }

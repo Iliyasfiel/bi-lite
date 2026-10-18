@@ -127,7 +127,7 @@ export async function renderTemplate(
     // 列标签（默认不写 —— 模板一般已预置）
     if (block.writeColLabels && block.colLabels) {
       block.colLabels.forEach((label, i) => {
-        sheet.cell(start.row - 1, start.col + i).value(label);
+        sheet.cell(start.row - 1, start.col + i).value(quoteFormulas(label));
         cellsWritten++;
       });
     }
@@ -135,7 +135,7 @@ export async function renderTemplate(
     // 数据格
     block.rows.forEach((row, ri) => {
       if (block.writeRowLabels) {
-        sheet.cell(start.row + ri, start.col - 1).value(row.label);
+        sheet.cell(start.row + ri, start.col - 1).value(quoteFormulas(row.label));
         cellsWritten++;
       }
       row.values.forEach((v, ci) => {
