@@ -182,6 +182,7 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
 | `skill install` | 可选安装项目/用户级手册副本；`--force` 显式更新 |
+| `reset` | 预览或清理标记过的独立测试工作区；保留工作区外供应商配置 |
 
 开发验收入口与范围见贡献指南；`npm run e2e` 验证主链路，`npm run package:check` 验证真实安装包。
 
@@ -200,12 +201,27 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 不要向聊天上传含业务数据的文件；本地检查无法撤回上传造成的模型接触，也不保证覆盖图片、批注、附件等内容。
 `agent preview` 支持坐标锚点和模板中的定义名称锚点，与 MCP 复用预览逻辑。
 
+### 重置测试工作区
+
+先停止目标工作区的 Web 服务，再标记、预览并确认清理：
+
+```bash
+bilite --workspace ./test-area reset enable
+bilite --workspace ./test-area reset
+bilite --workspace ./test-area reset --confirm test-area
+```
+
+reset 只作用于显式标记的独立测试工作区。预览不删除文件；确认值必须等于工作区目录名。
+它会清理模型、指标、规格、模板、草稿、数据库、会话、输出与受管缓存，
+保留 `bilite.config.json`、运行时所有者状态以及用户配置目录中的供应商配置和 API key。
+活动 Web 服务、未知文件、链接和外部数据库路径会阻止清理。Web 页面不提供 reset 入口。
+
 ## Agent 接入配置
 
-当前外部 agent 配置如下。后续内置规格助手、CLI 能力分层及仅开发阶段 reset 的统一方案见
+当前外部 agent 配置如下。后续内置规格助手、CLI 能力分层及测试区 reset 的统一方案见
 [方案与架构设计](docs/agent-authoring/design.md)。模板准备层、pi 最小会话、供应商配置和受控
 发送 DTO 已提供；Web 业务对话与版本确认尚未接入。
-仅源码开发的测试工作区 reset 见 [贡献指南](CONTRIBUTING.md)。
+测试区 reset 见 [贡献指南](CONTRIBUTING.md)。
 
 ### 配置内置助手供应商
 
