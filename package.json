@@ -29,7 +29,7 @@
     "sync-assets": "node scripts/sync-package-assets.mjs",
     "prepack": "npm run build",
     "package:check": "npm run build && node test/package.ts",
-    "test:development": "node test/development.ts"
+    "test:reset": "node test/reset.ts"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.5-r.5",

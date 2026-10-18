@@ -188,6 +188,7 @@ CLI 适合人工操作、脚本和本地 agent；结果通常以 JSON 写到 std
 | `plan / apply / rebuild` | 查看与应用模型变化，重建派生数据 |
 | `replay / compact / skill export` | 重放对拍、整理归档、导出操作元数据 |
 | `skill install` | 可选安装项目/用户级手册副本；`--force` 显式更新 |
+| `reset` | 预览或清理标记过的独立测试工作区；保留工作区外供应商配置 |
 
 开发验收入口与范围见贡献指南；`npm run e2e` 验证主链路，`npm run package:check` 验证真实安装包。
 
@@ -210,12 +211,27 @@ node src/cli.ts render specs/月度保送表.yaml --out 月度报送.xlsx
 `status: needs-modeling`、结构投影和待补事项，`yaml: null`、`draftValid: false`；
 这表示结构已读取、规格尚未生成，不会自动添加模型或样例数据。该命令不调用 DeepSeek。
 
+### 重置测试工作区
+
+先停止目标工作区的 Web 服务，再标记、预览并确认清理：
+
+```bash
+bilite --workspace ./test-area reset enable
+bilite --workspace ./test-area reset
+bilite --workspace ./test-area reset --confirm test-area
+```
+
+reset 只作用于显式标记的独立测试工作区。预览不删除文件；确认值必须等于工作区目录名。
+它会清理模型、指标、规格、模板、草稿、数据库、会话、输出与受管缓存，
+保留 `bilite.config.json`、运行时所有者状态以及用户配置目录中的供应商配置和 API key。
+活动 Web 服务、未知文件、链接和外部数据库路径会阻止清理。Web 页面不提供 reset 入口。
+
 ## Agent 接入配置
 
 内置助手和外部 agent 的配置与支持边界如下。[需求与架构](docs/需求与架构.md) 统一规格制定、数据边界和 CLI/Web 分工，
 [开发计划](docs/开发计划.md) 说明当前缺口与交付顺序。先完成 CLI 单入口的安全检查、方向选择、对话和确认生成，
 再接 Web 的同一流程；下列供应商命令仅用于配置和连通测试。
-仅源码开发的测试工作区 reset 见 [贡献指南](CONTRIBUTING.md)。
+测试工作区 reset 见 [贡献指南](CONTRIBUTING.md)。
 
 ### 配置内置助手供应商
 

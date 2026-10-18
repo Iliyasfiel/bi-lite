@@ -4,7 +4,7 @@
  *
  * 定位：三个入口（CLI / MCP / Web）里的第三个 —— 给**人与脚本**。
  * 命令面已走完：引擎侧（ingest / render / query）、生成器侧（`plan` / `apply`）、
- * 物料侧（`catalog` / `validate` / `skill export`）与运维（`compact`）。
+ * 物料侧（`catalog` / `validate` / `skill export`）与运维（`compact` / `reset`）。
  *
  * 四条纪律（都有出处，改之前先读）：
  *
@@ -158,6 +158,8 @@ export type Invocation =
       retainOnCancel: boolean;
     }
   | { kind: 'authoring-test'; send: boolean }
+  | { kind: 'reset-enable' }
+  | { kind: 'reset'; confirm: string | null }
   | { kind: 'usage-error'; message: string; hint: string | null };
 
 const HELP_FLAGS = new Set(['-h', '--help']);
@@ -255,6 +257,7 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (first === 'replay') return parseReplayArgs(tokens.slice(1));
   if (first === 'skill') return parseSkillArgs(tokens.slice(1));
   if (first === 'authoring') return parseAuthoringArgs(tokens.slice(1));
+  if (first === 'reset') return parseResetArgs(tokens.slice(1));
   return usage(`未知命令：${first}`);
 }
 
@@ -694,6 +697,26 @@ function parseAuthoringArgs(tokens: readonly string[]): Invocation {
   };
 }
 
+function parseResetArgs(tokens: readonly string[]): Invocation {
+  const hint = 'bilite reset --help';
+  const sub = tokens[0];
+  if (sub === undefined) return { kind: 'reset', confirm: null };
+  if (HELP_FLAGS.has(sub)) return { kind: 'help', command: 'reset' };
+  if (sub === 'enable') {
+    if (tokens.length === 1) return { kind: 'reset-enable' };
+    if (tokens.slice(1).some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'reset enable' };
+    return usage(`enable 不接受参数（收到 ${tokens[1]}）`, hint);
+  }
+  const args = scanArgs(tokens, ['--confirm'], [], hint);
+  if (args.problem) return usage(args.problem.message, args.problem.hint);
+  if (args.positionals.length > 0) {
+    return usage(`reset 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+  }
+  const values = args.values['--confirm'] ?? [];
+  if (values.length > 1) return usage('--confirm 只能指定一次', hint);
+  return { kind: 'reset', confirm: values[0] ?? null };
+}
+
 function parseQueryArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite query --help';
   if (tokens.some((t) => HELP_FLAGS.has(t))) return { kind: 'help', command: 'query' };
@@ -812,6 +835,8 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'authoring-cancel',
   'authoring-chat',
   'authoring-test',
+  'reset-enable',
+  'reset',
 ];
 
 /** `--decisions` 给的是文件路径；读出来交给 ingest 侧**唯一**的校验实现 */
@@ -1341,6 +1366,48 @@ export const COMMANDS: CliCommand[] = [
       if (inv.kind !== 'skill-install') throw new Error('命令表与 Invocation 不匹配');
       const { installSkill } = await import('./skill/install.ts');
       jsonTo(io, installSkill(inv));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'reset-enable',
+    name: 'reset enable',
+    summary: '把独立测试工作区标记为可重置；不会清理任何业务数据',
+    usage: 'bilite reset enable',
+    async run(inv, io) {
+      if (inv.kind !== 'reset-enable') throw new Error('命令表与 Invocation 不匹配');
+      const { enableTestWorkspace } = await import('./runtime/reset.ts');
+      const result = enableTestWorkspace(process.cwd());
+      jsonTo(io, { ...result, note: '已标记测试工作区；先用 bilite reset 预览清理范围。' });
+      io.err(`bilite reset enable: ${result.workspace} 已标记为测试工作区\n`);
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'reset',
+    name: 'reset',
+    summary: '预览或确认清理当前测试工作区；保留工作区外的供应商配置与 API key',
+    usage: 'bilite reset [--confirm <工作区名>]',
+    async run(inv, io) {
+      if (inv.kind !== 'reset') throw new Error('命令表与 Invocation 不匹配');
+      const { planWorkspaceReset, resetWorkspace } = await import('./runtime/reset.ts');
+      if (inv.confirm === null) {
+        const plan = planWorkspaceReset(process.cwd());
+        jsonTo(io, {
+          ...plan,
+          note: '只读预览，没有删除任何文件；确认后加 --confirm 工作区名。',
+        });
+        io.err(`bilite reset: 将清理 ${plan.removed.length} 个受管路径；确认值 ${plan.confirm}\n`);
+        return EXIT.OK;
+      }
+      const result = await resetWorkspace(process.cwd(), inv.confirm);
+      jsonTo(io, {
+        ...result,
+        note: '业务数据已清理并重建空目录；工作区标识与工作区外的供应商配置未改动。',
+      });
+      io.err(
+        `bilite reset: ${result.workspace} 已清理；重建 ${result.reinitialized.length} 个业务目录\n`,
+      );
       return EXIT.OK;
     },
   },
@@ -1961,7 +2028,7 @@ function readVersion(io: CliIO): string {
 /** 有专门帮助页的主题：总览(null)、每个命令名、以及 "ingest" 这个分组 */
 function isKnownHelpTopic(command: string): boolean {
   return command === 'ingest' || command === 'agent' || command === 'skill' ||
-    command === 'authoring' || COMMANDS.some((c) => c.name === command);
+    command === 'authoring' || command === 'reset' || COMMANDS.some((c) => c.name === command);
 }
 
 function helpText(io: CliIO, command: string | null): string {
@@ -2036,6 +2103,20 @@ function helpText(io: CliIO, command: string | null): string {
         '默认供应商：DeepSeek（https://api.deepseek.com/v1），模型 deepseek-flash。',
         '`setup` 交互输入 API key；密钥单独写入用户配置目录的 authoring-auth.json（0600），',
         '不写入项目工作区，也不读取 ~/.pi/agent。',
+      ].join('\n') + '\n'
+    );
+  }
+  if (command === 'reset') {
+    return (
+      [
+        '用法： bilite reset [--confirm <工作区名>]',
+        '       bilite reset enable',
+        '',
+        '只处理已用 reset enable 标记的独立测试工作区。',
+        '不带 --confirm 时只输出清理清单，不删除文件；确认值必须等于工作区目录名。',
+        '清理模型、指标、规格、模板、草稿、数据库、会话、输出与受管缓存，',
+        '保留 bilite.config.json、运行时所有者状态和工作区外的供应商配置/API key。',
+        '执行前需停止该工作区的 Web 服务；活动持锁进程会使 reset 失败。',
       ].join('\n') + '\n'
     );
   }

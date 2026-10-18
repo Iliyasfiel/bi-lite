@@ -46,7 +46,7 @@ npm run doctor
 | 共享规格任务与候选 | `npm run test:authoring` | 任务租约、修订、连续会话、两类候选与无数据库边界；不调用真实模型 |
 | 接入、语义计算、模型或渲染 | `npm run e2e` | 临时副本和假数据，结束后清理 |
 | CLI、工作区、服务生命周期或发布资源 | `npm run package:check` | 临时安装真实 `.tgz`，启动回环服务后清理 |
-| 源码开发 reset | `npm run test:development` | 临时工作区，检查真实锁、链接拒绝与配置保留 |
+| 测试区 reset | `npm run test:reset` | 临时工作区，检查真实锁、链接拒绝与供应商配置保留 |
 | 打包输出 | `npm run build` / `npm pack` | 生成 `dist/` / `.tgz`，不提交产物 |
 | 文档或简单样式 | `git diff --check` 及相关针对性检查 | 不默认跑全套验收 |
 
@@ -73,21 +73,22 @@ node bin/bilite.mjs --workspace <业务工作区> catalog dump --format prompt
 Web 运行时 CLI 自动转交数据库操作；MCP 目前仍须单独占库。
 不要复制另一设备的 `.bilite/`、数据库锁或 `node_modules/` 来恢复环境。
 
-### 重置独立测试工作区（仅源码开发）
+### 重置独立测试工作区
 
-先停止目标工作区的 Web 服务，再使用源码命令标记、预览和确认：
+先停止目标工作区的 Web 服务，再使用全局 CLI 标记、预览和确认：
 
 ```bash
-node bin/bilite.mjs --workspace <测试工作区> dev enable
-node bin/bilite.mjs --workspace <测试工作区> dev reset
-node bin/bilite.mjs --workspace <测试工作区> dev reset --confirm <工作区名>
+bilite --workspace <测试工作区> reset enable
+bilite --workspace <测试工作区> reset
+bilite --workspace <测试工作区> reset --confirm <工作区名>
 ```
 
-`enable` 只在工作区标识中写入开发标记；不带 `--confirm` 的 reset 只输出清单。
+源码开发可用 `node bin/bilite.mjs --workspace <测试工作区> reset ...`，行为与安装包一致。
+`enable` 只在工作区标识中写入测试标记；不带 `--confirm` 的 reset 只输出清单。
 确认后清空模型、指标、模板、规格、草稿、数据库、会话、输出与受管缓存，重建空业务目录。
 工作区标识和工作区外的供应商配置保留，不自动重装财务预设。
 源码/Git/包目录、未知文件、链接、外部数据库和活动持锁服务会被拒绝，不自动杀进程。
-该实现放在 `dev/`，测试在 `test/development.ts`，正式包不包含实现或 Web reset 入口；上线前移除源码功能。
+该实现位于 `src/runtime/reset.ts`，测试在 `test/reset.ts`；安装包包含 CLI 命令，Web 不提供 reset 入口。
 
 ## 配置和常见阻塞
 
