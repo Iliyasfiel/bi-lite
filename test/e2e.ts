@@ -220,6 +220,18 @@ async function verify() {
     const sheet = wb.sheet('主要指标');
     assert.deepEqual(sheet.range('B4:E8').value(), expected);
     assert.equal(sheet.cell('B9').formula(), 'SUM(B4:B8)');
+    const escaped = await renderTemplate(spec.template!, 'output/公式注入标签.xlsx', [{
+      sheet: spec.sheets[0].name,
+      anchor: 'B4',
+      colLabels: ['=2+2'],
+      rows: [{ label: '+SUM(A1:A2)', values: [1] }],
+      writeRowLabels: true,
+      writeColLabels: true,
+    }]);
+    assert.equal(escaped.cellsWritten > 0, true);
+    const escapedBook = await XLSX.fromFileAsync('output/公式注入标签.xlsx');
+    assert.equal(escapedBook.sheet(spec.sheets[0].name).cell('A4').value(), "'+SUM(A1:A2)");
+    assert.equal(escapedBook.sheet(spec.sheets[0].name).cell('B3').value(), "'=2+2");
     assert.equal(sheet.range('A1:E1').merged(), true);
     assert.equal(readNumberFormat(wb, sheet.cell('B4')), '#,##0.00;[Red]-#,##0.00');
     const { default: JSZip } = await import('jszip');
@@ -421,6 +433,31 @@ async function verify() {
       const emptyWorkspace = path.join(caller, '空工作区');
       assert.equal(spawnSync(process.execPath, [entry, 'init', emptyWorkspace], { cwd: caller }).status, 0);
       assert.deepEqual(fs.readdirSync(path.join(emptyWorkspace, 'models')), []);
+      // An empty catalog must still return the layout of a composite business template.
+      const composite = await XLSX.fromBlankAsync();
+      composite.sheet(0).cell('A1').value('公司主体');
+      composite.sheet(0).cell('B1').value('指标');
+      composite.sheet(0).cell('C1').value('单位');
+      composite.sheet(0).cell('D1').value('本年累计');
+      composite.sheet(0).cell('E1').value('同比增长率');
+      composite.sheet(0).cell('A2').value('待建主体');
+      composite.sheet(0).cell('B2').value('待建指标');
+      composite.sheet(0).cell('C2').value('元');
+      composite.sheet(0).cell('E2').formula('IF(D2=0,0,D2*1)');
+      const compositePath = path.join(emptyWorkspace, 'templates/composite.xlsx');
+      await composite.toFileAsync(compositePath);
+      const structureOnly = spawnSync(process.execPath, [entry, '--workspace', emptyWorkspace, 'agent', 'generate', '--template', compositePath], {
+        cwd: caller, encoding: 'utf8', env: { ...process.env, BILITE_DB: path.join(emptyWorkspace, 'data/bi.duckdb') },
+      });
+      assert.equal(structureOnly.status, 0, structureOnly.stderr);
+      const structure = JSON.parse(structureOnly.stdout);
+      assert.equal(structure.status, 'needs-modeling');
+      assert.equal(structure.draftValid, false);
+      assert.equal(structure.yaml, null);
+      assert.ok(structure.projection.sheets[0].cells.some((cell) => cell.text === '待建指标'));
+      assert.ok(structure.projection.sheets[0].cells.some((cell) => cell.ref === 'E2' && cell.formula === true));
+      assert.ok(!structureOnly.stdout.includes('IF(D2'));
+      for (const dir of ['models', 'metrics', 'ingest', 'specs']) assert.deepEqual(fs.readdirSync(path.join(emptyWorkspace, dir)), []);
       const emptyPlan = spawnSync(process.execPath, [entry, '--workspace', emptyWorkspace, 'plan', '--check'], {
         cwd: caller, encoding: 'utf8', env: { ...process.env, BILITE_DB: path.join(emptyWorkspace, 'data/bi.duckdb') },
       });

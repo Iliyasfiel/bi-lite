@@ -21,6 +21,7 @@
     "fixtures": "node test/make-fixtures.ts",
     "e2e": "node test/e2e.ts",
     "test:pi": "node test/pi.ts",
+    "test:authoring": "node test/authoring.ts",
     "test:pi:live": "node test/pi-live.ts",
     "start": "node src/server.ts",
     "fixtures:business": "node test/prepare-business-fixtures.ts",

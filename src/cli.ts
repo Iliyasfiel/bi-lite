@@ -31,12 +31,20 @@ import fs from 'node:fs';
 import { looksLikeIngestDoc } from './spec/geometry.ts';
 import { declaredFactsOf } from './gen/parse.ts';
 import { parseSpec } from './spec/types.ts';
+import { workspacePath } from './runtime/service.ts';
+import { canonicalPath } from './runtime/paths.ts';
 
 // ---------------- IO（可注入，便于 e2e 在进程内跑而不杀测试进程） ----------------
 
 export interface CliIO {
   out: (text: string) => void;
   err: (text: string) => void;
+}
+
+function cliWorkspace(): string {
+  const value = process.env.BILITE_WORKSPACE;
+  if (!value) return workspacePath();
+  return canonicalPath(value);
 }
 
 export function processIO(): CliIO {
@@ -60,6 +68,7 @@ export const EXIT = { OK: 0, FAILED: 1, USAGE: 2 } as const;
 export type Invocation =
   | { kind: 'help'; command: string | null }
   | { kind: 'version' }
+  | { kind: 'spec'; excel: string }
   | { kind: 'ingest-lint'; specFile: string }
   | { kind: 'ingest-dry-run'; specFile: string; decisionsPath: string | null; source: string | null }
   | { kind: 'ingest-run'; specFile: string; decisionsPath: string | null; strict: boolean; source: string | null }
@@ -101,6 +110,53 @@ export type Invocation =
       force: boolean;
     }
   | { kind: 'authoring-status' }
+  | {
+      kind: 'authoring-task-status';
+      taskId: string;
+    }
+  | {
+      kind: 'authoring-preview';
+      taskId: string;
+      userText: string;
+    }
+  | {
+      kind: 'authoring-review';
+      taskId: string;
+    }
+  | {
+      kind: 'authoring-start';
+      attachmentId: string | null;
+      direction: 'ingest' | 'export' | null;
+      revision: number | null;
+    }
+  | {
+      kind: 'authoring-create';
+      inspect: string;
+    }
+  | {
+      kind: 'authoring-select';
+      taskId: string;
+      direction: 'ingest' | 'export';
+      revision: number;
+    }
+  | {
+      kind: 'authoring-resume';
+      taskId: string;
+      revision: number;
+    }
+  | {
+      kind: 'authoring-cancel';
+      taskId: string;
+      revision: number;
+      retain: boolean;
+    }
+  | {
+      kind: 'authoring-chat';
+      taskId: string;
+      revision: number;
+      text: string;
+      retainOnCancel: boolean;
+    }
   | { kind: 'authoring-test'; send: boolean }
   | { kind: 'reset-enable' }
   | { kind: 'reset'; confirm: string | null }
@@ -183,6 +239,11 @@ export function parseCliArgs(argv: readonly string[]): Invocation {
   if (VERSION_FLAGS.has(first) || first === 'version') return { kind: 'version' };
   if (HELP_FLAGS.has(first)) return { kind: 'help', command: null };
   if (first === 'help') return { kind: 'help', command: tokens[1] ?? null };
+  if (first === 'spec') {
+    if (tokens.slice(1).some(t => HELP_FLAGS.has(t))) return { kind: 'help', command: 'spec' };
+    if (tokens.length !== 2 || tokens[1].startsWith('-')) return usage('用法：bilite spec <Excel路径>');
+    return { kind: 'spec', excel: tokens[1] };
+  }
   if (first === 'agent') return parseAgentArgs(tokens.slice(1));
   if (first === 'ingest') return parseIngestArgs(tokens.slice(1));
   if (first === 'render') return parseRenderArgs(tokens.slice(1));
@@ -474,12 +535,137 @@ function parseAuthoringArgs(tokens: readonly string[]): Invocation {
   const hint = 'bilite authoring --help';
   const sub = tokens[0];
   if (sub === undefined || HELP_FLAGS.has(sub)) return { kind: 'help', command: 'authoring' };
+  if (sub === 'task-status') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring task-status' };
+    const args = scanArgs(rest, [], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    return { kind: 'authoring-task-status', taskId };
+  }
+  if (sub === 'preview') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring preview' };
+    const args = scanArgs(rest, ['--text'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    return {
+      kind: 'authoring-preview',
+      taskId,
+      userText: args.values['--text']?.[0] ?? '',
+    };
+  }
+  if (sub === 'review' || sub === 'summary') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring review' };
+    const args = scanArgs(rest, [], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    return { kind: 'authoring-review', taskId };
+  }
   if (sub === 'status') {
-    if (tokens.length > 1 && tokens.slice(1).some((token) => HELP_FLAGS.has(token))) {
+    if (tokens.slice(1).some((token) => HELP_FLAGS.has(token))) {
       return { kind: 'help', command: 'authoring status' };
     }
-    if (tokens.length !== 1) return usage(`status 不接受参数（收到 ${tokens[1]}）`, hint);
+    if (tokens.length > 1) return usage('任务状态请使用 bilite authoring task-status <任务标识>', hint);
     return { kind: 'authoring-status' };
+  }
+  if (sub === 'create') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring create' };
+    const args = scanArgs(rest, ['--inspect'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    if (args.positionals.length) return usage(`create 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+    if (args.values['--inspect']?.length !== 1) {
+      return usage('create 需要 --inspect <空白 Excel；使用 - 从标准输入读取>', hint);
+    }
+    return { kind: 'authoring-create', inspect: args.values['--inspect']![0]! };
+  }
+  if (sub === 'start') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring start' };
+    const args = scanArgs(rest, ['--attachment', '--direction', '--revision'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    if (args.positionals.length) return usage(`start 不接受位置参数（收到 ${args.positionals[0]}）`, hint);
+    const attachmentId = args.values['--attachment']?.[0] ?? null;
+    if (!attachmentId) return usage('start 需要 --attachment <已检查标识>', hint);
+    const directionValue = args.values['--direction']?.[0];
+    if (directionValue !== undefined && !['ingest', 'export'].includes(directionValue)) {
+      return usage('--direction 只能是 ingest / export', hint);
+    }
+    const revisionValue = args.values['--revision']?.[0];
+    const revision = revisionValue === undefined ? null : Number(revisionValue);
+    if (revision !== null && (!Number.isInteger(revision) || revision < 0)) {
+      return usage('--revision 必须是非负整数', hint);
+    }
+    return {
+      kind: 'authoring-start',
+      attachmentId,
+      direction: (directionValue as 'ingest' | 'export' | undefined) ?? null,
+      revision,
+    };
+  }
+  if (sub === 'select') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring select' };
+    const args = scanArgs(rest, ['--direction', '--revision'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    const direction = args.values['--direction']?.[0];
+    if (!direction || !['ingest', 'export'].includes(direction)) {
+      return usage('select 需要 --direction ingest|export', hint);
+    }
+    const revision = Number(args.values['--revision']?.[0]);
+    if (!Number.isInteger(revision) || revision < 0) return usage('select 需要非负整数 --revision', hint);
+    return { kind: 'authoring-select', taskId, direction: direction as 'ingest' | 'export', revision };
+  }
+  if (sub === 'resume') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring resume' };
+    const args = scanArgs(rest, ['--revision'], [], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    const revision = Number(args.values['--revision']?.[0]);
+    if (!Number.isInteger(revision) || revision < 0) return usage('resume 需要非负整数 --revision', hint);
+    return { kind: 'authoring-resume', taskId, revision };
+  }
+  if (sub === 'cancel') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring cancel' };
+    const args = scanArgs(rest, ['--revision'], ['--retain'], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    const revision = Number(args.values['--revision']?.[0]);
+    if (!Number.isInteger(revision) || revision < 0) return usage('cancel 需要非负整数 --revision', hint);
+    return {
+      kind: 'authoring-cancel',
+      taskId,
+      revision,
+      retain: '--retain' in args.values,
+    };
+  }
+  if (sub === 'chat') {
+    const rest = tokens.slice(1);
+    if (rest.some((token) => HELP_FLAGS.has(token))) return { kind: 'help', command: 'authoring chat' };
+    const args = scanArgs(rest, ['--revision'], ['--retain-on-cancel'], hint);
+    if (args.problem) return usage(args.problem.message, args.problem.hint);
+    const taskId = onePositional(args, '任务标识', hint);
+    if (typeof taskId !== 'string') return taskId;
+    const revision = Number(args.values['--revision']?.[0]);
+    if (!Number.isInteger(revision) || revision < 0) return usage('chat 需要非负整数 --revision', hint);
+    return {
+      kind: 'authoring-chat',
+      taskId,
+      revision,
+      text: '',
+      retainOnCancel: '--retain-on-cancel' in args.values,
+    };
   }
   if (sub === 'test') {
     const rest = tokens.slice(1);
@@ -636,8 +822,18 @@ const HANDLED_KINDS: readonly Invocation['kind'][] = [
   'diff-spec',
   'skill-export',
   'skill-install',
+  'spec',
   'authoring-setup',
   'authoring-status',
+  'authoring-task-status',
+  'authoring-preview',
+  'authoring-review',
+  'authoring-create',
+  'authoring-start',
+  'authoring-select',
+  'authoring-resume',
+  'authoring-cancel',
+  'authoring-chat',
   'authoring-test',
   'reset-enable',
   'reset',
@@ -678,6 +874,19 @@ async function agentOutput(io: CliIO, value: unknown): Promise<number> {
 }
 
 export const COMMANDS: CliCommand[] = [
+  {
+    invocation: 'spec',
+    name: 'spec',
+    summary: '从 Excel 样表连续制定接入或导出规格，审阅确认后保存',
+    usage: 'bilite spec <Excel路径>',
+    async run(inv, io) {
+      if (inv.kind !== 'spec') throw new Error('命令表与 Invocation 不匹配');
+      if (!process.stdin.isTTY) { io.err('spec 需要交互终端，请在终端直接执行同一条命令。\n'); return EXIT.USAGE; }
+      const { runSpecWorkflow } = await import('./authoring/workflow.ts');
+      const result = await runSpecWorkflow({ excel: inv.excel, workspace: cliWorkspace(), output: process.stdout, input: process.stdin, error: process.stderr });
+      return result === 'failed' || result === 'rejected' ? EXIT.FAILED : EXIT.OK;
+    },
+  },
   {
     invocation: 'authoring-setup',
     name: 'authoring setup',
@@ -901,6 +1110,266 @@ export const COMMANDS: CliCommand[] = [
     },
   },
   {
+    invocation: 'authoring-task-status',
+    name: 'authoring task-status',
+    summary: '查看规格制定任务、草稿与声明的受控状态',
+    usage: 'bilite authoring task-status <任务标识>',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-task-status') throw new Error('命令表与 Invocation 不匹配');
+      const { authoringTaskView, getAuthoringTask } = await import('./authoring/tasks.ts');
+      jsonTo(io, authoringTaskView(getAuthoringTask(inv.taskId, cliWorkspace())));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-preview',
+    name: 'authoring preview',
+    summary: '查看当前任务下一次发送给模型的受控上下文；不调用模型',
+    usage: 'bilite authoring preview <任务标识> [--text <下一轮用户文字>]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-preview') throw new Error('命令表与 Invocation 不匹配');
+      const { getAuthoringTask } = await import('./authoring/tasks.ts');
+      const { previewAuthoringSend } = await import('./authoring/inspect.ts');
+      jsonTo(io, previewAuthoringSend(
+        getAuthoringTask(inv.taskId, cliWorkspace()),
+        inv.userText,
+      ));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-review',
+    name: 'authoring review',
+    summary: '在本机查看完整候选草稿、诊断和声明差异',
+    usage: 'bilite authoring review <任务标识>',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-review') throw new Error('命令表与 Invocation 不匹配');
+      const { getAuthoringTask } = await import('./authoring/tasks.ts');
+      const { inspectAuthoringTask } = await import('./authoring/inspect.ts');
+      jsonTo(io, inspectAuthoringTask(getAuthoringTask(inv.taskId, cliWorkspace())));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-create',
+    name: 'authoring create',
+    summary: '从空白 Excel 的本地输入流检查并建立待选方向任务',
+    usage: 'bilite authoring create --inspect <空白.xlsx|->',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-create') throw new Error('命令表与 Invocation 不匹配');
+      const { readCheckedTemplate, TemplateCheckError } = await import('./spec/blank.ts');
+      let bytes: Buffer;
+      if (inv.inspect === '-') {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of process.stdin) {
+          const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += value.length;
+          if (size > 32 * 1024 * 1024) throw new Error('上传超过 32MB 上限');
+          chunks.push(value);
+        }
+        bytes = Buffer.concat(chunks);
+      } else {
+        if (!fs.existsSync(inv.inspect)) throw new Error(`空白模板不存在：${inv.inspect}`);
+        bytes = fs.readFileSync(inv.inspect);
+      }
+      try {
+        await readCheckedTemplate(bytes);
+      } catch (error) {
+        if (error instanceof TemplateCheckError) {
+          jsonTo(io, { accepted: false, code: error.code, message: error.message });
+          return EXIT.FAILED;
+        }
+        throw error;
+      }
+      const { startAuthoringTask, authoringTaskView } = await import('./authoring/tasks.ts');
+      const task = await startAuthoringTask({
+        filename: inv.inspect === '-' ? 'stdin.xlsx' : inv.inspect,
+        bytes,
+        workspace: cliWorkspace(),
+      });
+      jsonTo(io, {
+        accepted: true,
+        task: authoringTaskView(task),
+        next: [
+          `bilite authoring select ${task.task.id} --direction ingest|export --revision ${task.task.revision}`,
+          `bilite authoring task-status ${task.task.id}`,
+        ],
+      });
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-start',
+    name: 'authoring start',
+    summary: '从已检查附件建立任务；可选选择方向',
+    usage:
+      'bilite authoring start --attachment <检查标识> [--direction ingest|export] [--revision <n>]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-start') throw new Error('命令表与 Invocation 不匹配');
+      const {
+        authoringTaskView,
+        getAuthoringTask,
+        recoverAuthoringTask,
+        selectAuthoringDirection,
+      } = await import('./authoring/tasks.ts');
+      const workspace = cliWorkspace();
+      let task;
+      if (inv.attachmentId) {
+        try {
+          task = getAuthoringTask(inv.attachmentId, workspace);
+        } catch (error) {
+          if (!(error as Error & { code?: string }).code?.includes('NOT_FOUND')) throw error;
+          task = recoverAuthoringTask(inv.attachmentId, workspace);
+        }
+      }
+      if (inv.direction) {
+        const revision = inv.revision ?? task.task.revision;
+        task = selectAuthoringDirection({
+          taskId: task.task.id,
+          expectedRevision: revision,
+          direction: inv.direction,
+          workspace,
+        });
+      } else if (inv.revision !== null) {
+        throw new Error('--revision 只能与 --direction 一起使用');
+      }
+      jsonTo(io, authoringTaskView(task));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-select',
+    name: 'authoring select',
+    summary: '为待选方向任务选择接入或导出规格',
+    usage: 'bilite authoring select <任务标识> --direction ingest|export --revision <n>',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-select') throw new Error('命令表与 Invocation 不匹配');
+      const { authoringTaskView, selectAuthoringDirection } = await import('./authoring/tasks.ts');
+      jsonTo(io, authoringTaskView(selectAuthoringDirection({
+        taskId: inv.taskId,
+        expectedRevision: inv.revision,
+        direction: inv.direction,
+        workspace: cliWorkspace(),
+      })));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-resume',
+    name: 'authoring resume',
+    summary: '恢复失败或已保留的任务',
+    usage: 'bilite authoring resume <任务标识> --revision <n>',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-resume') throw new Error('命令表与 Invocation 不匹配');
+      const { authoringTaskView, resumeAuthoringTask } = await import('./authoring/tasks.ts');
+      jsonTo(io, authoringTaskView(resumeAuthoringTask({
+        taskId: inv.taskId,
+        expectedRevision: inv.revision,
+        workspace: cliWorkspace(),
+      })));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-cancel',
+    name: 'authoring cancel',
+    summary: '取消任务；--retain 保留可恢复副本',
+    usage: 'bilite authoring cancel <任务标识> --revision <n> [--retain]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-cancel') throw new Error('命令表与 Invocation 不匹配');
+      const { authoringTaskView, cancelAuthoringTask } = await import('./authoring/tasks.ts');
+      jsonTo(io, authoringTaskView(cancelAuthoringTask({
+        taskId: inv.taskId,
+        expectedRevision: inv.revision,
+        retain: inv.retain,
+        workspace: cliWorkspace(),
+      })));
+      return EXIT.OK;
+    },
+  },
+  {
+    invocation: 'authoring-chat',
+    name: 'authoring chat',
+    summary: '在已选方向的同一任务中连续对话；管道输入时发送一轮',
+    usage: 'bilite authoring chat <任务标识> --revision <n> [--retain-on-cancel]',
+    async run(inv, io) {
+      if (inv.kind !== 'authoring-chat') throw new Error('命令表与 Invocation 不匹配');
+      if (process.stdin.isTTY) {
+        const { runInteractiveAuthoring } = await import('./authoring/interactive.ts');
+        const result = await runInteractiveAuthoring({
+          taskId: inv.taskId,
+          expectedRevision: inv.revision,
+          workspace: cliWorkspace(),
+          input: process.stdin,
+          output: process.stdout,
+          error: process.stderr,
+          retainOnCancel: inv.retainOnCancel,
+        });
+        return result.task.task.status === 'failed' ? EXIT.FAILED : EXIT.OK;
+      }
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      for await (const chunk of process.stdin) {
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += value.length;
+        if (bytes > 64 * 1024) throw new Error('消息超过 64KB 上限');
+        chunks.push(value);
+      }
+      const text = Buffer.concat(chunks).toString('utf8').trim();
+      if (!text) throw new Error('chat 需要从标准输入提供一轮文字');
+      const { runSharedAuthoringTurn } = await import('./authoring/session.ts');
+      const { authoringTaskView, cancelAuthoringTask } = await import('./authoring/tasks.ts');
+      const controller = new AbortController();
+      const onInterrupt = () => controller.abort();
+      process.once('SIGINT', onInterrupt);
+      try {
+        const result = await runSharedAuthoringTurn({
+          taskId: inv.taskId,
+          expectedRevision: inv.revision,
+          userText: text,
+          workspace: cliWorkspace(),
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) {
+          const cancelled = cancelAuthoringTask({
+            taskId: result.task.task.id,
+            expectedRevision: result.task.task.revision,
+            retain: inv.retainOnCancel,
+            workspace: cliWorkspace(),
+          });
+          jsonTo(io, {
+            cancelled: true,
+            task: authoringTaskView(cancelled),
+          });
+          return EXIT.OK;
+        }
+        jsonTo(io, {
+          text: result.text,
+          stopReason: result.stopReason,
+          errorMessage: result.errorMessage,
+          requestCount: result.requestCount,
+          task: authoringTaskView(result.task),
+        });
+        return result.errorMessage ? EXIT.FAILED : EXIT.OK;
+      } finally {
+        process.off('SIGINT', onInterrupt);
+      }
+    },
+  },
+  {
+    invocation: 'skill-install',
+    name: 'skill install',
+    summary: '按需安装 Codex skill 独立副本；已有文件需显式 --force',
+    usage: 'bilite skill install [--scope project|user] [--force]',
+    async run(inv, io) {
+      if (inv.kind !== 'skill-install') throw new Error('命令表与 Invocation 不匹配');
+      const { installSkill } = await import('./skill/install.ts');
+      jsonTo(io, installSkill(inv));
+      return EXIT.OK;
+    },
+  },
+  {
     invocation: 'reset-enable',
     name: 'reset enable',
     summary: '把独立测试工作区标记为可重置；不会清理任何业务数据',
@@ -939,18 +1408,6 @@ export const COMMANDS: CliCommand[] = [
       io.err(
         `bilite reset: ${result.workspace} 已清理；重建 ${result.reinitialized.length} 个业务目录\n`,
       );
-      return EXIT.OK;
-    },
-  },
-  {
-    invocation: 'skill-install',
-    name: 'skill install',
-    summary: '按需安装 Codex skill 独立副本；已有文件需显式 --force',
-    usage: 'bilite skill install [--scope project|user] [--force]',
-    async run(inv, io) {
-      if (inv.kind !== 'skill-install') throw new Error('命令表与 Invocation 不匹配');
-      const { installSkill } = await import('./skill/install.ts');
-      jsonTo(io, installSkill(inv));
       return EXIT.OK;
     },
   },
@@ -1587,7 +2044,7 @@ function helpText(io: CliIO, command: string | null): string {
         '命令：',
         '  web                前台启动网页服务（--port / --no-open），CLI 自动转交数据库操作',
         '  operation status   查询转交操作状态（不返回结果值）',
-        ...COMMANDS.map((c) => `  ${c.name.padEnd(18)} ${c.summary}`),
+        ...COMMANDS.filter(c => !c.name.startsWith('authoring ') || ['authoring setup', 'authoring status'].includes(c.name)).map((c) => `  ${c.name.padEnd(18)} ${c.summary}`),
         '  help [命令]        看帮助',
         '  version            看版本（等价于 --version）',
         '',
@@ -1695,6 +2152,38 @@ function helpText(io: CliIO, command: string | null): string {
   }
   const c = COMMANDS.find((x) => x.name === command);
   if (!c) return `没有这个命令：${command}\n`;
+  if (command === 'authoring start') {
+    return [
+      `用法： ${c.usage}`,
+      '',
+      '从已有检查记录恢复制定任务；新的空白 Excel 可先用 authoring create 检查并由 stdin 送入。',
+      '先显示待选方向；加 --direction 在同一修订上确认方向。',
+      '任务、草稿与声明快照保存在 .bilite/authoring/，制定流程不打开数据库。',
+      '',
+      '权限：任务标识、方向与修订由本机用户绑定；Excel 路径只从本地参数读取。',
+    ].join('\n') + '\n';
+  }
+  if (command === 'authoring create') {
+    return [
+      `用法： ${c.usage}`,
+      '',
+      '先在本机检查空白工作簿，再从 stdin 一次性送入字节：',
+      '  bilite authoring create --inspect - < 空白模板.xlsx',
+      '',
+      '--inspect <文件> 只做本地检查并给出同样结果，不接受路径参数来自模型。',
+      '检查通过后返回任务标识与修订号；制定流程不打开数据库。',
+    ].join('\n') + '\n';
+  }
+  if (command === 'authoring status') {
+    const taskCommand = COMMANDS.find((entry) => entry.name === 'authoring task-status');
+    return [
+      `用法： ${taskCommand?.usage ?? c.usage}`,
+      `       ${c.usage}`,
+      '',
+      '不带任务标识时检查供应商配置；指定标识时返回任务、草稿与声明状态。',
+      '这两种查询都不打开数据库、不发起网络请求。',
+    ].join('\n') + '\n';
+  }
   return [`用法： ${c.usage}`, '', c.summary, ''].join('\n') + '\n';
 }
 
@@ -1711,7 +2200,8 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
   const inv = parseCliArgs(argv);
 
   if (inv.kind === 'help') {
-    if (inv.command !== null && !isKnownHelpTopic(inv.command)) {
+    if (inv.command !== null && !isKnownHelpTopic(inv.command)
+      && !COMMANDS.some((command) => command.name === inv.command)) {
       io.err(`bilite: 没有这个命令：${inv.command}\n提示：${HINT}\n`);
       return EXIT.USAGE;
     }
@@ -1735,6 +2225,10 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
     return EXIT.FAILED;
   }
   try {
+    if (inv.kind !== 'spec') {
+      const { assertPublicationReadable } = await import('./runtime/publication.ts');
+      assertPublicationReadable(cliWorkspace());
+    }
     return await cmd.run(inv, io);
   } catch (e) {
     io.err(`bilite ${cmd.name}: ${(e as Error).message}\n`);

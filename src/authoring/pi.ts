@@ -1,9 +1,15 @@
 import { Agent, type StreamFn } from '@earendil-works/pi-agent-core';
-import { createModels, createProvider, envApiKeyAuth, type Model, type SimpleStreamOptions } from '@earendil-works/pi-ai';
-import type { AssistantMessageEventStream, TranscriptContext } from '@earendil-works/pi-ai';
+import { createModels, createProvider, createInitialSystemMessage, toToolDeclaration, envApiKeyAuth, type Model, type SimpleStreamOptions } from '@earendil-works/pi-ai';
+import type {
+  AssistantMessageEventStream,
+  Message,
+  TranscriptContext,
+  UserMessage,
+} from '@earendil-works/pi-ai';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import type { Tool } from '@earendil-works/pi-ai';
 import { Type } from 'typebox';
+import { DEFAULT_AUTHORING_MAX_PROMPT_CHARS, assertAuthoringContextSize } from './limits.ts';
 import {
   AUTHORING_PROVIDER_ID,
   DEFAULT_AUTHORING_BASE_URL,
@@ -38,6 +44,11 @@ type StreamFunction = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
+type AgentWithOptionalExecute = Tool & {
+  execute?: Tool['execute'];
+  label?: string;
+};
+
 export interface AuthoringTurnContext {
   task: { id: string; sha256: string };
 }
@@ -53,6 +64,9 @@ export interface PiRunOptions {
   userText: string;
   tools?: Tool[];
   signal?: AbortSignal;
+  /** Provider-native transcript preceding the new userText. */
+  messages?: Message[];
+  onTextDelta?: (delta: string) => void;
 }
 
 export interface PiRunResult {
@@ -62,6 +76,15 @@ export interface PiRunResult {
   stopReason: string | undefined;
   errorMessage: string | undefined;
   requestCount: number;
+  messages: Message[];
+}
+
+export interface AuthoringDiagnostic {
+  code: string;
+  at?: string;
+  message: string;
+  hint?: string;
+  level?: string;
 }
 
 export interface AuthoringProtocolProbe {
@@ -95,6 +118,7 @@ type AgentToolEndEvent = {
 };
 
 export const SUBMIT_SPEC_PROPOSAL_TOOL_NAME = 'submit_spec_proposal';
+export const SUBMIT_AUTHORING_PROPOSAL_TOOL_NAME = 'submit_authoring_proposal';
 
 type SpecProposalDetails = { kind?: unknown; note?: unknown };
 
@@ -112,6 +136,10 @@ const submitSpecProposalTool: Tool = {
   }),
 };
 
+/** Tools consumed only by local AgentTool.execute; never exposed as provider tools. */
+const LOCAL_ONLY_TOOLS = new Set([SUBMIT_AUTHORING_PROPOSAL_TOOL_NAME]);
+const ALLOWED_TOOL_NAMES = new Set([SUBMIT_SPEC_PROPOSAL_TOOL_NAME, ...LOCAL_ONLY_TOOLS]);
+
 const DEFAULTS = {
   baseUrl: DEFAULT_AUTHORING_BASE_URL,
   modelId: DEFAULT_AUTHORING_MODEL_ID,
@@ -121,7 +149,7 @@ const DEFAULTS = {
   maxRetries: 1,
   maxRetryDelayMs: 5_000,
   maxToolTurns: 6,
-  maxPromptChars: 24_000,
+  maxPromptChars: DEFAULT_AUTHORING_MAX_PROMPT_CHARS,
 };
 
 /**
@@ -164,6 +192,30 @@ export function createAuthoringModels(options: PiRuntimeOptions = {}) {
   return { models, model: selected };
 }
 
+/** The SDK's system message contains both the prompt and tool declarations. */
+export function authoringInputMessages(options: PiRunOptions): Message[] {
+  const system = createInitialSystemMessage(options.systemPrompt,
+    (options.tools ?? [submitSpecProposalTool]).map(toToolDeclaration));
+  return [
+    ...(system ? [system] : []),
+    ...(options.messages ?? []).filter(message => message.role !== 'system'),
+    { role: 'user', content: options.userText, timestamp: Date.now() } as UserMessage,
+  ];
+}
+
+export function serializeAuthoringContext(messages: readonly Message[]): string {
+  // Provider bookkeeping (usage, timing, tool details) is persisted for recovery,
+  // but is not model input. Count the actual transcript fields only.
+  return JSON.stringify(messages.map(message => {
+    const base = { role: message.role, content: message.content };
+    if (message.role === 'system') return { ...base, sections: message.sections,
+      toolsAdded: message.toolsAdded, toolsRemoved: message.toolsRemoved };
+    if (message.role === 'toolResult') return { ...base, toolCallId: message.toolCallId,
+      toolName: message.toolName, isError: message.isError };
+    return base;
+  }));
+}
+
 export async function runAuthoringTurn(
   options: PiRunOptions,
   runtime: PiRuntimeOptions = {},
@@ -187,9 +239,8 @@ export async function runAuthoringTurn(
   if (!Number.isInteger(maxToolTurns) || maxToolTurns < 1) throw new Error('maxToolTurns must be a positive integer');
   const maxPromptChars = runtime.maxPromptChars ?? DEFAULTS.maxPromptChars;
   if (!Number.isInteger(maxPromptChars) || maxPromptChars < 1) throw new Error('maxPromptChars must be a positive integer');
-  if (options.systemPrompt.length + options.userText.length > maxPromptChars) {
-    throw new Error('AUTHORING_CONTEXT_TOO_LARGE');
-  }
+  const initialMessages = authoringInputMessages(options);
+  assertAuthoringContextSize(serializeAuthoringContext(initialMessages).length, maxPromptChars);
   if (options.signal?.aborted) {
     return {
       text: '',
@@ -198,6 +249,7 @@ export async function runAuthoringTurn(
       stopReason: 'aborted',
       errorMessage: 'AUTHORING_TURN_ABORTED',
       requestCount: 0,
+      messages: structuredClone(options.messages ?? []),
     };
   }
   const { models, model } = createAuthoringModels(runtime);
@@ -207,7 +259,10 @@ export async function runAuthoringTurn(
     maxRetryDelayMs,
     ...runtime.streamOptions,
   };
-  const baseTools = options.tools ?? [submitSpecProposalTool];
+  const baseTools: AgentWithOptionalExecute[] = options.tools
+    ? options.tools.map((tool) => ({ ...tool }))
+    : [submitSpecProposalTool];
+  const localTools = (options.tools ?? []).filter((tool) => LOCAL_ONLY_TOOLS.has(tool.name));
   const tools = context ? baseTools.map((tool) => tool.name === SUBMIT_SPEC_PROPOSAL_TOOL_NAME ? ({
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate) => {
@@ -215,11 +270,16 @@ export async function runAuthoringTurn(
       return { ...result, details: { ...result.details, task: context.task } };
     },
   }) : tool) : baseTools;
+  const executableTools = tools.map((tool) => ({
+      ...tool,
+      label: tool.label ?? tool.name,
+      execute: tool.execute ?? submitSpecProposalTool.execute,
+    }));
   const state = {
     model,
     thinkingLevel: 'off' as const,
-    messages: [],
-    tools,
+    messages: initialMessages,
+    tools: localTools.length ? executableTools : tools,
     systemPrompt: options.systemPrompt,
   };
   let requestCount = 0;
@@ -240,17 +300,24 @@ export async function runAuthoringTurn(
     transformContext: async (messages, signal) => {
       options.signal?.throwIfAborted();
       signal?.throwIfAborted();
-      if (JSON.stringify(messages).length > (runtime.maxPromptChars ?? DEFAULTS.maxPromptChars) * 2) {
-        throw new Error('AUTHORING_CONTEXT_TOO_LARGE');
-      }
+      assertAuthoringContextSize(serializeAuthoringContext(messages).length, maxPromptChars);
       return messages;
     },
     toolExecution: 'sequential',
     sessionId: `authoring-${Date.now().toString(36)}`,
-    beforeToolCall: async ({ toolCall }) => toolCall.name === SUBMIT_SPEC_PROPOSAL_TOOL_NAME
+    beforeToolCall: async ({ toolCall }) => ALLOWED_TOOL_NAMES.has(toolCall.name)
       ? undefined
-      : { block: true, reason: 'only submit_spec_proposal is allowed', terminate: true },
+      : { block: true, reason: 'only authoring proposal tools are allowed', terminate: true },
     afterToolCall: async ({ toolCall, result }) => {
+      if (toolCall.name === SUBMIT_AUTHORING_PROPOSAL_TOOL_NAME) {
+        const details = result.details as {
+          validation?: { ok?: unknown; diagnostics?: AuthoringDiagnostic[]; unresolved?: unknown[] };
+        } | undefined;
+        if (details?.validation?.ok === false) {
+          return { content: [...result.content, { type: 'text', text: JSON.stringify(details.validation) }], isError: true };
+        }
+        return undefined;
+      }
       if (toolCall.name !== SUBMIT_SPEC_PROPOSAL_TOOL_NAME || !(result.details as SpecProposalDetails)) return undefined;
       const details = result.details as SpecProposalDetails;
       if (typeof details.kind !== 'string' || typeof details.note !== 'string') return undefined;
@@ -267,6 +334,14 @@ export async function runAuthoringTurn(
   agent.subscribe((event) => {
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       finalAssistant = event.message as AssistantMessageRecord;
+    } else if (event.type === 'message_update'
+      && event.assistantMessageEvent.type === 'text_delta') {
+      options.onTextDelta?.(event.assistantMessageEvent.delta);
+    } else if (event.type === 'message_end' && event.message.role === 'user') {
+      const fields = event.message as unknown as Record<string, unknown>;
+      if (typeof fields.content === 'string') {
+        fields.content = [{ type: 'text', text: fields.content }];
+      }
     } else if (event.type === 'tool_execution_end') {
       const toolEvent = event as unknown as AgentToolEndEvent;
       toolResults.push({
@@ -279,7 +354,8 @@ export async function runAuthoringTurn(
   const abortRun = () => agent.abort();
   options.signal?.addEventListener('abort', abortRun, { once: true });
   try {
-    const prompt = agent.prompt(options.userText);
+    // The current user message is already in initialState, including turn one.
+    const prompt = agent.continue();
     if (options.signal?.aborted) agent.abort();
     await prompt;
     await agent.waitForIdle();
@@ -298,6 +374,8 @@ export async function runAuthoringTurn(
     stopReason: typeof finalAssistant?.stopReason === 'string' ? finalAssistant.stopReason : undefined,
     errorMessage: typeof finalAssistant?.errorMessage === 'string' ? finalAssistant.errorMessage : undefined,
     requestCount,
+    messages: agent.state.messages.filter((message): message is Message =>
+      ['user', 'assistant', 'toolResult'].includes(message.role)),
   };
 }
 

@@ -17,6 +17,7 @@ import {
 } from '../src/authoring/config.ts';
 import { buildAuthoringTurnInput } from '../src/authoring/context.ts';
 import { checkAuthoringRuntime, probeAuthoringProtocol, runAuthoringTurn } from '../src/authoring/pi.ts';
+import { Type } from 'typebox';
 
 const turn = {
   systemPrompt: '只处理空白模板的结构讨论，不接收业务金额。',
@@ -38,6 +39,39 @@ const runtimeFor = (faux: ReturnType<typeof fauxProvider>, maxToolTurns = 2) => 
   assert.equal(result.stopReason, 'aborted');
   assert.equal(result.requestCount, 0);
   assert.equal(faux.state.callCount, 0);
+}
+
+{
+  const tool = {
+    name: 'submit_authoring_proposal',
+    description: 'local fixture',
+    parameters: Type.Object({}),
+    execute: async () => ({
+      content: [{ type: 'text' as const, text: 'recorded' }],
+      details: {
+        validation: {
+          ok: false,
+          diagnostics: [{ code: 'NO_SHEETS', at: 'sheets', message: '至少需要一个 sheet。' }],
+          unresolved: ['填充区尚未确定'],
+        },
+      },
+    }),
+  };
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(tool.name, {})], { stopReason: 'toolUse' }),
+    fauxAssistantMessage('已根据诊断修订。'),
+  ]);
+  const result = await runAuthoringTurn({
+    ...turn,
+    tools: [tool],
+  }, runtimeFor(faux));
+  assert.equal(result.requestCount, 2);
+  const toolResult = result.messages.find((message) => message.role === 'toolResult');
+  assert.ok(toolResult && Array.isArray(toolResult.content));
+  const diagnosticText = toolResult.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+  assert.match(diagnosticText, /NO_SHEETS/);
+  assert.match(diagnosticText, /填充区尚未确定/);
 }
 
 {
@@ -123,12 +157,14 @@ assert.equal((await checkAuthoringRuntime({})).authStatus, 'missing');
       api: 'openai-completions',
       baseUrl: 'https://example.com/v1/',
       modelId: 'fake-model',
+      maxPromptChars: 500_000,
       apiKeyEnv: 'BILITE_AUTHORING_FAKE_KEY',
     }), { mode: 0o600 });
     const config = loadAuthoringConfig({ file });
     const authFile = path.join(dir, 'authoring-auth.json');
     assert.equal(config.baseUrl, 'https://example.com/v1');
     assert.equal(config.modelId, 'fake-model');
+    assert.equal(config.maxPromptChars, 500_000);
     assert.equal(config.apiKeyEnv, 'BILITE_AUTHORING_FAKE_KEY');
     assert.equal(
       runtimeFromAuthoringConfig(config, { BILITE_AUTHORING_FAKE_KEY: 'fake-key' }, { authFile }).apiKey,

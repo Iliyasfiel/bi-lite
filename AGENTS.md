@@ -1,6 +1,6 @@
 # bi-lite 开发约定
 
-bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报表规格 → 模板 Excel。
+bi-lite 是本地 BI 引擎：接入报表 + 接入规格 → DuckDB → 导出规格 → 导出报表。
 核心场景是按给定模板填表报送。第二版继续围绕这条主链路开发。
 
 ## 开工入口
@@ -8,7 +8,8 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 先读本文件、`docs/需求与架构.md` 与 `docs/开发计划.md`，再读相关模块。
 新设备或首次接手先按 [CONTRIBUTING.md](CONTRIBUTING.md) 配置环境；它是人与 agent 共用的配置和排障入口。
 工作区结构见本文件；用户使用与接入配置见 `README.md`；agent 操作手册在 `skills/bi-lite-ingest/`。
-文档描述当前设计与功能状态，不记录开发流水账、历史报错或断言数量。
+文档职责固定：需求与架构统一术语和设计，开发计划记录状态与交付顺序，18期经营测试记录验收样例。
+不另建重叠的架构审阅、助手方案或子系统升级计划；不记录开发流水账、历史报错或断言数量。
 
 ## 环境与工具
 
@@ -45,10 +46,10 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 | `src/web/`、`src/server.ts` | 本地 Web 界面与 HTTP 入口 |
 | `src/cli.ts`、`src/mcp/` | CLI 与 agent 入口 |
 | `src/authoring/` | 内置助手的本地模板检查、结构投影、附件任务与 pi 最小会话适配 |
-| `src/runtime/` | 工作区定位、服务生命周期、CLI 转交与测试区 reset |
+| `src/runtime/` | 工作区定位、服务生命周期、CLI 转交、发布屏障与测试区 reset |
 | `models/` | 表结构、维度、窗口口径、聚合与桥接声明 |
 | `metrics/`、`src/metrics/` | 指标身份、单位/分类、公式声明与主数据同步 |
-| `ingest/`、`specs/`、`templates/` | 接入规格、报表规格、空白模板 |
+| `ingest/`、`specs/`、`templates/` | 接入规格、导出规格、关联的空白 Excel |
 | `skills/bi-lite-ingest/` | agent 操作手册与 MCP 配置 |
 | `docs/` | 架构与功能状态 |
 | `test/` | 主链路验收、假数据生成器 |
@@ -66,9 +67,10 @@ bi-lite 是本地 BI 引擎：Excel + YAML 接入规格 → DuckDB → YAML 报�
 7. 生产接入源放在稳定的 `data/` 路径；`test/fixtures/` 只用于可重建的示例。
    保存 `ingest/*.yaml` 只是保存规格，执行导入才写库。
 8. 功能或架构变化同步更新相应说明，保持简短。清理文档不代表删除运行时校验。
-9. 内置助手准备与接入按 `docs/agent-authoring/design.md` 实施，状态以开发计划为准。
-   模型上下文只取受控结构投影，不直接序列化含本地路径的附件任务；
-   测试区 reset 只处理显式标记的独立工作区，并保留工作区外的供应商配置。
+9. 规格制定按 `docs/需求与架构.md` 的共享规格制定引擎设计实施，状态以开发计划为准。
+   先完成 CLI 全流程，再开发 Web 对应交互；安全检查通过后才选择接入/导出方向。
+   两类规格共用任务、会话、草稿和确认发布；制定全程只使用结构、对话和 YAML 声明，不访问业务数据库。
+   模型上下文只取受控结构投影，不直接序列化含本地路径的附件任务；测试区 reset 只处理显式标记的独立工作区，并保留工作区外供应商配置。
 
 ## 测试纪律（第二版）
 

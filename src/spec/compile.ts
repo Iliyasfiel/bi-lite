@@ -85,7 +85,12 @@ function filterRef(dim: DimName, col: string): string {
 export function compileBlock(
   block: Block,
   params: Record<string, string | number> = {},
-  opts: { maxRows?: number; factName?: string; facts?: DeclaredFact[] } = {},
+  opts: {
+    maxRows?: number;
+    factName?: string;
+    facts?: DeclaredFact[];
+    metrics?: ReturnType<typeof loadMetrics>;
+  } = {},
 ): CompiledQuery {
   // ---- 目标表解析：factName 有值就必须声明过（fail-closed），否则落缺省表 ----
   const factName = opts.factName && opts.factName.trim() !== '' ? opts.factName : undefined;
@@ -131,7 +136,7 @@ export function compileBlock(
   const agg = block.value.agg ?? 'sum';
   const measure = block.value.measure ?? fact?.measureColumn ?? 'amount';
 
-  const definitions = loadMetrics();
+  const definitions = opts.metrics ?? loadMetrics();
   const fixedMetric = resolved.value.metric;
   const fixedPeriod = resolved.value.periodType;
   const label = (s: string, dim: string) => dim === 'metric' ? metricOf(s, definitions)?.name ?? s : s;
