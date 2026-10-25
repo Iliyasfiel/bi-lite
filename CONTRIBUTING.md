@@ -47,6 +47,7 @@ npm run doctor
 | 接入、语义计算、模型或渲染 | `npm run e2e` | 临时副本和假数据，结束后清理 |
 | CLI、工作区、服务生命周期或发布资源 | `npm run package:check` | 临时安装真实 `.tgz`，启动回环服务后清理 |
 | 测试区 reset | `npm run test:reset` | 临时工作区，检查真实锁、链接拒绝与供应商配置保留 |
+| 独立 Web 原型 | `npm --prefix prototypes/web-app run check` / `run build:single` | 演示查询关键边界、Vue 构建与离线单文件导出；不证明正式引擎闭环 |
 | 打包输出 | `npm run build` / `npm pack` | 生成 `dist/` / `.tgz`，不提交产物 |
 | 文档或简单样式 | `git diff --check` 及相关针对性检查 | 不默认跑全套验收 |
 
@@ -55,6 +56,16 @@ npm run doctor
 不以开发链接代替分发验收；浏览器启动回调的自动验证也不等同于实际桌面浏览器验收。
 
 ## 本机试用
+
+### 独立 Web 原型
+
+新界面位于 `prototypes/web-app/`，使用自己的包清单和锁文件；首次进入时运行
+`npm --prefix prototypes/web-app ci`，然后 `npm --prefix prototypes/web-app run dev`。
+启动、体验路径和能力边界见 [原型说明](prototypes/web-app/README.md)。
+根目录 `npm ci` 不安装原型依赖；原型也不加载现有服务或数据库。仅改原型时运行其针对性检查和构建，
+无需启动业务引擎。`dist/` 和 `node_modules/` 不提交，分发单文件由 `run build:single` 重建。
+
+### 现有执行引擎
 
 自动验收不会生成或修改当前仓库的业务库。人工试用前区分两类示例：
 
